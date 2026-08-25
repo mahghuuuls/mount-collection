@@ -1,0 +1,15 @@
+# Mount Collection translations
+key.categories.mountcollection=Mount Collection
+key.mountcollection.contextual=Register / Recall Mount
+mountcollection.message.registered=Mount registered and selected.
+mountcollection.message.recall_not_available=No ridden mount to register. Recall is not available yet.
+mountcollection.message.unsupported=That entity is not a supported mount.
+mountcollection.message.not_tamed=That mount must be tamed first.
+mountcollection.message.not_owned=You do not meet that mount's ownership requirement.
+mountcollection.message.disallowed=That mount is disabled by the registration configuration.
+mountcollection.message.already_registered=That mount is already registered.
+mountcollection.message.owned_by_other=That mount belongs to another collection.
+mountcollection.message.integrity_conflict=Registration is blocked by conflicting mount identity evidence.
+mountcollection.message.provider_failure=The mount provider could not verify this mount.
+mountcollection.message.read_only=Mount Collection storage is read-only for safety.
+mountcollection.message.internal_failure=Mount registration is temporarily unavailable.
