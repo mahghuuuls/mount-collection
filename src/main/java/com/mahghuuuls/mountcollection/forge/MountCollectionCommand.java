@@ -1,5 +1,6 @@
 package com.mahghuuuls.mountcollection.forge;
 
+import com.mahghuuuls.mountcollection.persistence.LastKnownEvidence;
 import com.mahghuuuls.mountcollection.persistence.MountId;
 import com.mahghuuuls.mountcollection.persistence.MountRecord;
 import com.mahghuuuls.mountcollection.persistence.MountRepository;
@@ -75,13 +76,19 @@ final class MountCollectionCommand extends CommandBase {
             throw new CommandException("Unknown player profile.");
         }
         MountRepository.CollectionInspection inspection = repository.inspectCollection(profile.getId());
+        long deadline = repository.getRecallCooldownDeadline(profile.getId());
+        long activeTick = repository.getActiveTick();
+        long remaining = deadline > activeTick ? deadline - activeTick : 0L;
         sender.sendMessage(new TextComponentString(
                 "Mount Collection player=" + bounded(profile.getName())
                         + " records=" + inspection.getCount()
                         + " selected=" + inspection.getSelectedMountId()
                                 .map(MountId::toString)
                                 .orElse("none")
-                        + " revision=" + inspection.getRevision()));
+                        + " revision=" + inspection.getRevision()
+                        + " activeTick=" + activeTick
+                        + " cooldownDeadline=" + deadline
+                        + " cooldownRemaining=" + remaining));
     }
 
     private static void inspectMount(
@@ -98,6 +105,7 @@ final class MountCollectionCommand extends CommandBase {
             throw new CommandException("Mount record not found.");
         }
         MountRecord record = found.get();
+        LastKnownEvidence lastKnown = record.getLastKnown();
         sender.sendMessage(new TextComponentString(
                 "Mount Collection mount=" + record.getMountId()
                         + " owner=" + record.getOwnerId()
@@ -106,7 +114,13 @@ final class MountCollectionCommand extends CommandBase {
                         + " condition=" + record.getCondition()
                         + " ordinal=" + record.getFallbackOrdinal()
                         + " order=" + record.getRegistrationOrder()
-                        + " physical=" + String.valueOf(record.getPhysicalEntityId())));
+                        + " physical=" + String.valueOf(record.getPhysicalEntityId())
+                        + (lastKnown == null
+                                ? " lastKnown=none"
+                                : " lastKnown=" + lastKnown.getDimensionId()
+                                        + ":" + lastKnown.getX()
+                                        + "," + lastKnown.getY()
+                                        + "," + lastKnown.getZ())));
     }
 
     @Override

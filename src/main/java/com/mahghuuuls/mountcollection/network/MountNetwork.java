@@ -2,7 +2,7 @@ package com.mahghuuuls.mountcollection.network;
 
 import com.mahghuuuls.mountcollection.Tags;
 import com.mahghuuuls.mountcollection.forge.MountCollectionServices;
-import com.mahghuuuls.mountcollection.lifecycle.RegistrationOutcome;
+import com.mahghuuuls.mountcollection.lifecycle.ContextualOutcome;
 import java.util.Objects;
 import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraft.util.text.TextComponentTranslation;
@@ -52,14 +52,14 @@ public final class MountNetwork {
         if (!intentGate.acquire(player.getUniqueID(), activeTick)) {
             return;
         }
-        RegistrationOutcome outcome;
+        ContextualOutcome outcome;
         try {
             outcome = services.getLifecycleService()
                     .map(service -> service.handleContextualIntent(player))
-                    .orElseGet(() -> RegistrationOutcome.failure(
-                            RegistrationOutcome.Status.INTERNAL_FAILURE));
+                    .orElseGet(() -> ContextualOutcome.failure(
+                            ContextualOutcome.Status.INTERNAL_FAILURE));
         } catch (RuntimeException exception) {
-            outcome = RegistrationOutcome.failure(RegistrationOutcome.Status.INTERNAL_FAILURE);
+            outcome = ContextualOutcome.failure(ContextualOutcome.Status.INTERNAL_FAILURE);
         }
         player.sendMessage(new TextComponentTranslation(outcome.getStatus().getTranslationKey()));
     }

@@ -73,7 +73,10 @@ public final class MountCollectionServices {
                 providerRegistry,
                 () -> getActiveConfig().orElseThrow(
                         () -> new IllegalStateException("server configuration is not active")),
-                diagnostics);
+                diagnostics,
+                activeServerClock,
+                inhibitedIntegration,
+                new ForgeRecallWorldGateway());
     }
 
     synchronized void clearActiveConfig() {

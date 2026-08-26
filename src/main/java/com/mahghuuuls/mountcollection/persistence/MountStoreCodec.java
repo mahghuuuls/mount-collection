@@ -11,7 +11,7 @@ import net.minecraft.util.ResourceLocation;
 
 final class MountStoreCodec {
 
-    static final int CURRENT_ROOT_VERSION = 1;
+    static final int CURRENT_ROOT_VERSION = 2;
     private static final int COMPOUND_TAG = 10;
     private static final int MAX_KEY_LENGTH = 128;
 
@@ -54,12 +54,20 @@ final class MountStoreCodec {
         for (int index = 0; index < playerList.tagCount(); index++) {
             try {
                 NBTTagCompound raw = playerList.getCompoundTagAt(index);
-                if (raw.hasKey("Version") && raw.getInteger("Version") > 1) {
+                if (raw.hasKey("Version") && raw.getInteger("Version") > 2) {
                     throw new IllegalArgumentException("future player schema");
                 }
                 UUID ownerId = parseUuid(raw.getString("OwnerId"));
                 MountRepository.PlayerState state = new MountRepository.PlayerState();
                 state.revision = requireNonNegative(raw.getLong("Revision"), "revision");
+                state.recallCooldownDeadline = raw.hasKey("RecallCooldownDeadline")
+                        ? requireNonNegative(
+                                raw.getLong("RecallCooldownDeadline"), "recallCooldownDeadline")
+                        : 0L;
+                state.recallCooldownDuration = raw.hasKey("RecallCooldownDuration")
+                        ? requireNonNegative(
+                                raw.getLong("RecallCooldownDuration"), "recallCooldownDuration")
+                        : 0L;
                 if (raw.hasKey("SelectedMountId")) {
                     state.selectedMountId = MountId.parse(raw.getString("SelectedMountId"));
                 }
@@ -122,12 +130,14 @@ final class MountStoreCodec {
         NBTTagList players = new NBTTagList();
         for (Map.Entry<UUID, MountRepository.PlayerState> entry : snapshot.players.entrySet()) {
             NBTTagCompound player = new NBTTagCompound();
-            player.setInteger("Version", 1);
+            player.setInteger("Version", 2);
             player.setString("OwnerId", entry.getKey().toString());
             if (entry.getValue().selectedMountId != null) {
                 player.setString("SelectedMountId", entry.getValue().selectedMountId.toString());
             }
             player.setLong("Revision", entry.getValue().revision);
+            player.setLong("RecallCooldownDeadline", entry.getValue().recallCooldownDeadline);
+            player.setLong("RecallCooldownDuration", entry.getValue().recallCooldownDuration);
             NBTTagList ordinals = new NBTTagList();
             for (Map.Entry<String, Integer> ordinalEntry : entry.getValue().nextOrdinals.entrySet()) {
                 NBTTagCompound ordinal = new NBTTagCompound();

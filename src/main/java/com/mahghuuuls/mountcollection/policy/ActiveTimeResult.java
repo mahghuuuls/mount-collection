@@ -6,7 +6,9 @@ public final class ActiveTimeResult {
         VALID,
         NEGATIVE_INPUT,
         BACKWARD_INPUT,
-        OVERFLOW_SATURATED
+        OVERFLOW_SATURATED,
+        OVERFLOW_REBASED,
+        BOUNDED_CLAMP
     }
 
     private final long value;

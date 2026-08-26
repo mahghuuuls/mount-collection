@@ -25,7 +25,8 @@ public final class ActiveServerClock {
 
     public synchronized ActiveTimeResult advance() {
         if (currentTick == Long.MAX_VALUE) {
-            return new ActiveTimeResult(currentTick, ActiveTimeResult.Status.OVERFLOW_SATURATED);
+            currentTick = 0L;
+            return new ActiveTimeResult(currentTick, ActiveTimeResult.Status.OVERFLOW_REBASED);
         }
         currentTick++;
         return new ActiveTimeResult(currentTick, ActiveTimeResult.Status.VALID);
@@ -50,5 +51,22 @@ public final class ActiveServerClock {
             return new ActiveTimeResult(Long.MAX_VALUE, ActiveTimeResult.Status.NEGATIVE_INPUT);
         }
         return new ActiveTimeResult(Math.max(0L, deadlineTick - currentTick), ActiveTimeResult.Status.VALID);
+    }
+
+    /**
+     * Bounds a persisted deadline by the duration that originally created it. This prevents a
+     * corrupted or reset active clock from turning a finite cooldown into an effectively permanent
+     * lock.
+     */
+    public synchronized ActiveTimeResult remainingUntil(long deadlineTick, long maximumDurationTicks) {
+        if (deadlineTick < 0L || maximumDurationTicks < 0L) {
+            return new ActiveTimeResult(
+                    Math.max(0L, maximumDurationTicks), ActiveTimeResult.Status.NEGATIVE_INPUT);
+        }
+        long remaining = deadlineTick <= currentTick ? 0L : deadlineTick - currentTick;
+        if (remaining < 0L || remaining > maximumDurationTicks) {
+            return new ActiveTimeResult(maximumDurationTicks, ActiveTimeResult.Status.BOUNDED_CLAMP);
+        }
+        return new ActiveTimeResult(remaining, ActiveTimeResult.Status.VALID);
     }
 }

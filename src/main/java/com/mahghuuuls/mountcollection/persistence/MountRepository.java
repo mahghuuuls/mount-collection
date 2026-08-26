@@ -38,6 +38,11 @@ public final class MountRepository {
         INTEGRITY_CONFLICT
     }
 
+    public enum RecallCommitStatus {
+        SUCCESS,
+        REJECTED
+    }
+
     public static final class RegistrationCandidate {
         private final UUID ownerId;
         private final ResourceLocation providerId;
@@ -120,6 +125,55 @@ public final class MountRepository {
         public int getCount() { return count; }
         public Optional<MountId> getSelectedMountId() { return Optional.ofNullable(selectedMountId); }
         public long getRevision() { return revision; }
+    }
+
+    public static final class CooldownState {
+        private final long deadline;
+        private final long duration;
+
+        private CooldownState(long deadline, long duration) {
+            this.deadline = deadline;
+            this.duration = duration;
+        }
+
+        public long getDeadline() { return deadline; }
+        public long getDuration() { return duration; }
+    }
+
+    /** A one-use persistence finalizer obtained before the world is mutated. */
+    public final class RecallCommit {
+        private final MountId mountId;
+        private final PlayerState player;
+        private final MountRecord record;
+        private boolean open = true;
+
+        private RecallCommit(MountId mountId, PlayerState player, MountRecord record) {
+            this.mountId = mountId;
+            this.player = player;
+            this.record = record;
+        }
+
+        public void complete(LastKnownEvidence evidence, long cooldownDeadline, long cooldownDuration) {
+            Objects.requireNonNull(evidence, "evidence");
+            synchronized (MountRepository.this) {
+                if (!open) {
+                    throw new IllegalStateException("recall commit is already closed");
+                }
+                // prepareRecall reserves a stable record on the logical server thread. Completion
+                // deliberately has no policy revalidation that could reject an already-moved entity.
+                records.put(mountId, record.withLastKnown(evidence));
+                player.recallCooldownDeadline = cooldownDeadline;
+                player.recallCooldownDuration = cooldownDuration;
+                open = false;
+                dirtyMarker.run();
+            }
+        }
+
+        public void cancel() {
+            synchronized (MountRepository.this) {
+                open = false;
+            }
+        }
     }
 
     private final Map<MountId, MountRecord> records = new LinkedHashMap<>();
@@ -268,6 +322,102 @@ public final class MountRepository {
                 player == null ? 0L : player.revision);
     }
 
+    public synchronized long getRecallCooldownDeadline(UUID ownerId) {
+        PlayerState player = players.get(ownerId);
+        return player == null ? 0L : player.recallCooldownDeadline;
+    }
+
+    public synchronized CooldownState getRecallCooldown(UUID ownerId) {
+        PlayerState player = players.get(ownerId);
+        return player == null
+                ? new CooldownState(0L, 0L)
+                : new CooldownState(player.recallCooldownDeadline, player.recallCooldownDuration);
+    }
+
+    public synchronized boolean normalizeRecallCooldown(
+            UUID ownerId, long currentTick, long defaultMaximumDuration) {
+        PlayerState player = players.get(ownerId);
+        if (readOnly || player == null || currentTick < 0L || defaultMaximumDuration < 0L) {
+            return false;
+        }
+        long bound = player.recallCooldownDuration > 0L
+                ? player.recallCooldownDuration
+                : defaultMaximumDuration;
+        long rawRemaining = player.recallCooldownDeadline <= currentTick
+                ? 0L
+                : player.recallCooldownDeadline - currentTick;
+        if (rawRemaining <= bound) {
+            return false;
+        }
+        player.recallCooldownDeadline = bound > Long.MAX_VALUE - currentTick
+                ? Long.MAX_VALUE
+                : currentTick + bound;
+        player.recallCooldownDuration = bound;
+        dirtyMarker.run();
+        return true;
+    }
+
+    public synchronized Optional<RecallCommit> prepareRecall(
+            UUID ownerId, MountId mountId, UUID physicalEntityId) {
+        Objects.requireNonNull(ownerId, "ownerId");
+        Objects.requireNonNull(mountId, "mountId");
+        Objects.requireNonNull(physicalEntityId, "physicalEntityId");
+        PlayerState player = players.get(ownerId);
+        MountRecord record = records.get(mountId);
+        if (readOnly
+                || player == null
+                || player.selectionIntegrityBlocked
+                || !mountId.equals(player.selectedMountId)
+                || record == null
+                || record.getCondition() != MountCondition.LIVING
+                || !ownerId.equals(record.getOwnerId())
+                || !physicalEntityId.equals(record.getPhysicalEntityId())) {
+            return Optional.empty();
+        }
+        return Optional.of(new RecallCommit(mountId, player, record));
+    }
+
+    public synchronized RecallCommitStatus commitRecall(
+            UUID ownerId,
+            MountId mountId,
+            UUID physicalEntityId,
+            LastKnownEvidence evidence,
+            long cooldownDeadline) {
+        return commitRecall(ownerId, mountId, physicalEntityId, evidence, cooldownDeadline, 0L);
+    }
+
+    public synchronized RecallCommitStatus commitRecall(
+            UUID ownerId,
+            MountId mountId,
+            UUID physicalEntityId,
+            LastKnownEvidence evidence,
+            long cooldownDeadline,
+            long cooldownDuration) {
+        Objects.requireNonNull(ownerId, "ownerId");
+        Objects.requireNonNull(mountId, "mountId");
+        Objects.requireNonNull(physicalEntityId, "physicalEntityId");
+        Objects.requireNonNull(evidence, "evidence");
+        if (cooldownDeadline < 0L || cooldownDuration < 0L || readOnly) {
+            return RecallCommitStatus.REJECTED;
+        }
+        PlayerState player = players.get(ownerId);
+        MountRecord record = records.get(mountId);
+        if (player == null
+                || player.selectionIntegrityBlocked
+                || !mountId.equals(player.selectedMountId)
+                || record == null
+                || record.getCondition() != MountCondition.LIVING
+                || !ownerId.equals(record.getOwnerId())
+                || !physicalEntityId.equals(record.getPhysicalEntityId())) {
+            return RecallCommitStatus.REJECTED;
+        }
+        records.put(mountId, record.withLastKnown(evidence));
+        player.recallCooldownDeadline = cooldownDeadline;
+        player.recallCooldownDuration = cooldownDuration;
+        dirtyMarker.run();
+        return RecallCommitStatus.SUCCESS;
+    }
+
     public synchronized int getTotalRecordCount() {
         return records.size();
     }
@@ -365,6 +515,18 @@ public final class MountRepository {
             activeTick = tick;
             dirtyMarker.run();
         }
+    }
+
+    public synchronized void rebaseActiveTime(long tick) {
+        if (readOnly || tick < 0L) {
+            return;
+        }
+        activeTick = tick;
+        for (PlayerState player : players.values()) {
+            player.recallCooldownDeadline = tick;
+            player.recallCooldownDuration = 0L;
+        }
+        dirtyMarker.run();
     }
 
     synchronized RepositorySnapshot snapshot() {
@@ -474,6 +636,8 @@ public final class MountRepository {
     static final class PlayerState {
         MountId selectedMountId;
         long revision;
+        long recallCooldownDeadline;
+        long recallCooldownDuration;
         boolean selectionIntegrityBlocked;
         final Map<String, Integer> nextOrdinals = new LinkedHashMap<>();
 
@@ -531,6 +695,8 @@ public final class MountRepository {
                 PlayerState player = new PlayerState();
                 player.selectedMountId = entry.getValue().selectedMountId;
                 player.revision = entry.getValue().revision;
+                player.recallCooldownDeadline = entry.getValue().recallCooldownDeadline;
+                player.recallCooldownDuration = entry.getValue().recallCooldownDuration;
                 player.selectionIntegrityBlocked = entry.getValue().selectionIntegrityBlocked;
                 player.nextOrdinals.putAll(entry.getValue().nextOrdinals);
                 copy.put(entry.getKey(), player);

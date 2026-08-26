@@ -41,6 +41,12 @@ dependencies {
         developmentRuntime rfg.deobf(files(agentDiagnosticsToolkit))
     }
 
+    // Optional integration fixture. Available only to development runs; Mount Collection
+    // detects the registered effect by ID and neither compiles against nor packages Inhibited.
+    developmentRuntime(rfg.deobf('curse.maven:inhibited-880544:4721850')) {
+        transitive = false
+    }
+
     // Include StripLatestForgeRequirements by default for the dev env, saves everyone a hassle
     runtimeOnly 'com.cleanroommc:strip-latest-forge-requirements:1.0'
     // Include OSXNarratorBlocker by default for the dev env, for M1+ Macs

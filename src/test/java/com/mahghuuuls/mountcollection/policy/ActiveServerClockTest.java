@@ -40,13 +40,25 @@ final class ActiveServerClockTest {
     }
 
     @Test
-    void overflowSaturatesInsteadOfWrapping() {
+    void overflowDeadlineFailsClosedAndTickAdvanceRebases() {
         ActiveServerClock clock = new ActiveServerClock();
         clock.restore(Long.MAX_VALUE - 1L, 0L);
         assertEquals(ActiveTimeResult.Status.OVERFLOW_SATURATED, clock.deadlineAfter(2L).getStatus());
         assertEquals(Long.MAX_VALUE, clock.deadlineAfter(2L).getValue());
         assertTrue(clock.advance().isValid());
-        assertEquals(ActiveTimeResult.Status.OVERFLOW_SATURATED, clock.advance().getStatus());
-        assertEquals(Long.MAX_VALUE, clock.now());
+        assertEquals(ActiveTimeResult.Status.OVERFLOW_REBASED, clock.advance().getStatus());
+        assertEquals(0L, clock.now());
+        assertEquals(2L, clock.deadlineAfter(2L).getValue());
+    }
+
+    @Test
+    void resetClockCannotTurnFiniteCooldownIntoUnboundedLock() {
+        ActiveServerClock clock = new ActiveServerClock();
+        clock.restore(10L, 0L);
+
+        ActiveTimeResult remaining = clock.remainingUntil(1_000_000L, 200L);
+
+        assertEquals(ActiveTimeResult.Status.BOUNDED_CLAMP, remaining.getStatus());
+        assertEquals(200L, remaining.getValue());
     }
 }

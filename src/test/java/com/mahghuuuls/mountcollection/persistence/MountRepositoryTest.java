@@ -156,6 +156,55 @@ final class MountRepositoryTest {
         assertTrue(repository.findByPhysicalEntity(secondPhysical).isPresent());
     }
 
+    @Test
+    void preparedRecallHasNonRejectingOneUseFinalization() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord record = register(
+                repository, owner, UUID.randomUUID(), null).getRecord().get();
+        LastKnownEvidence destination = new LastKnownEvidence(0, 9.0D, 64.0D, 9.0D);
+
+        MountRepository.RecallCommit commit = repository.prepareRecall(
+                owner, record.getMountId(), record.getPhysicalEntityId()).get();
+        commit.complete(destination, 300L, 200L);
+
+        assertEquals(destination, repository.find(record.getMountId()).get().getLastKnown());
+        assertEquals(300L, repository.getRecallCooldown(owner).getDeadline());
+        assertEquals(200L, repository.getRecallCooldown(owner).getDuration());
+    }
+
+    @Test
+    void activeTimeRebaseExpiresOldDeadlinesAtomically() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord record = register(
+                repository, owner, UUID.randomUUID(), null).getRecord().get();
+        repository.commitRecall(
+                owner, record.getMountId(), record.getPhysicalEntityId(),
+                record.getLastKnown(), Long.MAX_VALUE, 200L);
+
+        repository.rebaseActiveTime(0L);
+
+        assertEquals(0L, repository.getActiveTick());
+        assertEquals(0L, repository.getRecallCooldown(owner).getDeadline());
+        assertEquals(0L, repository.getRecallCooldown(owner).getDuration());
+    }
+
+    @Test
+    void anomalousFutureDeadlineIsNormalizedOnceAndCanCountDown() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord record = register(
+                repository, owner, UUID.randomUUID(), null).getRecord().get();
+        repository.commitRecall(
+                owner, record.getMountId(), record.getPhysicalEntityId(),
+                record.getLastKnown(), 1_000_000L, 200L);
+
+        assertTrue(repository.normalizeRecallCooldown(owner, 10L, 200L));
+        assertEquals(210L, repository.getRecallCooldown(owner).getDeadline());
+        assertFalse(repository.normalizeRecallCooldown(owner, 11L, 200L));
+    }
+
     private static MountRepository.RegistrationResult register(
             MountRepository repository, UUID ownerId, UUID physicalId, MountId claimedId) {
         return repository.register(new MountRepository.RegistrationCandidate(

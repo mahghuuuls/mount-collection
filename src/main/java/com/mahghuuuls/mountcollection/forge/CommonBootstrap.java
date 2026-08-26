@@ -98,8 +98,20 @@ public final class CommonBootstrap {
     public void onServerTick(TickEvent.ServerTickEvent event) {
         if (event.phase == TickEvent.Phase.END && services.getActiveConfig().isPresent()) {
             ActiveTimeResult advanced = services.getActiveServerClock().advance();
-            services.getActiveRepository().ifPresent(
-                    repository -> repository.updateActiveTick(advanced.getValue()));
+            services.getActiveRepository().ifPresent(repository -> {
+                if (advanced.getStatus() == ActiveTimeResult.Status.OVERFLOW_REBASED) {
+                    repository.rebaseActiveTime(advanced.getValue());
+                    Map<String, String> fields = new LinkedHashMap<>();
+                    fields.put("status", advanced.getStatus().name());
+                    fields.put("active_tick", Long.toString(advanced.getValue()));
+                    services.getDiagnostics().detail(
+                            com.mahghuuuls.mountcollection.diagnostics.DiagnosticCategory.LIFECYCLE,
+                            "active_time_anomaly",
+                            fields);
+                } else {
+                    repository.updateActiveTick(advanced.getValue());
+                }
+            });
         }
     }
 

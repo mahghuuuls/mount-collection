@@ -25,6 +25,8 @@ final class MountStoreCodecTest {
         MountRecord first = register(repository, owner, firstPhysical).getRecord().get();
         MountRecord second = register(repository, owner, secondPhysical).getRecord().get();
         repository.updateActiveTick(4321L);
+        assertEquals(MountRepository.RecallCommitStatus.SUCCESS, repository.commitRecall(
+                owner, second.getMountId(), secondPhysical, second.getLastKnown(), 4400L, 79L));
 
         NBTTagCompound encoded = original.writeToNBT(new NBTTagCompound());
         MountSavedData restored = new MountSavedData("test");
@@ -36,6 +38,28 @@ final class MountStoreCodecTest {
         assertEquals(second.getMountId(), restored.getRepository().inspectCollection(owner).getSelectedMountId().get());
         assertEquals(2L, restored.getRepository().inspectCollection(owner).getRevision());
         assertEquals(4321L, restored.getRepository().getActiveTick());
+        assertEquals(4400L, restored.getRepository().getRecallCooldownDeadline(owner));
+        assertEquals(79L, restored.getRepository().getRecallCooldown(owner).getDuration());
+    }
+
+    @Test
+    void restartPreservesRemainingCooldownWithoutCountingDowntime() {
+        MountSavedData source = new MountSavedData("test");
+        MountRepository repository = source.getRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord record = register(repository, owner, UUID.randomUUID()).getRecord().get();
+        repository.updateActiveTick(100L);
+        assertEquals(MountRepository.RecallCommitStatus.SUCCESS, repository.commitRecall(
+                owner, record.getMountId(), record.getPhysicalEntityId(), record.getLastKnown(), 300L, 200L));
+
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(source.writeToNBT(new NBTTagCompound()));
+        ActiveServerClock restartedClock = new ActiveServerClock();
+        restartedClock.restore(restored.getRepository().getActiveTick(), 0L);
+
+        MountRepository.CooldownState cooldown = restored.getRepository().getRecallCooldown(owner);
+        assertEquals(200L, restartedClock.remainingUntil(
+                cooldown.getDeadline(), cooldown.getDuration()).getValue());
     }
 
     @Test
