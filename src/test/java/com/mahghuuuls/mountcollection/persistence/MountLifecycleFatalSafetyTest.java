@@ -110,6 +110,51 @@ final class MountLifecycleFatalSafetyTest {
         assertEquals(1, fixture.gateway.removeSourceCalls);
     }
 
+    @Test
+    void unexpectedCandidateIntentInspectionExceptionIsFatal() {
+        Fixture fixture = candidateIntentFixture();
+        fixture.gateway.inspectFailure = new IllegalStateException("injected inspection failure");
+
+        FatalTransferSafetyException fatal = assertThrows(
+                FatalTransferSafetyException.class,
+                () -> fixture.service.reconcilePendingTransfer(
+                        fixture.operation.getOperationId(), true, true));
+
+        assertFatalIntentRetained(fixture, fatal, TransferPhase.CANDIDATE_SPAWN_INTENT);
+    }
+
+    @Test
+    void unexpectedCandidateContainmentRemovalExceptionIsFatal() {
+        Fixture fixture = candidateIntentFixture();
+        fixture.gateway.candidatePresent = true;
+        fixture.gateway.candidateCheckpoint = RecallWorldGateway.CheckpointStatus.FAILED;
+        fixture.gateway.removeCandidateFailure =
+                new IllegalStateException("injected candidate removal failure");
+
+        FatalTransferSafetyException fatal = assertThrows(
+                FatalTransferSafetyException.class,
+                () -> fixture.service.reconcilePendingTransfer(
+                        fixture.operation.getOperationId(), true, true));
+
+        assertFatalIntentRetained(fixture, fatal, TransferPhase.CANDIDATE_SPAWN_INTENT);
+        assertEquals(1, fixture.gateway.removeCandidateCalls);
+    }
+
+    @Test
+    void unexpectedSourceRemovalExceptionIsFatal() {
+        Fixture fixture = sourceIntentFixture();
+        fixture.gateway.removeSourceFailure =
+                new IllegalStateException("injected source removal failure");
+
+        FatalTransferSafetyException fatal = assertThrows(
+                FatalTransferSafetyException.class,
+                () -> fixture.service.reconcilePendingTransfer(
+                        fixture.operation.getOperationId(), true, true));
+
+        assertFatalIntentRetained(fixture, fatal, TransferPhase.SOURCE_REMOVAL_INTENT);
+        assertEquals(1, fixture.gateway.removeSourceCalls);
+    }
+
     private static Fixture candidateIntentFixture() {
         Fixture fixture = fixture();
         assertEquals(MountRepository.TransferStatus.SUCCESS,
@@ -209,6 +254,9 @@ final class MountLifecycleFatalSafetyTest {
         private boolean candidatePresent;
         private CheckpointStatus candidateCheckpoint = CheckpointStatus.VERIFIED;
         private PhysicalAction removeSourceResult = PhysicalAction.SUCCESS;
+        private RuntimeException inspectFailure;
+        private RuntimeException removeCandidateFailure;
+        private RuntimeException removeSourceFailure;
         private int removeCandidateCalls;
         private int removeSourceCalls;
 
@@ -243,6 +291,9 @@ final class MountLifecycleFatalSafetyTest {
 
         @Override
         public TransferEvidence inspectTransfer(TransferOperation operation) {
+            if (inspectFailure != null) {
+                throw inspectFailure;
+            }
             return new TransferEvidence(
                     sourcePresent ? TransferEvidence.Presence.EXACT : TransferEvidence.Presence.MISSING,
                     candidatePresent ? TransferEvidence.Presence.EXACT : TransferEvidence.Presence.MISSING);
@@ -257,6 +308,9 @@ final class MountLifecycleFatalSafetyTest {
         @Override
         public PhysicalAction removeCandidate(TransferOperation operation) {
             removeCandidateCalls++;
+            if (removeCandidateFailure != null) {
+                throw removeCandidateFailure;
+            }
             candidatePresent = false;
             return PhysicalAction.SUCCESS;
         }
@@ -269,6 +323,9 @@ final class MountLifecycleFatalSafetyTest {
         @Override
         public PhysicalAction removeSource(TransferOperation operation) {
             removeSourceCalls++;
+            if (removeSourceFailure != null) {
+                throw removeSourceFailure;
+            }
             if (removeSourceResult == PhysicalAction.SUCCESS) {
                 sourcePresent = false;
             }

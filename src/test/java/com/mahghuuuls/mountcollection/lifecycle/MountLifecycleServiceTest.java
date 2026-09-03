@@ -2,6 +2,7 @@ package com.mahghuuuls.mountcollection.lifecycle;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.mahghuuuls.mountcollection.api.ProviderPayload;
@@ -254,6 +255,32 @@ final class MountLifecycleServiceTest {
                 repository.find(record.getMountId()).get().getPhysicalEntityId());
         assertEquals(0L, repository.getRecallCooldownDeadline(owner));
         assertTrue(repository.getPendingTransfers().isEmpty());
+    }
+
+    @Test
+    void unexpectedCandidateSpawnExceptionEscalatesWhileIntentRemainsDurable() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord record = repository.register(new MountRepository.RegistrationCandidate(
+                owner, PROVIDER, HORSE, HORSE.toString(), UUID.randomUUID(),
+                new LastKnownEvidence(0, 1.0D, 64.0D, 1.0D), null)).getRecord().get();
+        FakeTransferWorld gateway = new FakeTransferWorld(record);
+        gateway.spawnFailure = new IllegalStateException("injected spawn callback failure");
+        MountLifecycleService service = recallService(
+                repository, new ActiveServerClock(), gateway);
+
+        FatalTransferSafetyException fatal = assertThrows(
+                FatalTransferSafetyException.class,
+                () -> service.recallVerified(
+                        UUID.randomUUID(), null, owner, 1,
+                        InhibitedStatus.UNAFFECTED, config()));
+
+        assertEquals(TransferPhase.CANDIDATE_SPAWN_INTENT, fatal.getPhase());
+        assertEquals(TransferPhase.CANDIDATE_SPAWN_INTENT, repository
+                .getPendingTransfers().get(0).getPhase());
+        assertEquals(MountCondition.OPERATION_IN_PROGRESS,
+                repository.find(record.getMountId()).get().getCondition());
+        assertEquals(0L, repository.getRecallCooldownDeadline(owner));
     }
 
     @Test
@@ -1259,6 +1286,7 @@ final class MountLifecycleServiceTest {
         private CheckpointStatus candidateCheckpointStatus = CheckpointStatus.VERIFIED;
         private CheckpointStatus sourceAbsentCheckpointStatus = CheckpointStatus.VERIFIED;
         private CandidateAction spawnAction = CandidateAction.SUCCESS;
+        private RuntimeException spawnFailure;
         private TransferPhase pauseAfter;
         private int spawnCalls;
         private int removeSourceCalls;
@@ -1321,6 +1349,9 @@ final class MountLifecycleServiceTest {
         public CandidateAction spawnCandidate(TransferOperation operation) {
             spawnCalls++;
             spawnObservedPreparedState = providerPreparedBeforeCaptureReturned;
+            if (spawnFailure != null) {
+                throw spawnFailure;
+            }
             if (spawnAction == CandidateAction.SUCCESS) {
                 candidatePresent = true;
             }

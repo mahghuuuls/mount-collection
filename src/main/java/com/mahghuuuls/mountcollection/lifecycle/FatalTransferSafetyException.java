@@ -16,7 +16,12 @@ public final class FatalTransferSafetyException extends RuntimeException {
 
     public FatalTransferSafetyException(
             UUID operationId, TransferPhase phase, String reason) {
-        super(Objects.requireNonNull(reason, "reason"));
+        this(operationId, phase, reason, null);
+    }
+
+    public FatalTransferSafetyException(
+            UUID operationId, TransferPhase phase, String reason, Throwable cause) {
+        super(Objects.requireNonNull(reason, "reason"), cause);
         this.operationId = Objects.requireNonNull(operationId, "operationId");
         this.phase = Objects.requireNonNull(phase, "phase");
         if (!phase.isActionIntent()) {

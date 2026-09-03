@@ -73,6 +73,12 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         void dropLead();
     }
 
+    interface CandidateRemovalAccess {
+        boolean isExact();
+        void remove();
+        boolean isRemoved();
+    }
+
     private final ChunkPersistence chunkPersistence;
     private final DiagnosticSink diagnostics;
     private final LongSupplier nanoTime;
@@ -635,20 +641,42 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
                     ? PhysicalAction.SUCCESS
                     : PhysicalAction.UNAVAILABLE;
         }
-        Entity candidate = world.getEntityFromUuid(operation.getCandidateEntityId());
-        if (candidate == null) {
-            access.release(world);
-            return PhysicalAction.SUCCESS;
+        final Entity candidate = world.getEntityFromUuid(operation.getCandidateEntityId());
+        return removeCandidateWithRelease(
+                candidate == null ? null : new CandidateRemovalAccess() {
+                    @Override
+                    public boolean isExact() {
+                        return isExactCandidate(candidate, operation);
+                    }
+
+                    @Override
+                    public void remove() {
+                        world.removeEntityDangerously(candidate);
+                    }
+
+                    @Override
+                    public boolean isRemoved() {
+                        return world.getEntityFromUuid(operation.getCandidateEntityId()) == null
+                                || candidate.isDead;
+                    }
+                },
+                () -> access.release(world));
+    }
+
+    static PhysicalAction removeCandidateWithRelease(
+            CandidateRemovalAccess candidate, Runnable release) {
+        try {
+            if (candidate == null) {
+                return PhysicalAction.SUCCESS;
+            }
+            if (!candidate.isExact()) {
+                return PhysicalAction.CONFLICT;
+            }
+            candidate.remove();
+            return candidate.isRemoved() ? PhysicalAction.SUCCESS : PhysicalAction.FAILED;
+        } finally {
+            release.run();
         }
-        if (!isExactCandidate(candidate, operation)) {
-            access.release(world);
-            return PhysicalAction.CONFLICT;
-        }
-        world.removeEntityDangerously(candidate);
-        boolean removed = world.getEntityFromUuid(operation.getCandidateEntityId()) == null
-                || candidate.isDead;
-        access.release(world);
-        return removed ? PhysicalAction.SUCCESS : PhysicalAction.FAILED;
     }
 
     @Override

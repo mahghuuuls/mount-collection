@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.mahghuuuls.mountcollection.api.MountProvider;
@@ -147,6 +148,20 @@ final class ForgeRecallWorldGatewayTest {
         assertEquals(1, source.leadDrops);
         assertNull(source.currentVehicle);
         assertNull(source.currentLeashHolder);
+    }
+
+    @Test
+    void candidateRemovalExceptionStillReleasesTemporaryChunkAccess() {
+        AtomicBoolean released = new AtomicBoolean();
+        FaultCandidateRemoval candidate = new FaultCandidateRemoval();
+
+        assertThrows(
+                IllegalStateException.class,
+                () -> ForgeRecallWorldGateway.removeCandidateWithRelease(
+                        candidate, () -> released.set(true)));
+
+        assertTrue(candidate.removeCalled);
+        assertTrue(released.get());
     }
 
     @Test
@@ -533,6 +548,27 @@ final class ForgeRecallWorldGatewayTest {
         @Override
         public void dropLead() {
             leadDrops++;
+        }
+    }
+
+    private static final class FaultCandidateRemoval
+            implements ForgeRecallWorldGateway.CandidateRemovalAccess {
+        private boolean removeCalled;
+
+        @Override
+        public boolean isExact() {
+            return true;
+        }
+
+        @Override
+        public void remove() {
+            removeCalled = true;
+            throw new IllegalStateException("injected candidate removal fault");
+        }
+
+        @Override
+        public boolean isRemoved() {
+            return false;
         }
     }
 }

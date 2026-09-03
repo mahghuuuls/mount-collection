@@ -352,62 +352,70 @@ public final class MountLifecycleService {
             return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
                     ContextualOutcome.failure(ContextualOutcome.Status.INTERNAL_FAILURE));
         }
-        MountRepository.TransferStatus intentRecorded =
-                repository.markCandidateSpawnIntent(operation.getOperationId());
-        if (intentRecorded != MountRepository.TransferStatus.SUCCESS) {
-            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
-                    ContextualOutcome.failure(fromTransferStatus(intentRecorded)));
-        }
-        recordTransferPhase(operation, TransferPhase.CANDIDATE_SPAWN_INTENT);
-        operation = repository.findTransfer(operation.getOperationId()).orElse(operation);
-        worldGateway.transferPhaseAcknowledged(TransferPhase.CANDIDATE_SPAWN_INTENT);
-        RecallWorldGateway.CandidateAction spawned = worldGateway.spawnCandidate(operation);
-        if (spawned != RecallWorldGateway.CandidateAction.SUCCESS) {
-            TransferAdvanceOutcome rollback = rollbackSpawnFailure(operation, spawned);
-            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
-                    ContextualOutcome.failure(fromTransferOutcome(rollback)));
-        }
-        RecallWorldGateway.CheckpointStatus candidateCheckpoint =
-                worldGateway.checkpointCandidate(operation, true);
-        if (candidateCheckpoint != RecallWorldGateway.CheckpointStatus.VERIFIED) {
-            TransferAdvanceOutcome outcome = fromCheckpoint(
-                    operation, candidateCheckpoint, "candidate checkpoint contradicted identity");
-            TransferAdvanceOutcome containment = containCandidateIntent(operation);
-            if (containment == TransferAdvanceOutcome.INTEGRITY_CONFLICT
-                    || containment == TransferAdvanceOutcome.PERSISTENCE_FAILURE) {
-                outcome = containment;
+        UUID operationId = operation.getOperationId();
+        try {
+            MountRepository.TransferStatus intentRecorded =
+                    repository.markCandidateSpawnIntent(operationId);
+            if (intentRecorded != MountRepository.TransferStatus.SUCCESS) {
+                return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                        ContextualOutcome.failure(fromTransferStatus(intentRecorded)));
             }
+            recordTransferPhase(operation, TransferPhase.CANDIDATE_SPAWN_INTENT);
+            operation = repository.findTransfer(operationId).orElse(operation);
+            worldGateway.transferPhaseAcknowledged(TransferPhase.CANDIDATE_SPAWN_INTENT);
+            RecallWorldGateway.CandidateAction spawned = worldGateway.spawnCandidate(operation);
+            if (spawned != RecallWorldGateway.CandidateAction.SUCCESS) {
+                TransferAdvanceOutcome rollback = rollbackSpawnFailure(operation, spawned);
+                return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                        ContextualOutcome.failure(fromTransferOutcome(rollback)));
+            }
+            RecallWorldGateway.CheckpointStatus candidateCheckpoint =
+                    worldGateway.checkpointCandidate(operation, true);
+            if (candidateCheckpoint != RecallWorldGateway.CheckpointStatus.VERIFIED) {
+                TransferAdvanceOutcome outcome = fromCheckpoint(
+                        operation, candidateCheckpoint, "candidate checkpoint contradicted identity");
+                TransferAdvanceOutcome containment = containCandidateIntent(operation);
+                if (containment == TransferAdvanceOutcome.INTEGRITY_CONFLICT
+                        || containment == TransferAdvanceOutcome.PERSISTENCE_FAILURE) {
+                    outcome = containment;
+                }
+                return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                        ContextualOutcome.failure(fromTransferOutcome(outcome)));
+            }
+            MountRepository.TransferStatus candidateRecorded =
+                    repository.markCandidateSpawned(operationId);
+            if (candidateRecorded != MountRepository.TransferStatus.SUCCESS) {
+                TransferAdvanceOutcome containment = containCandidateIntent(operation);
+                ContextualOutcome.Status status = containment == TransferAdvanceOutcome.INTEGRITY_CONFLICT
+                        ? ContextualOutcome.Status.INTEGRITY_CONFLICT
+                        : fromTransferStatus(candidateRecorded);
+                return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                        ContextualOutcome.failure(status));
+            }
+            recordTransferPhase(operation, TransferPhase.CANDIDATE_SPAWNED);
+            if (worldGateway.pauseAfterPhase(TransferPhase.CANDIDATE_SPAWNED)) {
+                return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                        ContextualOutcome.failure(ContextualOutcome.Status.INTERNAL_FAILURE));
+            }
+            TransferAdvanceOutcome advanced = advanceTransfer(operationId, true, true);
+            if (advanced != TransferAdvanceOutcome.COMPLETE) {
+                return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                        ContextualOutcome.failure(fromTransferOutcome(advanced)));
+            }
+            Map<String, String> fields = new LinkedHashMap<>();
+            fields.put("correlation", correlationId.toString());
+            fields.put("mount", record.getMountId().toString());
+            fields.put("source_dimension", Integer.toString(source.getDimensionId()));
+            fields.put("destination_dimension", Integer.toString(destination.getEvidence().getDimensionId()));
+            diagnostics.detail(DiagnosticCategory.LIFECYCLE, "transfer_commit", fields);
             return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
-                    ContextualOutcome.failure(fromTransferOutcome(outcome)));
+                    ContextualOutcome.success(ContextualOutcome.Status.RECALLED, record.getMountId()));
+        } catch (FatalTransferSafetyException fatal) {
+            throw fatal;
+        } catch (RuntimeException unexpected) {
+            throw unexpectedTransferFailure(
+                    operationId, TransferPhase.CANDIDATE_SPAWN_INTENT, unexpected);
         }
-        MountRepository.TransferStatus candidateRecorded =
-                repository.markCandidateSpawned(operation.getOperationId());
-        if (candidateRecorded != MountRepository.TransferStatus.SUCCESS) {
-            TransferAdvanceOutcome containment = containCandidateIntent(operation);
-            ContextualOutcome.Status status = containment == TransferAdvanceOutcome.INTEGRITY_CONFLICT
-                    ? ContextualOutcome.Status.INTEGRITY_CONFLICT
-                    : fromTransferStatus(candidateRecorded);
-            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
-                    ContextualOutcome.failure(status));
-        }
-        recordTransferPhase(operation, TransferPhase.CANDIDATE_SPAWNED);
-        if (worldGateway.pauseAfterPhase(TransferPhase.CANDIDATE_SPAWNED)) {
-            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
-                    ContextualOutcome.failure(ContextualOutcome.Status.INTERNAL_FAILURE));
-        }
-        TransferAdvanceOutcome advanced = advanceTransfer(operation.getOperationId(), true, true);
-        if (advanced != TransferAdvanceOutcome.COMPLETE) {
-            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
-                    ContextualOutcome.failure(fromTransferOutcome(advanced)));
-        }
-        Map<String, String> fields = new LinkedHashMap<>();
-        fields.put("correlation", correlationId.toString());
-        fields.put("mount", record.getMountId().toString());
-        fields.put("source_dimension", Integer.toString(source.getDimensionId()));
-        fields.put("destination_dimension", Integer.toString(destination.getEvidence().getDimensionId()));
-        diagnostics.detail(DiagnosticCategory.LIFECYCLE, "transfer_commit", fields);
-        return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
-                ContextualOutcome.success(ContextualOutcome.Status.RECALLED, record.getMountId()));
     }
 
     private TransferAdvanceOutcome rollbackSpawnFailure(
@@ -466,6 +474,17 @@ public final class MountLifecycleService {
     }
 
     private TransferAdvanceOutcome advanceTransfer(
+            UUID operationId, boolean sourceObserved, boolean candidateObserved) {
+        try {
+            return advanceTransferUnchecked(operationId, sourceObserved, candidateObserved);
+        } catch (FatalTransferSafetyException fatal) {
+            throw fatal;
+        } catch (RuntimeException unexpected) {
+            throw unexpectedTransferFailure(operationId, null, unexpected);
+        }
+    }
+
+    private TransferAdvanceOutcome advanceTransferUnchecked(
             UUID operationId, boolean sourceObserved, boolean candidateObserved) {
         for (int guard = 0; guard < 12; guard++) {
             TransferOperation operation = repository.findTransfer(operationId).orElse(null);
@@ -682,6 +701,28 @@ public final class MountLifecycleService {
             }
         }
         return TransferAdvanceOutcome.PENDING;
+    }
+
+    private RuntimeException unexpectedTransferFailure(
+            UUID operationId, TransferPhase fallbackIntent, RuntimeException unexpected) {
+        TransferPhase unresolvedPhase = null;
+        try {
+            TransferOperation unresolved = repository.findTransfer(operationId).orElse(null);
+            if (unresolved != null && unresolved.getPhase().isActionIntent()) {
+                unresolvedPhase = unresolved.getPhase();
+            }
+        } catch (RuntimeException inspectionFailure) {
+            unexpected.addSuppressed(inspectionFailure);
+            unresolvedPhase = fallbackIntent;
+        }
+        if (unresolvedPhase != null && unresolvedPhase.isActionIntent()) {
+            return new FatalTransferSafetyException(
+                    operationId,
+                    unresolvedPhase,
+                    "unexpected exception while physical-action intent remained unresolved",
+                    unexpected);
+        }
+        return unexpected;
     }
 
     private static boolean isRecoveryReady(

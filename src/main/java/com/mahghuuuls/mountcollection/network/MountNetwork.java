@@ -5,6 +5,7 @@ import com.mahghuuuls.mountcollection.forge.MountCollectionServices;
 import com.mahghuuuls.mountcollection.lifecycle.ContextualOutcome;
 import com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException;
 import java.util.Objects;
+import java.util.function.Supplier;
 import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraft.util.text.TextComponentTranslation;
 import net.minecraftforge.fml.common.network.NetworkRegistry;
@@ -60,17 +61,21 @@ public final class MountNetwork {
     }
 
     private void executeContextualIntent(EntityPlayerMP player) {
-        ContextualOutcome outcome;
+        ContextualOutcome outcome = executeLifecycleIntent(() -> services.getLifecycleService()
+                .map(service -> service.handleContextualIntent(player))
+                .orElseGet(() -> ContextualOutcome.failure(
+                        ContextualOutcome.Status.INTERNAL_FAILURE)));
+        player.sendMessage(new TextComponentTranslation(outcome.getStatus().getTranslationKey()));
+    }
+
+    static ContextualOutcome executeLifecycleIntent(Supplier<ContextualOutcome> intent) {
+        Objects.requireNonNull(intent, "intent");
         try {
-            outcome = services.getLifecycleService()
-                    .map(service -> service.handleContextualIntent(player))
-                    .orElseGet(() -> ContextualOutcome.failure(
-                            ContextualOutcome.Status.INTERNAL_FAILURE));
+            return intent.get();
         } catch (FatalTransferSafetyException fatal) {
             throw fatal;
         } catch (RuntimeException exception) {
-            outcome = ContextualOutcome.failure(ContextualOutcome.Status.INTERNAL_FAILURE);
+            return ContextualOutcome.failure(ContextualOutcome.Status.INTERNAL_FAILURE);
         }
-        player.sendMessage(new TextComponentTranslation(outcome.getStatus().getTranslationKey()));
     }
 }
