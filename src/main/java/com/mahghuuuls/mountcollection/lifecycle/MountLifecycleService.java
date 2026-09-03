@@ -12,7 +12,10 @@ import com.mahghuuuls.mountcollection.persistence.EntityMountEvidence;
 import com.mahghuuuls.mountcollection.persistence.LastKnownEvidence;
 import com.mahghuuuls.mountcollection.persistence.MountId;
 import com.mahghuuuls.mountcollection.persistence.MountRecord;
+import com.mahghuuuls.mountcollection.persistence.MountCondition;
 import com.mahghuuuls.mountcollection.persistence.MountRepository;
+import com.mahghuuuls.mountcollection.persistence.TransferOperation;
+import com.mahghuuuls.mountcollection.persistence.TransferPhase;
 import com.mahghuuuls.mountcollection.policy.ValidatedMountConfig;
 import com.mahghuuuls.mountcollection.policy.ActiveServerClock;
 import com.mahghuuuls.mountcollection.policy.ActiveTimeResult;
@@ -37,6 +40,15 @@ public final class MountLifecycleService {
     private final InhibitedIntegration inhibitedIntegration;
     private final RecallWorldGateway worldGateway;
     private final RecallPolicy recallPolicy = new RecallPolicy();
+    private boolean reconcilingTransfers;
+
+    private enum TransferAdvanceOutcome {
+        COMPLETE,
+        PENDING,
+        TEMPORARILY_UNAVAILABLE,
+        PERSISTENCE_FAILURE,
+        INTEGRITY_CONFLICT
+    }
 
     MountLifecycleService(
             MountRepository repository,
@@ -152,13 +164,15 @@ public final class MountLifecycleService {
                     ContextualOutcome.failure(ContextualOutcome.Status.INTEGRITY_CONFLICT));
         }
         MountProvider provider = providers.find(record.getProviderId()).orElse(null);
-        if (record.getCondition()
-                == com.mahghuuuls.mountcollection.persistence.MountCondition.INTEGRITY_BLOCKED) {
+        if (record.getCondition() == MountCondition.INTEGRITY_BLOCKED) {
             return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
                     ContextualOutcome.failure(ContextualOutcome.Status.INTEGRITY_CONFLICT));
         }
-        if (record.getCondition()
-                        != com.mahghuuuls.mountcollection.persistence.MountCondition.LIVING
+        if (record.getCondition() == MountCondition.OPERATION_IN_PROGRESS) {
+            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                    ContextualOutcome.failure(ContextualOutcome.Status.OPERATION_IN_PROGRESS));
+        }
+        if (record.getCondition() != MountCondition.LIVING
                 || provider == null) {
             return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
                     ContextualOutcome.failure(ContextualOutcome.Status.PROVIDER_UNAVAILABLE));
@@ -169,17 +183,19 @@ public final class MountLifecycleService {
         }
         RecallWorldGateway.LocateResult located = worldGateway.locate(player, record);
         if (located == null || located.getStatus() != RecallWorldGateway.LocateResult.Status.FOUND) {
-            ContextualOutcome.Status unavailable = located != null
-                            && located.getStatus()
-                                    == RecallWorldGateway.LocateResult.Status.INTEGRITY_CONFLICT
-                    ? ContextualOutcome.Status.INTEGRITY_CONFLICT
-                    : ContextualOutcome.Status.MOUNT_MISSING;
+            ContextualOutcome.Status unavailable = ContextualOutcome.Status.MOUNT_MISSING;
+            if (located != null
+                    && located.getStatus() == RecallWorldGateway.LocateResult.Status.INTEGRITY_CONFLICT) {
+                unavailable = ContextualOutcome.Status.INTEGRITY_CONFLICT;
+            } else if (located != null
+                    && located.getStatus() == RecallWorldGateway.LocateResult.Status.UNAVAILABLE) {
+                unavailable = ContextualOutcome.Status.INTERNAL_FAILURE;
+            }
             return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
                     ContextualOutcome.failure(unavailable));
         }
         RecallWorldGateway.Source source = located.getSource().get();
-        if (!record.getPhysicalEntityId().equals(source.getPhysicalEntityId())
-                || source.getDimensionId() != destinationDimension) {
+        if (!record.getPhysicalEntityId().equals(source.getPhysicalEntityId())) {
             return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
                     ContextualOutcome.failure(ContextualOutcome.Status.MOUNT_MISSING));
         }
@@ -229,6 +245,11 @@ public final class MountLifecycleService {
             return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
                     ContextualOutcome.failure(ContextualOutcome.Status.INTERNAL_FAILURE));
         }
+        if (source.getDimensionId() != destinationDimension) {
+            return transferAcrossDimensions(
+                    correlationId, player, ownerId, record, source, destination.get(),
+                    provider, deadline.getValue(), config.getSummonCooldownTicks());
+        }
         MountRepository.RecallCommit recallCommit = repository.prepareRecall(
                 ownerId, mountId, source.getPhysicalEntityId()).orElse(null);
         if (recallCommit == null) {
@@ -252,6 +273,570 @@ public final class MountLifecycleService {
         diagnostics.detail(DiagnosticCategory.LIFECYCLE, "recall_commit", commitFields);
         return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
                 ContextualOutcome.success(ContextualOutcome.Status.RECALLED, mountId));
+    }
+
+    public void reconcilePendingTransfers() {
+        if (worldGateway == null || reconcilingTransfers) {
+            return;
+        }
+        reconcilingTransfers = true;
+        try {
+            for (TransferOperation operation : repository.getPendingTransfers()) {
+                if (operation.getPhase() == TransferPhase.INTEGRITY_BLOCKED) {
+                    continue;
+                }
+                advanceTransfer(operation.getOperationId(), true, true);
+            }
+        } finally {
+            reconcilingTransfers = false;
+        }
+    }
+
+    public void reconcilePendingTransfer(UUID operationId) {
+        reconcilePendingTransfer(operationId, true, true);
+    }
+
+    public void reconcilePendingTransfer(
+            UUID operationId, boolean sourceObserved, boolean candidateObserved) {
+        if (worldGateway == null || operationId == null || reconcilingTransfers) {
+            return;
+        }
+        reconcilingTransfers = true;
+        try {
+            TransferOperation operation = repository.findTransfer(operationId).orElse(null);
+            if (operation != null && operation.getPhase() != TransferPhase.INTEGRITY_BLOCKED) {
+                advanceTransfer(operationId, sourceObserved, candidateObserved);
+            }
+        } finally {
+            reconcilingTransfers = false;
+        }
+    }
+
+    private ContextualOutcome transferAcrossDimensions(
+            UUID correlationId,
+            EntityPlayerMP player,
+            UUID ownerId,
+            MountRecord record,
+            RecallWorldGateway.Source source,
+            RecallWorldGateway.Destination destination,
+            MountProvider provider,
+            long cooldownDeadline,
+            long cooldownDuration) {
+        java.util.Optional<RecallWorldGateway.TransferPlan> planned =
+                worldGateway.captureTransfer(player, source, destination, provider);
+        if (!planned.isPresent()) {
+            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                    ContextualOutcome.failure(ContextualOutcome.Status.INTERNAL_FAILURE));
+        }
+        RecallWorldGateway.TransferPlan transferPlan = planned.get();
+        TransferOperation operation = new TransferOperation(
+                correlationId,
+                record.getMountId(),
+                ownerId,
+                source.getPhysicalEntityId(),
+                transferPlan.getCandidateEntityId(),
+                transferPlan.getSourceEvidence(),
+                destination.getEvidence(),
+                transferPlan.copySourceSnapshot(),
+                cooldownDeadline,
+                cooldownDuration,
+                TransferPhase.PREPARED,
+                null);
+        MountRepository.TransferStatus began = repository.beginTransfer(operation);
+        if (began != MountRepository.TransferStatus.SUCCESS) {
+            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                    ContextualOutcome.failure(fromTransferStatus(began)));
+        }
+        recordTransferPhase(operation, TransferPhase.PREPARED);
+        if (worldGateway.pauseAfterPhase(TransferPhase.PREPARED)) {
+            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                    ContextualOutcome.failure(ContextualOutcome.Status.INTERNAL_FAILURE));
+        }
+        MountRepository.TransferStatus intentRecorded =
+                repository.markCandidateSpawnIntent(operation.getOperationId());
+        if (intentRecorded != MountRepository.TransferStatus.SUCCESS) {
+            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                    ContextualOutcome.failure(fromTransferStatus(intentRecorded)));
+        }
+        recordTransferPhase(operation, TransferPhase.CANDIDATE_SPAWN_INTENT);
+        operation = repository.findTransfer(operation.getOperationId()).orElse(operation);
+        worldGateway.transferPhaseAcknowledged(TransferPhase.CANDIDATE_SPAWN_INTENT);
+        RecallWorldGateway.CandidateAction spawned = worldGateway.spawnCandidate(operation);
+        if (spawned != RecallWorldGateway.CandidateAction.SUCCESS) {
+            TransferAdvanceOutcome rollback = rollbackSpawnFailure(operation, spawned);
+            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                    ContextualOutcome.failure(fromTransferOutcome(rollback)));
+        }
+        RecallWorldGateway.CheckpointStatus candidateCheckpoint =
+                worldGateway.checkpointCandidate(operation, true);
+        if (candidateCheckpoint != RecallWorldGateway.CheckpointStatus.VERIFIED) {
+            TransferAdvanceOutcome outcome = fromCheckpoint(
+                    operation, candidateCheckpoint, "candidate checkpoint contradicted identity");
+            TransferAdvanceOutcome containment = containCandidateIntent(operation);
+            if (containment == TransferAdvanceOutcome.INTEGRITY_CONFLICT
+                    || containment == TransferAdvanceOutcome.PERSISTENCE_FAILURE) {
+                outcome = containment;
+            }
+            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                    ContextualOutcome.failure(fromTransferOutcome(outcome)));
+        }
+        MountRepository.TransferStatus candidateRecorded =
+                repository.markCandidateSpawned(operation.getOperationId());
+        if (candidateRecorded != MountRepository.TransferStatus.SUCCESS) {
+            TransferAdvanceOutcome containment = containCandidateIntent(operation);
+            ContextualOutcome.Status status = containment == TransferAdvanceOutcome.INTEGRITY_CONFLICT
+                    ? ContextualOutcome.Status.INTEGRITY_CONFLICT
+                    : fromTransferStatus(candidateRecorded);
+            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                    ContextualOutcome.failure(status));
+        }
+        recordTransferPhase(operation, TransferPhase.CANDIDATE_SPAWNED);
+        if (worldGateway.pauseAfterPhase(TransferPhase.CANDIDATE_SPAWNED)) {
+            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                    ContextualOutcome.failure(ContextualOutcome.Status.INTERNAL_FAILURE));
+        }
+        TransferAdvanceOutcome advanced = advanceTransfer(operation.getOperationId(), true, true);
+        if (advanced != TransferAdvanceOutcome.COMPLETE) {
+            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                    ContextualOutcome.failure(fromTransferOutcome(advanced)));
+        }
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("correlation", correlationId.toString());
+        fields.put("mount", record.getMountId().toString());
+        fields.put("source_dimension", Integer.toString(source.getDimensionId()));
+        fields.put("destination_dimension", Integer.toString(destination.getEvidence().getDimensionId()));
+        diagnostics.detail(DiagnosticCategory.LIFECYCLE, "transfer_commit", fields);
+        return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                ContextualOutcome.success(ContextualOutcome.Status.RECALLED, record.getMountId()));
+    }
+
+    private TransferAdvanceOutcome rollbackSpawnFailure(
+            TransferOperation operation, RecallWorldGateway.CandidateAction action) {
+        if (action == RecallWorldGateway.CandidateAction.CONFLICT) {
+            return blockTransfer(operation.getOperationId(), "candidate UUID conflict during spawn");
+        }
+        if (action == RecallWorldGateway.CandidateAction.UNAVAILABLE) {
+            TransferAdvanceOutcome cancelled = fromRepositoryProgress(
+                    repository.cancelTransfer(operation.getOperationId()));
+            if (cancelled == TransferAdvanceOutcome.PENDING) {
+                return TransferAdvanceOutcome.TEMPORARILY_UNAVAILABLE;
+            }
+            return blockTransfer(
+                    operation.getOperationId(), "candidate intent could not be rolled back");
+        }
+        TransferAdvanceOutcome containment = containCandidateIntent(operation);
+        if (containment == TransferAdvanceOutcome.COMPLETE) {
+            return TransferAdvanceOutcome.PENDING;
+        }
+        return containment;
+    }
+
+    private TransferAdvanceOutcome containCandidateIntent(TransferOperation operation) {
+        RecallWorldGateway.TransferEvidence evidence = worldGateway.inspectTransfer(operation);
+        if (evidence.hasConflict()
+                || evidence.getSource() != RecallWorldGateway.TransferEvidence.Presence.EXACT
+                || evidence.getCandidate() == RecallWorldGateway.TransferEvidence.Presence.FINALIZED
+                || evidence.getCandidate() == RecallWorldGateway.TransferEvidence.Presence.UNAVAILABLE) {
+            return blockTransfer(
+                    operation.getOperationId(), "candidate intent could not be contained safely");
+        }
+        if (evidence.getCandidate() == RecallWorldGateway.TransferEvidence.Presence.EXACT) {
+            RecallWorldGateway.PhysicalAction removal = worldGateway.removeCandidate(operation);
+            if (removal != RecallWorldGateway.PhysicalAction.SUCCESS) {
+                return blockTransfer(
+                        operation.getOperationId(), "candidate intent cleanup did not complete");
+            }
+        } else if (evidence.getCandidate()
+                != RecallWorldGateway.TransferEvidence.Presence.MISSING) {
+            return blockTransfer(
+                    operation.getOperationId(), "candidate intent evidence is invalid");
+        }
+        RecallWorldGateway.CheckpointStatus absent = worldGateway.checkpointCandidateAbsent(operation);
+        if (absent != RecallWorldGateway.CheckpointStatus.VERIFIED) {
+            return blockTransfer(
+                    operation.getOperationId(), "candidate intent absence could not be fenced");
+        }
+        MountRepository.TransferStatus cancelled =
+                repository.cancelTransfer(operation.getOperationId());
+        if (cancelled == MountRepository.TransferStatus.SUCCESS) {
+            return TransferAdvanceOutcome.COMPLETE;
+        }
+        return blockTransfer(
+                operation.getOperationId(), "candidate intent rollback was not acknowledged");
+    }
+
+    private TransferAdvanceOutcome advanceTransfer(
+            UUID operationId, boolean sourceObserved, boolean candidateObserved) {
+        for (int guard = 0; guard < 12; guard++) {
+            TransferOperation operation = repository.findTransfer(operationId).orElse(null);
+            if (operation == null) {
+                return TransferAdvanceOutcome.COMPLETE;
+            }
+            if (!operation.getPhase().isActionIntent()
+                    && worldGateway.pauseAfterPhase(operation.getPhase())) {
+                return TransferAdvanceOutcome.PENDING;
+            }
+            if (!isRecoveryReady(operation.getPhase(), sourceObserved, candidateObserved)) {
+                return TransferAdvanceOutcome.PENDING;
+            }
+            boolean inspectSource = operation.getPhase() != TransferPhase.SOURCE_REMOVED;
+            boolean inspectCandidate = operation.getPhase() != TransferPhase.PREPARED;
+            RecallWorldGateway.TransferEvidence evidence =
+                    worldGateway.inspectTransfer(operation, inspectSource, inspectCandidate);
+            if (evidence.hasConflict()) {
+                return blockTransfer(operationId, "conflicting physical transfer evidence");
+            }
+            if ((inspectSource
+                            && evidence.getSource()
+                                    == RecallWorldGateway.TransferEvidence.Presence.UNAVAILABLE)
+                    || (inspectCandidate
+                            && evidence.getCandidate()
+                                    == RecallWorldGateway.TransferEvidence.Presence.UNAVAILABLE)) {
+                return TransferAdvanceOutcome.TEMPORARILY_UNAVAILABLE;
+            }
+            MountRepository.TransferStatus evidenceUpdate = updateRelocatedEvidence(operation, evidence);
+            if (evidenceUpdate != null) {
+                if (evidenceUpdate == MountRepository.TransferStatus.SUCCESS) {
+                    continue;
+                }
+                if (operation.getPhase().isActionIntent()) {
+                    return blockTransfer(
+                            operationId,
+                            "action-intent evidence correction was not acknowledged");
+                }
+                return fromRepositoryProgress(evidenceUpdate);
+            }
+            switch (operation.getPhase()) {
+                case PREPARED:
+                    if (evidence.getSource() != RecallWorldGateway.TransferEvidence.Presence.EXACT) {
+                        return TransferAdvanceOutcome.PENDING;
+                    }
+                    return fromRepositoryProgress(repository.cancelTransfer(operationId));
+                case CANDIDATE_SPAWN_INTENT:
+                    if (evidence.getSource() != RecallWorldGateway.TransferEvidence.Presence.EXACT) {
+                        return TransferAdvanceOutcome.PENDING;
+                    }
+                    if (evidence.getCandidate() == RecallWorldGateway.TransferEvidence.Presence.MISSING) {
+                        TransferAdvanceOutcome candidateAbsent = fromCheckpoint(
+                                operation,
+                                worldGateway.checkpointCandidateAbsent(operation),
+                                "candidate intent absence checkpoint contradicted identity");
+                        if (candidateAbsent != TransferAdvanceOutcome.PENDING) {
+                            TransferAdvanceOutcome containment = containCandidateIntent(operation);
+                            return containment == TransferAdvanceOutcome.COMPLETE
+                                    ? candidateAbsent
+                                    : containment;
+                        }
+                        MountRepository.TransferStatus cancelled =
+                                repository.cancelTransfer(operationId);
+                        if (cancelled == MountRepository.TransferStatus.SUCCESS) {
+                            return TransferAdvanceOutcome.PENDING;
+                        }
+                        return blockTransfer(
+                                operationId,
+                                "candidate intent cancellation was not acknowledged");
+                    }
+                    if (evidence.getCandidate() != RecallWorldGateway.TransferEvidence.Presence.EXACT) {
+                        return blockTransfer(operationId, "candidate intent evidence is invalid");
+                    }
+                    TransferAdvanceOutcome intentCandidateCheckpoint = fromCheckpoint(
+                            operation,
+                            worldGateway.checkpointCandidate(operation, true),
+                            "candidate intent checkpoint contradicted identity");
+                    if (intentCandidateCheckpoint != TransferAdvanceOutcome.PENDING) {
+                        TransferAdvanceOutcome containment = containCandidateIntent(operation);
+                        return containment == TransferAdvanceOutcome.COMPLETE
+                                ? intentCandidateCheckpoint
+                                : containment;
+                    }
+                    TransferAdvanceOutcome spawnedRecorded = fromRepositoryProgress(
+                            repository.markCandidateSpawned(operationId));
+                    if (spawnedRecorded != TransferAdvanceOutcome.PENDING) {
+                        TransferAdvanceOutcome containment = containCandidateIntent(operation);
+                        return containment == TransferAdvanceOutcome.COMPLETE
+                                ? spawnedRecorded
+                                : containment;
+                    }
+                    recordTransferPhase(operation, TransferPhase.CANDIDATE_SPAWNED);
+                    break;
+                case CANDIDATE_SPAWNED:
+                    if (evidence.getCandidate() != RecallWorldGateway.TransferEvidence.Presence.EXACT
+                            || evidence.getSource() != RecallWorldGateway.TransferEvidence.Presence.EXACT) {
+                        return TransferAdvanceOutcome.PENDING;
+                    }
+                    TransferAdvanceOutcome candidateCheckpoint = fromCheckpoint(
+                            operation,
+                            worldGateway.checkpointCandidate(operation, true),
+                            "candidate checkpoint contradicted identity");
+                    if (candidateCheckpoint != TransferAdvanceOutcome.PENDING) {
+                        return candidateCheckpoint;
+                    }
+                    TransferAdvanceOutcome associated = fromRepositoryProgress(
+                            repository.associateTransferCandidate(operationId));
+                    if (associated != TransferAdvanceOutcome.PENDING) {
+                        return associated;
+                    }
+                    recordTransferPhase(operation, TransferPhase.ASSOCIATED);
+                    if (worldGateway.pauseAfterPhase(TransferPhase.ASSOCIATED)) {
+                        return TransferAdvanceOutcome.PENDING;
+                    }
+                    break;
+                case ASSOCIATED:
+                    if (evidence.getCandidate() != RecallWorldGateway.TransferEvidence.Presence.EXACT
+                            || evidence.getSource() != RecallWorldGateway.TransferEvidence.Presence.EXACT) {
+                        return TransferAdvanceOutcome.PENDING;
+                    }
+                    TransferAdvanceOutcome validatedRemoval = fromPhysicalAction(
+                            operation,
+                            worldGateway.validateSourceRemoval(operation),
+                            "source removal preparation contradicted identity");
+                    if (validatedRemoval != TransferAdvanceOutcome.PENDING) {
+                        return validatedRemoval;
+                    }
+                    TransferAdvanceOutcome removalIntent = fromRepositoryProgress(
+                            repository.markSourceRemovalIntent(operationId));
+                    if (removalIntent != TransferAdvanceOutcome.PENDING) {
+                        return removalIntent;
+                    }
+                    recordTransferPhase(operation, TransferPhase.SOURCE_REMOVAL_INTENT);
+                    worldGateway.transferPhaseAcknowledged(TransferPhase.SOURCE_REMOVAL_INTENT);
+                    break;
+                case SOURCE_REMOVAL_INTENT:
+                    if (evidence.getCandidate() != RecallWorldGateway.TransferEvidence.Presence.EXACT) {
+                        return TransferAdvanceOutcome.PENDING;
+                    }
+                    if (evidence.getSource() == RecallWorldGateway.TransferEvidence.Presence.EXACT) {
+                        RecallWorldGateway.PhysicalAction removalAction =
+                                worldGateway.removeSource(operation);
+                        if (removalAction == RecallWorldGateway.PhysicalAction.FAILED) {
+                            return blockTransfer(
+                                    operationId,
+                                    "source removal could not prove original relationship restoration");
+                        }
+                        TransferAdvanceOutcome removal = fromPhysicalAction(
+                                operation, removalAction, "source removal contradicted identity");
+                        if (removal != TransferAdvanceOutcome.PENDING) {
+                            MountRepository.TransferStatus rolledBack =
+                                    repository.rollbackSourceRemovalIntent(operationId);
+                            if (rolledBack == MountRepository.TransferStatus.SUCCESS) {
+                                return removal;
+                            }
+                            return blockTransfer(
+                                    operationId, "source removal intent rollback was not acknowledged");
+                        }
+                    } else if (evidence.getSource()
+                            != RecallWorldGateway.TransferEvidence.Presence.MISSING) {
+                        return TransferAdvanceOutcome.PENDING;
+                    }
+                    TransferAdvanceOutcome sourceCheckpoint = fromCheckpoint(
+                            operation,
+                            worldGateway.checkpointSourceAbsent(operation),
+                            "source absence checkpoint contradicted identity");
+                    if (sourceCheckpoint != TransferAdvanceOutcome.PENDING) {
+                        return blockTransfer(
+                                operationId, "source removal intent absence could not be fenced");
+                    }
+                    TransferAdvanceOutcome sourceRecorded = fromRepositoryProgress(
+                            repository.markTransferSourceRemoved(operationId));
+                    if (sourceRecorded != TransferAdvanceOutcome.PENDING) {
+                        return blockTransfer(
+                                operationId, "source removal acknowledgement failed after absence fence");
+                    }
+                    recordTransferPhase(operation, TransferPhase.SOURCE_REMOVED);
+                    if (worldGateway.pauseAfterPhase(TransferPhase.SOURCE_REMOVED)) {
+                        return TransferAdvanceOutcome.PENDING;
+                    }
+                    break;
+                case SOURCE_REMOVED:
+                    if (evidence.getCandidate() != RecallWorldGateway.TransferEvidence.Presence.EXACT
+                                    && evidence.getCandidate()
+                                            != RecallWorldGateway.TransferEvidence.Presence.FINALIZED) {
+                        return TransferAdvanceOutcome.PENDING;
+                    }
+                    if (evidence.getCandidate() == RecallWorldGateway.TransferEvidence.Presence.EXACT) {
+                        TransferAdvanceOutcome markerClear = fromPhysicalAction(
+                                operation,
+                                worldGateway.clearCandidateOperationMarker(operation),
+                                "candidate marker cleanup contradicted identity");
+                        if (markerClear != TransferAdvanceOutcome.PENDING) {
+                            return markerClear;
+                        }
+                    }
+                    TransferAdvanceOutcome finalCandidateCheckpoint = fromCheckpoint(
+                            operation,
+                            worldGateway.checkpointCandidate(operation, false),
+                            "final candidate checkpoint contradicted identity");
+                    if (finalCandidateCheckpoint != TransferAdvanceOutcome.PENDING) {
+                        return finalCandidateCheckpoint;
+                    }
+                    TransferAdvanceOutcome finished = fromRepositoryProgress(
+                            repository.finishTransfer(operationId));
+                    if (finished != TransferAdvanceOutcome.PENDING) {
+                        return finished;
+                    }
+                    recordTransferPhase(operation, null);
+                    return TransferAdvanceOutcome.COMPLETE;
+                case INTEGRITY_BLOCKED:
+                default:
+                    return TransferAdvanceOutcome.INTEGRITY_CONFLICT;
+            }
+        }
+        return TransferAdvanceOutcome.PENDING;
+    }
+
+    private static boolean isRecoveryReady(
+            TransferPhase phase, boolean sourceObserved, boolean candidateObserved) {
+        switch (phase) {
+            case PREPARED:
+            case CANDIDATE_SPAWN_INTENT:
+                return sourceObserved;
+            case CANDIDATE_SPAWNED:
+            case ASSOCIATED:
+                return sourceObserved && candidateObserved;
+            case SOURCE_REMOVAL_INTENT:
+            case SOURCE_REMOVED:
+                return candidateObserved;
+            case INTEGRITY_BLOCKED:
+            default:
+                return false;
+        }
+    }
+
+    private TransferAdvanceOutcome fromCheckpoint(
+            TransferOperation operation,
+            RecallWorldGateway.CheckpointStatus status,
+            String conflictReason) {
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("correlation", operation.getOperationId().toString());
+        fields.put("mount", operation.getMountId().toString());
+        fields.put("phase", operation.getPhase().name());
+        fields.put("checkpoint", conflictReason);
+        fields.put("result", status.name());
+        fields.put("store_revision", Long.toString(repository.getStoreRevision()));
+        diagnostics.detail(DiagnosticCategory.LIFECYCLE, "transfer_checkpoint", fields);
+        switch (status) {
+            case VERIFIED:
+                return TransferAdvanceOutcome.PENDING;
+            case UNAVAILABLE:
+                diagnostics.essentialLifecycleWarning(
+                        "transfer_evidence_unavailable", conflictReason);
+                return TransferAdvanceOutcome.TEMPORARILY_UNAVAILABLE;
+            case INTEGRITY_CONFLICT:
+                return blockTransfer(operation.getOperationId(), conflictReason);
+            case FAILED:
+            default:
+                diagnostics.essentialLifecycleWarning(
+                        "transfer_physical_fence_failed", conflictReason);
+                return TransferAdvanceOutcome.PERSISTENCE_FAILURE;
+        }
+    }
+
+    private TransferAdvanceOutcome fromPhysicalAction(
+            TransferOperation operation,
+            RecallWorldGateway.PhysicalAction action,
+            String conflictReason) {
+        switch (action) {
+            case SUCCESS:
+                return TransferAdvanceOutcome.PENDING;
+            case FAILED_RESTORED:
+                diagnostics.essentialLifecycleWarning(
+                        "transfer_physical_action_failed", conflictReason);
+                return TransferAdvanceOutcome.PERSISTENCE_FAILURE;
+            case UNAVAILABLE:
+                return TransferAdvanceOutcome.TEMPORARILY_UNAVAILABLE;
+            case CONFLICT:
+                return blockTransfer(operation.getOperationId(), conflictReason);
+            case FAILED:
+            default:
+                diagnostics.essentialLifecycleWarning(
+                        "transfer_physical_action_failed", conflictReason);
+                return TransferAdvanceOutcome.PERSISTENCE_FAILURE;
+        }
+    }
+
+    private TransferAdvanceOutcome fromRepositoryProgress(MountRepository.TransferStatus status) {
+        switch (status) {
+            case SUCCESS:
+                return TransferAdvanceOutcome.PENDING;
+            case INTEGRITY_CONFLICT:
+                return TransferAdvanceOutcome.INTEGRITY_CONFLICT;
+            case PERSISTENCE_FAILURE:
+                diagnostics.essentialLifecycleWarning(
+                        "transfer_journal_acknowledgement_failed",
+                        "authorizing transfer transition was not acknowledged");
+                return TransferAdvanceOutcome.PERSISTENCE_FAILURE;
+            case REJECTED:
+            default:
+                return TransferAdvanceOutcome.PERSISTENCE_FAILURE;
+        }
+    }
+
+    private TransferAdvanceOutcome blockTransfer(UUID operationId, String reason) {
+        TransferOperation unresolved = repository.findTransfer(operationId).orElse(null);
+        MountRepository.TransferStatus status = repository.blockTransfer(operationId, reason);
+        if (status == MountRepository.TransferStatus.PERSISTENCE_FAILURE
+                && unresolved != null
+                && unresolved.getPhase().isActionIntent()) {
+            throw new FatalTransferSafetyException(
+                    operationId, unresolved.getPhase(), reason);
+        }
+        return status == MountRepository.TransferStatus.PERSISTENCE_FAILURE
+                ? TransferAdvanceOutcome.PERSISTENCE_FAILURE
+                : TransferAdvanceOutcome.INTEGRITY_CONFLICT;
+    }
+
+    private static ContextualOutcome.Status fromTransferStatus(
+            MountRepository.TransferStatus status) {
+        if (status == MountRepository.TransferStatus.INTEGRITY_CONFLICT) {
+            return ContextualOutcome.Status.INTEGRITY_CONFLICT;
+        }
+        if (status == MountRepository.TransferStatus.PERSISTENCE_FAILURE) {
+            return ContextualOutcome.Status.PERSISTENCE_FAILURE;
+        }
+        return ContextualOutcome.Status.INTERNAL_FAILURE;
+    }
+
+    private static ContextualOutcome.Status fromTransferOutcome(
+            TransferAdvanceOutcome outcome) {
+        switch (outcome) {
+            case INTEGRITY_CONFLICT:
+                return ContextualOutcome.Status.INTEGRITY_CONFLICT;
+            case TEMPORARILY_UNAVAILABLE:
+                return ContextualOutcome.Status.TEMPORARILY_UNAVAILABLE;
+            case PERSISTENCE_FAILURE:
+                return ContextualOutcome.Status.PERSISTENCE_FAILURE;
+            default:
+                return ContextualOutcome.Status.INTERNAL_FAILURE;
+        }
+    }
+
+    private MountRepository.TransferStatus updateRelocatedEvidence(
+            TransferOperation operation, RecallWorldGateway.TransferEvidence evidence) {
+        LastKnownEvidence source = evidence.getActualSourceEvidence()
+                .orElse(operation.getSourceEvidence());
+        LastKnownEvidence destination = evidence.getActualCandidateEvidence()
+                .orElse(operation.getDestinationEvidence());
+        if (source.equals(operation.getSourceEvidence())
+                && destination.equals(operation.getDestinationEvidence())) {
+            return null;
+        }
+        return repository.updateTransferEvidence(
+                operation.getOperationId(), source, destination);
+    }
+
+    private void recordTransferPhase(TransferOperation operation, TransferPhase phase) {
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("correlation", operation.getOperationId().toString());
+        fields.put("mount", operation.getMountId().toString());
+        fields.put("phase", phase == null ? "FINALIZED" : phase.name());
+        fields.put("source_entity", operation.getSourceEntityId().toString());
+        fields.put("candidate_entity", operation.getCandidateEntityId().toString());
+        fields.put("source_dimension", Integer.toString(
+                operation.getSourceEvidence().getDimensionId()));
+        fields.put("destination_dimension", Integer.toString(
+                operation.getDestinationEvidence().getDimensionId()));
+        fields.put("store_revision", Long.toString(repository.getStoreRevision()));
+        diagnostics.detail(DiagnosticCategory.LIFECYCLE, "transfer_phase", fields);
     }
 
     RegistrationOutcome commitVerifiedRegistration(

@@ -4,6 +4,9 @@ import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.world.WorldServer;
 import net.minecraft.world.storage.MapStorage;
 import net.minecraft.world.storage.WorldSavedData;
+import java.util.Objects;
+import java.util.function.BiConsumer;
+import java.util.function.BooleanSupplier;
 
 public final class MountSavedData extends WorldSavedData {
 
@@ -21,12 +24,37 @@ public final class MountSavedData extends WorldSavedData {
     }
 
     public static MountSavedData get(WorldServer overworld) {
+        return get(overworld, () -> false);
+    }
+
+    public static MountSavedData get(
+            WorldServer overworld, BooleanSupplier acknowledgementFault) {
+        return get(overworld, acknowledgementFault, (stage, cause) -> { });
+    }
+
+    public static MountSavedData get(
+            WorldServer overworld,
+            BooleanSupplier acknowledgementFault,
+            BiConsumer<String, String> failureReporter) {
+        Objects.requireNonNull(acknowledgementFault, "acknowledgementFault");
+        Objects.requireNonNull(failureReporter, "failureReporter");
         MapStorage storage = overworld.getPerWorldStorage();
         MountSavedData data = (MountSavedData) storage.getOrLoadData(MountSavedData.class, DATA_NAME);
         if (data == null) {
             data = new MountSavedData();
             storage.setData(DATA_NAME, data);
             data.markDirty();
+        }
+        java.io.File dataFile = overworld.getSaveHandler().getMapFileFromName(DATA_NAME);
+        if (dataFile != null) {
+            AcknowledgedMountStore acknowledgedStore = new AcknowledgedMountStore(
+                    dataFile,
+                    data,
+                    acknowledgementFault,
+                    (stage, cause) -> failureReporter.accept(stage.name(), cause));
+            data.repository.setAcknowledgedPersistence(acknowledgedStore::commit);
+        } else {
+            data.repository.setAcknowledgedPersistence(ignored -> false);
         }
         return data;
     }
@@ -44,9 +72,12 @@ public final class MountSavedData extends WorldSavedData {
             repository.load(new MountRepository.RepositorySnapshot(
                     java.util.Collections.emptyMap(),
                     java.util.Collections.emptyMap(),
+                    java.util.Collections.emptyMap(),
+                    java.util.Collections.emptyList(),
                     java.util.Collections.emptyList(),
                     java.util.Collections.emptyList(),
                     1L,
+                    0L,
                     0L,
                     true));
             return;

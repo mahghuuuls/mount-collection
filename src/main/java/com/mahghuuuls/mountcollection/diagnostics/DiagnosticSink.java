@@ -7,4 +7,6 @@ public interface DiagnosticSink {
     void detail(DiagnosticCategory category, String event, Map<String, String> fields);
 
     void essentialWarning(String category, String rejectedValue, String fallback);
+
+    void essentialLifecycleWarning(String event, String detail);
 }

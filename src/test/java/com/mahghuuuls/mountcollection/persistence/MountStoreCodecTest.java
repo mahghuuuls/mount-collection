@@ -63,6 +63,89 @@ final class MountStoreCodecTest {
     }
 
     @Test
+    void transferJournalRoundTripPreservesEveryRecoveryFieldAndPhase() {
+        MountSavedData source = new MountSavedData("test");
+        UUID owner = UUID.randomUUID();
+        MountRecord record = register(
+                source.getRepository(), owner, UUID.randomUUID()).getRecord().get();
+        source.getRepository().updateActiveTick(700L);
+        NBTTagCompound snapshot = new NBTTagCompound();
+        snapshot.setString("id", "minecraft:horse");
+        snapshot.setUniqueId("UUID", record.getPhysicalEntityId());
+        TransferOperation operation = new TransferOperation(
+                UUID.randomUUID(), record.getMountId(), owner, record.getPhysicalEntityId(),
+                UUID.randomUUID(), record.getLastKnown(),
+                new LastKnownEvidence(-1, 12.5D, 70.0D, -3.5D), snapshot,
+                900L, 200L, TransferPhase.PREPARED, null);
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                source.getRepository().beginTransfer(operation));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                source.getRepository().markCandidateSpawnIntent(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                source.getRepository().markCandidateSpawned(operation.getOperationId()));
+
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(source.writeToNBT(new NBTTagCompound()));
+        TransferOperation decoded = restored.getRepository()
+                .findTransfer(operation.getOperationId()).get();
+
+        assertEquals(TransferPhase.CANDIDATE_SPAWNED, decoded.getPhase());
+        assertEquals(operation.getMountId(), decoded.getMountId());
+        assertEquals(operation.getSourceEntityId(), decoded.getSourceEntityId());
+        assertEquals(operation.getCandidateEntityId(), decoded.getCandidateEntityId());
+        assertEquals(operation.getDestinationEvidence(), decoded.getDestinationEvidence());
+        assertEquals("minecraft:horse", decoded.copySourceSnapshot().getString("id"));
+        assertEquals(900L, decoded.getCooldownDeadline());
+        assertEquals(200L, decoded.getCooldownDuration());
+    }
+
+    @Test
+    void malformedTransferIsRetainedAndItsKnownMountIsQuarantined() {
+        MountSavedData source = new MountSavedData("test");
+        MountRecord record = register(
+                source.getRepository(), UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        NBTTagCompound root = source.writeToNBT(new NBTTagCompound());
+        NBTTagCompound malformed = new NBTTagCompound();
+        malformed.setInteger("Version", 99);
+        malformed.setString("OperationId", UUID.randomUUID().toString());
+        malformed.setString("MountId", record.getMountId().toString());
+        root.getTagList("Transfers", 10).appendTag(malformed);
+
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(root);
+        NBTTagCompound rewritten = restored.writeToNBT(new NBTTagCompound());
+
+        assertEquals(MountCondition.INTEGRITY_BLOCKED,
+                restored.getRepository().find(record.getMountId()).get().getCondition());
+        assertEquals(1, rewritten.getTagList("Transfers", 10).tagCount());
+        assertEquals(99, rewritten.getTagList("Transfers", 10)
+                .getCompoundTagAt(0).getInteger("Version"));
+    }
+
+    @Test
+    void versionOnePendingTransferFailsClosedInsteadOfUsingPreIntentRecoveryRules() {
+        MountSavedData source = new MountSavedData("test");
+        MountRecord record = register(
+                source.getRepository(), UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        TransferOperation operation = operation(record);
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                source.getRepository().beginTransfer(operation));
+        NBTTagCompound root = source.writeToNBT(new NBTTagCompound());
+        root.getTagList("Transfers", 10).getCompoundTagAt(0).setInteger("Version", 1);
+
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(root);
+        NBTTagCompound rewritten = restored.writeToNBT(new NBTTagCompound());
+
+        assertTrue(restored.getRepository().getPendingTransfers().isEmpty());
+        assertEquals(MountCondition.INTEGRITY_BLOCKED,
+                restored.getRepository().find(record.getMountId()).get().getCondition());
+        assertEquals(1, rewritten.getTagList("Transfers", 10).tagCount());
+        assertEquals(1, rewritten.getTagList("Transfers", 10)
+                .getCompoundTagAt(0).getInteger("Version"));
+    }
+
+    @Test
     void futureRootSchemaRemainsReadOnlyAndByteForByteSemanticallyPreserved() {
         NBTTagCompound future = new NBTTagCompound();
         future.setInteger("RootVersion", 99);
@@ -207,12 +290,8 @@ final class MountStoreCodecTest {
 
     @Test
     void negativePersistedClockReachesClockAnomalyHandling() {
-        NBTTagCompound root = new NBTTagCompound();
-        root.setInteger("RootVersion", MountStoreCodec.CURRENT_ROOT_VERSION);
-        root.setLong("NextRegistrationOrder", 1L);
+        NBTTagCompound root = new MountSavedData("test").writeToNBT(new NBTTagCompound());
         root.setLong("ActiveTick", -7L);
-        root.setTag("Records", new NBTTagList());
-        root.setTag("Players", new NBTTagList());
         MountSavedData restored = new MountSavedData("test");
         restored.readFromNBT(root);
         ActiveServerClock clock = new ActiveServerClock();
@@ -432,6 +511,280 @@ final class MountStoreCodecTest {
 
         assertTrue(restored.getRepository().isReadOnly());
         assertEquals("not-a-number", rewritten.getString("RootVersion"));
+    }
+
+    @Test
+    void everyPersistedTransferPhaseReloadsThroughTheProductionCodec() {
+        for (TransferPhase expected : new TransferPhase[] {
+                TransferPhase.PREPARED,
+                TransferPhase.CANDIDATE_SPAWN_INTENT,
+                TransferPhase.CANDIDATE_SPAWNED,
+                TransferPhase.ASSOCIATED,
+                TransferPhase.SOURCE_REMOVAL_INTENT,
+                TransferPhase.SOURCE_REMOVED}) {
+            MountSavedData source = new MountSavedData("test");
+            MountRecord record = register(
+                    source.getRepository(), UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+            TransferOperation operation = operation(record);
+            assertEquals(MountRepository.TransferStatus.SUCCESS,
+                    source.getRepository().beginTransfer(operation));
+            if (expected.ordinal() >= TransferPhase.CANDIDATE_SPAWN_INTENT.ordinal()) {
+                assertEquals(MountRepository.TransferStatus.SUCCESS,
+                        source.getRepository().markCandidateSpawnIntent(operation.getOperationId()));
+            }
+            if (expected.ordinal() >= TransferPhase.CANDIDATE_SPAWNED.ordinal()) {
+                assertEquals(MountRepository.TransferStatus.SUCCESS,
+                        source.getRepository().markCandidateSpawned(operation.getOperationId()));
+            }
+            if (expected.ordinal() >= TransferPhase.ASSOCIATED.ordinal()) {
+                assertEquals(MountRepository.TransferStatus.SUCCESS,
+                        source.getRepository().associateTransferCandidate(operation.getOperationId()));
+            }
+            if (expected.ordinal() >= TransferPhase.SOURCE_REMOVAL_INTENT.ordinal()) {
+                assertEquals(MountRepository.TransferStatus.SUCCESS,
+                        source.getRepository().markSourceRemovalIntent(operation.getOperationId()));
+            }
+            if (expected.ordinal() >= TransferPhase.SOURCE_REMOVED.ordinal()) {
+                assertEquals(MountRepository.TransferStatus.SUCCESS,
+                        source.getRepository().markTransferSourceRemoved(operation.getOperationId()));
+            }
+
+            MountSavedData restored = new MountSavedData("test");
+            restored.readFromNBT(source.writeToNBT(new NBTTagCompound()));
+
+            assertEquals(expected,
+                    restored.getRepository().findTransfer(operation.getOperationId()).get().getPhase());
+            assertEquals(MountCondition.OPERATION_IN_PROGRESS,
+                    restored.getRepository().find(record.getMountId()).get().getCondition());
+            assertEquals(
+                    expected.ordinal() < TransferPhase.ASSOCIATED.ordinal()
+                            ? operation.getSourceEntityId()
+                            : operation.getCandidateEntityId(),
+                    restored.getRepository().find(record.getMountId()).get().getPhysicalEntityId());
+        }
+    }
+
+    @Test
+    void wronglyTypedTransferFieldIsRetainedAndQuarantinesItsMount() {
+        MountSavedData source = new MountSavedData("test");
+        MountRecord record = register(
+                source.getRepository(), UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        TransferOperation operation = operation(record);
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                source.getRepository().beginTransfer(operation));
+        NBTTagCompound root = source.writeToNBT(new NBTTagCompound());
+        root.getTagList("Transfers", 10).getCompoundTagAt(0)
+                .setString("CooldownDeadline", "200");
+
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(root);
+        NBTTagCompound rewritten = restored.writeToNBT(new NBTTagCompound());
+
+        assertEquals(MountCondition.INTEGRITY_BLOCKED,
+                restored.getRepository().find(record.getMountId()).get().getCondition());
+        assertTrue(restored.getRepository().getPendingTransfers().isEmpty());
+        assertEquals(8, rewritten.getTagList("Transfers", 10)
+                .getCompoundTagAt(0).getTagId("CooldownDeadline"));
+    }
+
+    @Test
+    void currentRootRequiresExactRevisionAndTransferContainerTypes() {
+        MountSavedData source = new MountSavedData("test");
+        NBTTagCompound valid = source.writeToNBT(new NBTTagCompound());
+
+        for (String missing : new String[] {"StoreRevision", "Transfers"}) {
+            NBTTagCompound malformed = valid.copy();
+            malformed.removeTag(missing);
+            MountSavedData restored = new MountSavedData("test");
+            restored.readFromNBT(malformed);
+            assertTrue(restored.getRepository().isReadOnly());
+        }
+
+        NBTTagCompound wrongRevision = valid.copy();
+        wrongRevision.setInteger("StoreRevision", 0);
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(wrongRevision);
+        assertTrue(restored.getRepository().isReadOnly());
+    }
+
+    @Test
+    void everyRequiredTransferFieldIsMandatoryInTheCurrentSchema() {
+        MountSavedData source = new MountSavedData("test");
+        MountRecord record = register(
+                source.getRepository(), UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        TransferOperation operation = operation(record);
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                source.getRepository().beginTransfer(operation));
+        NBTTagCompound valid = source.writeToNBT(new NBTTagCompound());
+
+        for (String missing : new String[] {
+                "Version", "OperationId", "MountId", "OwnerId", "SourceEntityId",
+                "CandidateEntityId", "SourceSnapshot", "SourceEvidence",
+                "DestinationEvidence", "CooldownDeadline", "CooldownDuration", "Phase"}) {
+            NBTTagCompound malformed = valid.copy();
+            malformed.getTagList("Transfers", 10).getCompoundTagAt(0).removeTag(missing);
+            assertMalformedTransferQuarantined(malformed, record.getMountId());
+        }
+    }
+
+    @Test
+    void transferSnapshotIdentityEvidenceAndTimingMustMatchTheRecord() {
+        MountSavedData source = new MountSavedData("test");
+        MountRecord record = register(
+                source.getRepository(), UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        TransferOperation operation = operation(record);
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                source.getRepository().beginTransfer(operation));
+        NBTTagCompound valid = source.writeToNBT(new NBTTagCompound());
+
+        NBTTagCompound wrongType = valid.copy();
+        wrongType.getTagList("Transfers", 10).getCompoundTagAt(0)
+                .getCompoundTag("SourceSnapshot").setString("id", "minecraft:pig");
+        assertSemanticTransferQuarantined(wrongType, operation);
+
+        NBTTagCompound wrongSnapshotUuid = valid.copy();
+        wrongSnapshotUuid.getTagList("Transfers", 10).getCompoundTagAt(0)
+                .getCompoundTag("SourceSnapshot").setUniqueId("UUID", UUID.randomUUID());
+        assertSemanticTransferQuarantined(wrongSnapshotUuid, operation);
+
+        NBTTagCompound wrongEvidence = valid.copy();
+        wrongEvidence.getTagList("Transfers", 10).getCompoundTagAt(0)
+                .getCompoundTag("SourceEvidence").setDouble("X", 99.0D);
+        assertSemanticTransferQuarantined(wrongEvidence, operation);
+
+        NBTTagCompound excessiveDeadline = valid.copy();
+        excessiveDeadline.getTagList("Transfers", 10).getCompoundTagAt(0)
+                .setLong("CooldownDeadline", 201L);
+        assertSemanticTransferQuarantined(excessiveDeadline, operation);
+    }
+
+    @Test
+    void duplicateOperationIdentityQuarantinesEveryImplicatedKnownMount() {
+        MountSavedData source = new MountSavedData("test");
+        MountRecord first = register(
+                source.getRepository(), UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        MountRecord second = register(
+                source.getRepository(), UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        TransferOperation operation = operation(first);
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                source.getRepository().beginTransfer(operation));
+        NBTTagCompound root = source.writeToNBT(new NBTTagCompound());
+        NBTTagCompound duplicate = root.getTagList("Transfers", 10)
+                .getCompoundTagAt(0).copy();
+        duplicate.setString("MountId", second.getMountId().toString());
+        duplicate.setString("OwnerId", second.getOwnerId().toString());
+        duplicate.setString("SourceEntityId", second.getPhysicalEntityId().toString());
+        duplicate.setString("CandidateEntityId", UUID.randomUUID().toString());
+        root.getTagList("Transfers", 10).appendTag(duplicate);
+
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(root);
+
+        assertEquals(MountCondition.INTEGRITY_BLOCKED,
+                restored.getRepository().find(first.getMountId()).get().getCondition());
+        assertEquals(MountCondition.INTEGRITY_BLOCKED,
+                restored.getRepository().find(second.getMountId()).get().getCondition());
+        assertTrue(restored.getRepository().getPendingTransfers().isEmpty());
+        assertEquals(2, restored.writeToNBT(new NBTTagCompound())
+                .getTagList("Transfers", 10).tagCount());
+    }
+
+    @Test
+    void malformedDuplicateOperationIdentityQuarantinesTheAcceptedOperation() {
+        MountSavedData source = new MountSavedData("test");
+        MountRecord record = register(
+                source.getRepository(), UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        TransferOperation operation = operation(record);
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                source.getRepository().beginTransfer(operation));
+        NBTTagCompound root = source.writeToNBT(new NBTTagCompound());
+        NBTTagCompound malformed = root.getTagList("Transfers", 10)
+                .getCompoundTagAt(0).copy();
+        malformed.setInteger("Version", 99);
+        malformed.setString("MountId", MountId.create().toString());
+        malformed.setString("OwnerId", UUID.randomUUID().toString());
+        malformed.setString("SourceEntityId", UUID.randomUUID().toString());
+        malformed.setString("CandidateEntityId", UUID.randomUUID().toString());
+        root.getTagList("Transfers", 10).appendTag(malformed);
+
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(root);
+
+        assertEquals(MountCondition.INTEGRITY_BLOCKED,
+                restored.getRepository().find(record.getMountId()).get().getCondition());
+        assertTrue(restored.getRepository().getPendingTransfers().isEmpty());
+        assertEquals(2, restored.writeToNBT(new NBTTagCompound())
+                .getTagList("Transfers", 10).tagCount());
+    }
+
+    @Test
+    void malformedOperationIdentityAlsoQuarantinesALaterValidDuplicate() {
+        MountSavedData source = new MountSavedData("test");
+        MountRecord record = register(
+                source.getRepository(), UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        TransferOperation operation = operation(record);
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                source.getRepository().beginTransfer(operation));
+        NBTTagCompound encoded = source.writeToNBT(new NBTTagCompound());
+        NBTTagCompound valid = encoded.getTagList("Transfers", 10)
+                .getCompoundTagAt(0).copy();
+        NBTTagCompound malformed = valid.copy();
+        malformed.setInteger("Version", 99);
+        malformed.setString("MountId", MountId.create().toString());
+        malformed.setString("OwnerId", UUID.randomUUID().toString());
+        malformed.setString("SourceEntityId", UUID.randomUUID().toString());
+        malformed.setString("CandidateEntityId", UUID.randomUUID().toString());
+        NBTTagList reordered = new NBTTagList();
+        reordered.appendTag(malformed);
+        reordered.appendTag(valid);
+        encoded.setTag("Transfers", reordered);
+
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(encoded);
+
+        assertEquals(MountCondition.INTEGRITY_BLOCKED,
+                restored.getRepository().find(record.getMountId()).get().getCondition());
+        assertTrue(restored.getRepository().getPendingTransfers().isEmpty());
+        assertEquals(2, restored.writeToNBT(new NBTTagCompound())
+                .getTagList("Transfers", 10).tagCount());
+    }
+
+    private static TransferOperation operation(MountRecord record) {
+        NBTTagCompound snapshot = new NBTTagCompound();
+        snapshot.setString("id", "minecraft:horse");
+        snapshot.setUniqueId("UUID", record.getPhysicalEntityId());
+        return new TransferOperation(
+                UUID.randomUUID(),
+                record.getMountId(),
+                record.getOwnerId(),
+                record.getPhysicalEntityId(),
+                UUID.randomUUID(),
+                record.getLastKnown(),
+                new LastKnownEvidence(1, 8.0D, 64.0D, 8.0D),
+                snapshot,
+                200L,
+                200L,
+                TransferPhase.PREPARED,
+                null);
+    }
+
+    private static void assertMalformedTransferQuarantined(
+            NBTTagCompound root, MountId mountId) {
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(root);
+        assertEquals(MountCondition.INTEGRITY_BLOCKED,
+                restored.getRepository().find(mountId).get().getCondition());
+        assertTrue(restored.getRepository().getPendingTransfers().isEmpty());
+    }
+
+    private static void assertSemanticTransferQuarantined(
+            NBTTagCompound root, TransferOperation operation) {
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(root);
+        assertEquals(MountCondition.INTEGRITY_BLOCKED,
+                restored.getRepository().find(operation.getMountId()).get().getCondition());
+        assertEquals(TransferPhase.INTEGRITY_BLOCKED,
+                restored.getRepository().findTransfer(operation.getOperationId()).get().getPhase());
     }
 
     private static MountRepository.RegistrationResult register(

@@ -59,7 +59,7 @@ public final class MountRecord {
         if (condition.retainsAuthoritativePhysicalAssociation()
                 && (physicalEntityId == null || lastKnown == null)) {
             throw new IllegalArgumentException(
-                    "living or provider-unavailable records require physical and last-known evidence");
+                    "physically associated records require physical and last-known evidence");
         }
         this.integrityReason = boundedNullable(integrityReason, 160);
         if (providerPayloadVersion < 0) {
@@ -90,6 +90,31 @@ public final class MountRecord {
 
     MountRecord withLastKnown(LastKnownEvidence evidence) {
         return copy(condition, integrityReason, physicalEntityId, evidence);
+    }
+
+    MountRecord withPhysicalEntity(UUID nextPhysicalId, LastKnownEvidence evidence) {
+        return copy(
+                MountCondition.LIVING,
+                null,
+                Objects.requireNonNull(nextPhysicalId, "nextPhysicalId"),
+                Objects.requireNonNull(evidence, "evidence"));
+    }
+
+    MountRecord operationInProgress() {
+        return copy(MountCondition.OPERATION_IN_PROGRESS, null, physicalEntityId, lastKnown);
+    }
+
+    MountRecord operationInProgressWithPhysicalEntity(
+            UUID nextPhysicalId, LastKnownEvidence evidence) {
+        return copy(
+                MountCondition.OPERATION_IN_PROGRESS,
+                null,
+                Objects.requireNonNull(nextPhysicalId, "nextPhysicalId"),
+                Objects.requireNonNull(evidence, "evidence"));
+    }
+
+    MountRecord operationCompleted() {
+        return copy(MountCondition.LIVING, null, physicalEntityId, lastKnown);
     }
 
     MountRecord integrityBlocked(String reason) {

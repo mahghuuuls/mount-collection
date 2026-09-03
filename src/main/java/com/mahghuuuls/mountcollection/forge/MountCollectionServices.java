@@ -18,6 +18,9 @@ public final class MountCollectionServices {
     private final ActiveServerClock activeServerClock;
     private final MountCollectionDiagnostics diagnostics;
     private final InhibitedIntegration inhibitedIntegration;
+    private final LifecycleMutationExecutor lifecycleMutations;
+    private final TransferDevelopmentControls developmentControls =
+            new TransferDevelopmentControls();
     private ValidatedMountConfig activeConfig;
     private MountRepository activeRepository;
     private MountLifecycleService lifecycleService;
@@ -31,6 +34,7 @@ public final class MountCollectionServices {
         this.activeServerClock = activeServerClock;
         this.diagnostics = diagnostics;
         this.inhibitedIntegration = inhibitedIntegration;
+        this.lifecycleMutations = new LifecycleMutationExecutor(diagnostics);
     }
 
     public ProviderRegistry getProviderRegistry() {
@@ -47,6 +51,18 @@ public final class MountCollectionServices {
 
     public InhibitedIntegration getInhibitedIntegration() {
         return inhibitedIntegration;
+    }
+
+    TransferDevelopmentControls getDevelopmentControls() {
+        return developmentControls;
+    }
+
+    public boolean submitLifecycleMutation(Runnable mutation) {
+        return lifecycleMutations.enqueue(mutation);
+    }
+
+    LifecycleMutationExecutor getLifecycleMutationExecutor() {
+        return lifecycleMutations;
     }
 
     public synchronized Optional<ValidatedMountConfig> getActiveConfig() {
@@ -76,13 +92,19 @@ public final class MountCollectionServices {
                 diagnostics,
                 activeServerClock,
                 inhibitedIntegration,
-                new ForgeRecallWorldGateway());
+                new ForgeRecallWorldGateway(
+                        diagnostics,
+                        developmentControls::consumePhysicalFencePostDrainFault,
+                        developmentControls::shouldPause,
+                        developmentControls::phaseAcknowledged));
     }
 
     synchronized void clearActiveConfig() {
         activeConfig = null;
         activeRepository = null;
         lifecycleService = null;
+        lifecycleMutations.reset();
+        developmentControls.clear();
         diagnostics.setDetailedEnabled(false);
     }
 }

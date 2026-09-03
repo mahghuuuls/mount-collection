@@ -23,7 +23,10 @@ public final class ContextualOutcome {
         INHIBITED("mountcollection.message.inhibited"),
         COOLDOWN("mountcollection.message.cooldown"),
         NO_SAFE_DESTINATION("mountcollection.message.no_safe_destination"),
+        OPERATION_IN_PROGRESS("mountcollection.message.operation_in_progress"),
         INTEGRITY_CONFLICT("mountcollection.message.integrity_conflict"),
+        TEMPORARILY_UNAVAILABLE("mountcollection.message.temporarily_unavailable"),
+        PERSISTENCE_FAILURE("mountcollection.message.persistence_failure"),
         PROVIDER_FAILURE("mountcollection.message.provider_failure"),
         READ_ONLY("mountcollection.message.read_only"),
         INTERNAL_FAILURE("mountcollection.message.internal_failure");

@@ -18,6 +18,11 @@ import net.minecraft.util.ResourceLocation;
 public final class MountRepository {
 
     @FunctionalInterface
+    interface AcknowledgedPersistence {
+        boolean commit(RepositorySnapshot expectedSnapshot);
+    }
+
+    @FunctionalInterface
     public interface ProviderPayloadVerifier {
         ProviderResult<ProviderPayload> verify(ResourceLocation providerId, ProviderPayload payload);
     }
@@ -41,6 +46,13 @@ public final class MountRepository {
     public enum RecallCommitStatus {
         SUCCESS,
         REJECTED
+    }
+
+    public enum TransferStatus {
+        SUCCESS,
+        REJECTED,
+        INTEGRITY_CONFLICT,
+        PERSISTENCE_FAILURE
     }
 
     public static final class RegistrationCandidate {
@@ -180,12 +192,16 @@ public final class MountRepository {
     private final Map<UUID, MountId> physicalIndex = new LinkedHashMap<>();
     private final Map<UUID, LinkedHashSet<MountId>> ownerIndex = new LinkedHashMap<>();
     private final Map<UUID, PlayerState> players = new LinkedHashMap<>();
+    private final Map<UUID, TransferOperation> transfers = new LinkedHashMap<>();
     private final List<NBTTagCompound> retainedMalformedRecords = new ArrayList<>();
     private final List<NBTTagCompound> retainedMalformedPlayers = new ArrayList<>();
+    private final List<NBTTagCompound> retainedMalformedTransfers = new ArrayList<>();
     private final Runnable dirtyMarker;
+    private AcknowledgedPersistence acknowledgedPersistence = ignored -> true;
 
     private long nextRegistrationOrder = 1L;
     private long activeTick;
+    private long storeRevision;
     private boolean readOnly;
 
     public MountRepository() {
@@ -194,6 +210,10 @@ public final class MountRepository {
 
     MountRepository(Runnable dirtyMarker) {
         this.dirtyMarker = Objects.requireNonNull(dirtyMarker, "dirtyMarker");
+    }
+
+    synchronized void setAcknowledgedPersistence(AcknowledgedPersistence persistence) {
+        this.acknowledgedPersistence = Objects.requireNonNull(persistence, "persistence");
     }
 
     public synchronized RegistrationResult register(RegistrationCandidate candidate) {
@@ -418,6 +438,284 @@ public final class MountRepository {
         return RecallCommitStatus.SUCCESS;
     }
 
+    public synchronized TransferStatus beginTransfer(TransferOperation operation) {
+        Objects.requireNonNull(operation, "operation");
+        if (readOnly || operation.getPhase() != TransferPhase.PREPARED
+                || transfers.containsKey(operation.getOperationId())) {
+            return TransferStatus.REJECTED;
+        }
+        PlayerState player = players.get(operation.getOwnerId());
+        MountRecord record = records.get(operation.getMountId());
+        NBTTagCompound sourceSnapshot = operation.copySourceSnapshot();
+        if (player == null || player.selectionIntegrityBlocked
+                || !operation.getMountId().equals(player.selectedMountId)
+                || record == null || record.getCondition() != MountCondition.LIVING
+                || !operation.getOwnerId().equals(record.getOwnerId())
+                || !operation.getSourceEntityId().equals(record.getPhysicalEntityId())
+                || !sourceSnapshot.hasKey("id", 8)
+                || !record.getEntityTypeId().toString().equals(sourceSnapshot.getString("id"))) {
+            return TransferStatus.REJECTED;
+        }
+        for (TransferOperation pending : transfers.values()) {
+            if (pending.getMountId().equals(operation.getMountId())) {
+                return TransferStatus.INTEGRITY_CONFLICT;
+            }
+        }
+        RepositorySnapshot before = snapshot();
+        transfers.put(operation.getOperationId(), operation);
+        records.put(operation.getMountId(), record.operationInProgress());
+        return durableCheckpoint(before)
+                ? TransferStatus.SUCCESS
+                : TransferStatus.PERSISTENCE_FAILURE;
+    }
+
+    public synchronized Optional<TransferOperation> findTransfer(UUID operationId) {
+        return Optional.ofNullable(transfers.get(operationId));
+    }
+
+    public synchronized List<TransferOperation> getPendingTransfers() {
+        return Collections.unmodifiableList(new ArrayList<>(transfers.values()));
+    }
+
+    public synchronized Optional<TransferOperation> findTransferByMount(MountId mountId) {
+        for (TransferOperation operation : transfers.values()) {
+            if (operation.getMountId().equals(mountId)) {
+                return Optional.of(operation);
+            }
+        }
+        return Optional.empty();
+    }
+
+    public synchronized boolean isControlledTransferCandidate(
+            UUID operationId, MountId mountId, UUID candidateEntityId) {
+        TransferOperation operation = transfers.get(operationId);
+        return operation != null
+                && operation.getMountId().equals(mountId)
+                && operation.getCandidateEntityId().equals(candidateEntityId)
+                && operation.getPhase() != TransferPhase.INTEGRITY_BLOCKED;
+    }
+
+    public synchronized boolean isControlledTransferSource(MountId mountId, UUID sourceEntityId) {
+        for (TransferOperation operation : transfers.values()) {
+            if (operation.getPhase() != TransferPhase.INTEGRITY_BLOCKED
+                    && operation.getMountId().equals(mountId)
+                    && operation.getSourceEntityId().equals(sourceEntityId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public synchronized TransferStatus markCandidateSpawnIntent(UUID operationId) {
+        return advanceTransfer(
+                operationId, TransferPhase.PREPARED, TransferPhase.CANDIDATE_SPAWN_INTENT);
+    }
+
+    public synchronized TransferStatus markCandidateSpawned(UUID operationId) {
+        return advanceTransfer(
+                operationId,
+                TransferPhase.CANDIDATE_SPAWN_INTENT,
+                TransferPhase.CANDIDATE_SPAWNED);
+    }
+
+    public synchronized TransferStatus updateTransferEvidence(
+            UUID operationId,
+            LastKnownEvidence sourceEvidence,
+            LastKnownEvidence destinationEvidence) {
+        TransferOperation operation = transfers.get(operationId);
+        if (readOnly || operation == null
+                || operation.getPhase() == TransferPhase.INTEGRITY_BLOCKED) {
+            return TransferStatus.REJECTED;
+        }
+        TransferOperation replacement;
+        try {
+            replacement = operation.withEvidence(sourceEvidence, destinationEvidence);
+        } catch (IllegalArgumentException | NullPointerException exception) {
+            return blockTransferInternal(operation, "relocated transfer evidence is invalid");
+        }
+        MountRecord record = records.get(operation.getMountId());
+        if (record == null || record.getCondition() != MountCondition.OPERATION_IN_PROGRESS) {
+            return blockTransferInternal(operation, "relocated transfer record is invalid");
+        }
+        RepositorySnapshot before = snapshot();
+        transfers.put(operationId, replacement);
+        LastKnownEvidence authoritativeEvidence =
+                operation.getPhase() == TransferPhase.PREPARED
+                                || operation.getPhase() == TransferPhase.CANDIDATE_SPAWN_INTENT
+                                || operation.getPhase() == TransferPhase.CANDIDATE_SPAWNED
+                        ? sourceEvidence
+                        : destinationEvidence;
+        records.put(operation.getMountId(), record.withLastKnown(authoritativeEvidence));
+        return durableCheckpoint(before)
+                ? TransferStatus.SUCCESS
+                : TransferStatus.PERSISTENCE_FAILURE;
+    }
+
+    public synchronized TransferStatus associateTransferCandidate(UUID operationId) {
+        TransferOperation operation = transfers.get(operationId);
+        if (readOnly || operation == null || operation.getPhase() != TransferPhase.CANDIDATE_SPAWNED) {
+            return TransferStatus.REJECTED;
+        }
+        MountRecord record = records.get(operation.getMountId());
+        if (record == null || record.getCondition() != MountCondition.OPERATION_IN_PROGRESS
+                || !operation.getSourceEntityId().equals(record.getPhysicalEntityId())
+                || physicalIndex.containsKey(operation.getCandidateEntityId())) {
+            return blockTransferInternal(operation, "transfer association evidence changed");
+        }
+        RepositorySnapshot before = snapshot();
+        physicalIndex.remove(operation.getSourceEntityId());
+        physicalIndex.put(operation.getCandidateEntityId(), operation.getMountId());
+        records.put(operation.getMountId(), record.operationInProgressWithPhysicalEntity(
+                operation.getCandidateEntityId(), operation.getDestinationEvidence()));
+        transfers.put(operationId, operation.withPhase(TransferPhase.ASSOCIATED));
+        return durableCheckpoint(before)
+                ? TransferStatus.SUCCESS
+                : TransferStatus.PERSISTENCE_FAILURE;
+    }
+
+    public synchronized TransferStatus markSourceRemovalIntent(UUID operationId) {
+        return advanceTransfer(
+                operationId, TransferPhase.ASSOCIATED, TransferPhase.SOURCE_REMOVAL_INTENT);
+    }
+
+    public synchronized TransferStatus markTransferSourceRemoved(UUID operationId) {
+        return advanceTransfer(
+                operationId,
+                TransferPhase.SOURCE_REMOVAL_INTENT,
+                TransferPhase.SOURCE_REMOVED);
+    }
+
+    public synchronized TransferStatus rollbackSourceRemovalIntent(UUID operationId) {
+        return advanceTransfer(
+                operationId, TransferPhase.SOURCE_REMOVAL_INTENT, TransferPhase.ASSOCIATED);
+    }
+
+    public synchronized TransferStatus rollbackAssociatedTransfer(UUID operationId) {
+        TransferOperation operation = transfers.get(operationId);
+        if (readOnly || operation == null || operation.getPhase() != TransferPhase.ASSOCIATED) {
+            return TransferStatus.REJECTED;
+        }
+        MountRecord record = records.get(operation.getMountId());
+        if (record == null || record.getCondition() != MountCondition.OPERATION_IN_PROGRESS
+                || !operation.getCandidateEntityId().equals(record.getPhysicalEntityId())) {
+            return blockTransferInternal(operation, "associated rollback evidence changed");
+        }
+        RepositorySnapshot before = snapshot();
+        physicalIndex.remove(operation.getCandidateEntityId());
+        physicalIndex.put(operation.getSourceEntityId(), operation.getMountId());
+        records.put(operation.getMountId(), record
+                .operationInProgressWithPhysicalEntity(
+                        operation.getSourceEntityId(), operation.getSourceEvidence())
+                .operationCompleted());
+        transfers.remove(operationId);
+        return durableCheckpoint(before)
+                ? TransferStatus.SUCCESS
+                : TransferStatus.PERSISTENCE_FAILURE;
+    }
+
+    public synchronized TransferStatus finishTransfer(UUID operationId) {
+        TransferOperation operation = transfers.get(operationId);
+        if (readOnly || operation == null || operation.getPhase() != TransferPhase.SOURCE_REMOVED) {
+            return TransferStatus.REJECTED;
+        }
+        PlayerState player = players.get(operation.getOwnerId());
+        MountRecord record = records.get(operation.getMountId());
+        if (player == null || record == null
+                || record.getCondition() != MountCondition.OPERATION_IN_PROGRESS
+                || !operation.getCandidateEntityId().equals(record.getPhysicalEntityId())) {
+            return blockTransferInternal(operation, "transfer finalization evidence changed");
+        }
+        RepositorySnapshot before = snapshot();
+        player.recallCooldownDeadline = operation.getCooldownDeadline();
+        player.recallCooldownDuration = operation.getCooldownDuration();
+        records.put(operation.getMountId(), record.operationCompleted());
+        transfers.remove(operationId);
+        return durableCheckpoint(before)
+                ? TransferStatus.SUCCESS
+                : TransferStatus.PERSISTENCE_FAILURE;
+    }
+
+    public synchronized TransferStatus cancelTransfer(UUID operationId) {
+        TransferOperation operation = transfers.get(operationId);
+        if (readOnly || operation == null
+                || (operation.getPhase() != TransferPhase.PREPARED
+                        && operation.getPhase() != TransferPhase.CANDIDATE_SPAWN_INTENT)) {
+            return TransferStatus.REJECTED;
+        }
+        MountRecord record = records.get(operation.getMountId());
+        if (record == null || record.getCondition() != MountCondition.OPERATION_IN_PROGRESS
+                || !operation.getSourceEntityId().equals(record.getPhysicalEntityId())) {
+            return blockTransferInternal(operation, "transfer rollback evidence changed");
+        }
+        RepositorySnapshot before = snapshot();
+        records.put(operation.getMountId(), record.operationCompleted());
+        transfers.remove(operationId);
+        return durableCheckpoint(before)
+                ? TransferStatus.SUCCESS
+                : TransferStatus.PERSISTENCE_FAILURE;
+    }
+
+    public synchronized TransferStatus blockTransfer(UUID operationId, String reason) {
+        TransferOperation operation = transfers.get(operationId);
+        if (operation == null || readOnly) {
+            return TransferStatus.REJECTED;
+        }
+        return blockTransferInternal(operation, reason);
+    }
+
+    private TransferStatus advanceTransfer(
+            UUID operationId, TransferPhase expected, TransferPhase next) {
+        TransferOperation operation = transfers.get(operationId);
+        if (readOnly || operation == null || operation.getPhase() != expected) {
+            return TransferStatus.REJECTED;
+        }
+        RepositorySnapshot before = snapshot();
+        transfers.put(operationId, operation.withPhase(next));
+        return durableCheckpoint(before)
+                ? TransferStatus.SUCCESS
+                : TransferStatus.PERSISTENCE_FAILURE;
+    }
+
+    private TransferStatus blockTransferInternal(TransferOperation operation, String reason) {
+        RepositorySnapshot before = snapshot();
+        transfers.put(operation.getOperationId(), operation.integrityBlocked(reason));
+        MountRecord record = records.get(operation.getMountId());
+        if (record != null) {
+            blockIntegrity(record, reason);
+        }
+        return durableCheckpoint(before)
+                ? TransferStatus.INTEGRITY_CONFLICT
+                : TransferStatus.PERSISTENCE_FAILURE;
+    }
+
+    private boolean durableCheckpoint(RepositorySnapshot before) {
+        if (storeRevision == Long.MAX_VALUE) {
+            restoreAfterFailedCommit(before, storeRevision);
+            return false;
+        }
+        long attemptedRevision = storeRevision + 1L;
+        storeRevision = attemptedRevision;
+        dirtyMarker.run();
+        boolean committed;
+        try {
+            committed = acknowledgedPersistence.commit(snapshot());
+        } catch (RuntimeException exception) {
+            committed = false;
+        }
+        if (committed) {
+            return true;
+        }
+        restoreAfterFailedCommit(before, attemptedRevision);
+        return false;
+    }
+
+    private void restoreAfterFailedCommit(RepositorySnapshot before, long attemptedRevision) {
+        restoreSnapshot(before);
+        storeRevision = Math.max(before.storeRevision, attemptedRevision);
+        rebuildIndexesAndQuarantineConflicts();
+        dirtyMarker.run();
+    }
+
     public synchronized int getTotalRecordCount() {
         return records.size();
     }
@@ -510,6 +808,10 @@ public final class MountRepository {
         return activeTick;
     }
 
+    public synchronized long getStoreRevision() {
+        return storeRevision;
+    }
+
     public synchronized void updateActiveTick(long tick) {
         if (!readOnly && tick >= 0L && tick != activeTick) {
             activeTick = tick;
@@ -533,24 +835,35 @@ public final class MountRepository {
         return new RepositorySnapshot(
                 records,
                 players,
+                transfers,
                 retainedMalformedRecords,
                 retainedMalformedPlayers,
+                retainedMalformedTransfers,
                 nextRegistrationOrder,
                 activeTick,
+                storeRevision,
                 readOnly);
     }
 
     synchronized void load(RepositorySnapshot snapshot) {
+        restoreSnapshot(snapshot);
+        rebuildIndexesAndQuarantineConflicts();
+    }
+
+    private void restoreSnapshot(RepositorySnapshot snapshot) {
         records.clear();
         records.putAll(snapshot.records);
         players.clear();
         players.putAll(snapshot.players);
+        transfers.clear();
+        transfers.putAll(snapshot.transfers);
         copyRaw(snapshot.retainedMalformedRecords, retainedMalformedRecords);
         copyRaw(snapshot.retainedMalformedPlayers, retainedMalformedPlayers);
+        copyRaw(snapshot.retainedMalformedTransfers, retainedMalformedTransfers);
         nextRegistrationOrder = snapshot.nextRegistrationOrder;
         activeTick = snapshot.activeTick;
+        storeRevision = snapshot.storeRevision;
         readOnly = snapshot.readOnly;
-        rebuildIndexesAndQuarantineConflicts();
     }
 
     private void rebuildIndexesAndQuarantineConflicts() {
@@ -598,6 +911,43 @@ public final class MountRepository {
                 physicalIndex.remove(physicalId);
             }
         }
+        for (TransferOperation operation : new ArrayList<>(transfers.values())) {
+            MountRecord record = records.get(operation.getMountId());
+            boolean beforeAssociation = operation.getPhase() == TransferPhase.PREPARED
+                    || operation.getPhase() == TransferPhase.CANDIDATE_SPAWN_INTENT
+                    || operation.getPhase() == TransferPhase.CANDIDATE_SPAWNED;
+            UUID expectedPhysical = beforeAssociation
+                    ? operation.getSourceEntityId()
+                    : operation.getCandidateEntityId();
+            MountId candidateOwner = physicalIndex.get(operation.getCandidateEntityId());
+            if (operation.getPhase() == TransferPhase.INTEGRITY_BLOCKED) {
+                if (record != null) {
+                    records.put(record.getMountId(), record.integrityBlocked(
+                            operation.getIntegrityReason() == null
+                                    ? "persisted transfer is integrity-blocked"
+                                    : operation.getIntegrityReason()));
+                }
+            } else if (record == null
+                    || (record.getCondition() != MountCondition.OPERATION_IN_PROGRESS
+                            && record.getCondition() != MountCondition.LIVING)
+                    || !operation.getOwnerId().equals(record.getOwnerId())
+                    || !expectedPhysical.equals(record.getPhysicalEntityId())
+                    || !expectedTransferEvidence(operation, beforeAssociation).equals(record.getLastKnown())
+                    || !hasConsistentTransferSnapshot(operation, record)
+                    || operation.getCooldownDeadline()
+                            > saturatedAdd(activeTick, operation.getCooldownDuration())
+                    || (beforeAssociation && candidateOwner != null)) {
+                transfers.put(operation.getOperationId(), operation.integrityBlocked(
+                        "persisted transfer association is inconsistent"));
+                if (record != null) {
+                    records.put(record.getMountId(), record.integrityBlocked(
+                            "persisted transfer association is inconsistent"));
+                    physicalIndex.remove(record.getPhysicalEntityId());
+                }
+            } else if (record.getCondition() == MountCondition.LIVING) {
+                records.put(record.getMountId(), record.operationInProgress());
+            }
+        }
         for (Map.Entry<UUID, PlayerState> entry : players.entrySet()) {
             MountRecord selected = entry.getValue().selectedMountId == null
                     ? null
@@ -605,8 +955,35 @@ public final class MountRepository {
             entry.getValue().selectionIntegrityBlocked = selected == null
                     ? entry.getValue().selectedMountId != null
                     : !entry.getKey().equals(selected.getOwnerId())
-                            || !selected.getCondition().isOperational();
+                            || (selected.getCondition() != MountCondition.LIVING
+                                    && selected.getCondition() != MountCondition.OPERATION_IN_PROGRESS);
         }
+    }
+
+    private static LastKnownEvidence expectedTransferEvidence(
+            TransferOperation operation, boolean beforeAssociation) {
+        return beforeAssociation
+                ? operation.getSourceEvidence()
+                : operation.getDestinationEvidence();
+    }
+
+    private static boolean hasConsistentTransferSnapshot(
+            TransferOperation operation, MountRecord record) {
+        NBTTagCompound snapshot = operation.copySourceSnapshot();
+        if (!snapshot.hasKey("id", 8)
+                || !record.getEntityTypeId().toString().equals(snapshot.getString("id"))
+                || !snapshot.hasUniqueId("UUID")) {
+            return false;
+        }
+        try {
+            return operation.getSourceEntityId().equals(snapshot.getUniqueId("UUID"));
+        } catch (RuntimeException exception) {
+            return false;
+        }
+    }
+
+    private static long saturatedAdd(long left, long right) {
+        return left > Long.MAX_VALUE - right ? Long.MAX_VALUE : left + right;
     }
 
     private void updateLastKnown(MountRecord record, LastKnownEvidence evidence) {
@@ -658,26 +1035,35 @@ public final class MountRepository {
     static final class RepositorySnapshot {
         final Map<MountId, MountRecord> records;
         final Map<UUID, PlayerState> players;
+        final Map<UUID, TransferOperation> transfers;
         final List<NBTTagCompound> retainedMalformedRecords;
         final List<NBTTagCompound> retainedMalformedPlayers;
+        final List<NBTTagCompound> retainedMalformedTransfers;
         final long nextRegistrationOrder;
         final long activeTick;
+        final long storeRevision;
         final boolean readOnly;
 
         RepositorySnapshot(
                 Map<MountId, MountRecord> records,
                 Map<UUID, PlayerState> players,
+                Map<UUID, TransferOperation> transfers,
                 List<NBTTagCompound> retainedMalformedRecords,
                 List<NBTTagCompound> retainedMalformedPlayers,
+                List<NBTTagCompound> retainedMalformedTransfers,
                 long nextRegistrationOrder,
                 long activeTick,
+                long storeRevision,
                 boolean readOnly) {
             this.records = new LinkedHashMap<>(records);
             this.players = copyPlayers(players);
+            this.transfers = new LinkedHashMap<>(transfers);
             this.retainedMalformedRecords = copyRaw(retainedMalformedRecords);
             this.retainedMalformedPlayers = copyRaw(retainedMalformedPlayers);
+            this.retainedMalformedTransfers = copyRaw(retainedMalformedTransfers);
             this.nextRegistrationOrder = nextRegistrationOrder;
             this.activeTick = activeTick;
+            this.storeRevision = storeRevision;
             this.readOnly = readOnly;
         }
 

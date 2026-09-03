@@ -2,10 +2,12 @@ package com.mahghuuuls.mountcollection.persistence;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
 import java.util.UUID;
+import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.util.ResourceLocation;
 import org.junit.jupiter.api.Test;
 
@@ -203,6 +205,267 @@ final class MountRepositoryTest {
         assertTrue(repository.normalizeRecallCooldown(owner, 10L, 200L));
         assertEquals(210L, repository.getRecallCooldown(owner).getDeadline());
         assertFalse(repository.normalizeRecallCooldown(owner, 11L, 200L));
+    }
+
+    @Test
+    void journaledTransferAdvancesDurablyAndChangesAssociationBeforeCooldown() {
+        MountRepository repository = new MountRepository();
+        int[] barriers = {0};
+        repository.setAcknowledgedPersistence(snapshot -> {
+            barriers[0]++;
+            return true;
+        });
+        UUID owner = UUID.randomUUID();
+        MountRecord record = register(
+                repository, owner, UUID.randomUUID(), null).getRecord().get();
+        TransferOperation operation = operation(record);
+
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.beginTransfer(operation));
+        assertEquals(MountCondition.OPERATION_IN_PROGRESS,
+                repository.find(record.getMountId()).get().getCondition());
+        assertFalse(repository.prepareRecall(
+                owner, record.getMountId(), record.getPhysicalEntityId()).isPresent());
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.markCandidateSpawnIntent(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.markCandidateSpawned(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.associateTransferCandidate(operation.getOperationId()));
+        assertEquals(operation.getCandidateEntityId(),
+                repository.find(record.getMountId()).get().getPhysicalEntityId());
+        assertFalse(repository.findByPhysicalEntity(record.getPhysicalEntityId()).isPresent());
+        assertEquals(0L, repository.getRecallCooldownDeadline(owner));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.markSourceRemovalIntent(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.markTransferSourceRemoved(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.finishTransfer(operation.getOperationId()));
+
+        assertTrue(repository.getPendingTransfers().isEmpty());
+        assertEquals(operation.getCooldownDeadline(), repository.getRecallCooldownDeadline(owner));
+        assertEquals(MountCondition.LIVING,
+                repository.find(record.getMountId()).get().getCondition());
+        assertEquals(7, barriers[0]);
+    }
+
+    @Test
+    void failedPhaseAcknowledgementRollsBackThePhaseButKeepsOperationExclusive() {
+        MountRepository repository = new MountRepository();
+        int[] commits = {0};
+        repository.setAcknowledgedPersistence(snapshot -> ++commits[0] == 1);
+        UUID owner = UUID.randomUUID();
+        MountRecord record = register(
+                repository, owner, UUID.randomUUID(), null).getRecord().get();
+        TransferOperation operation = operation(record);
+
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.beginTransfer(operation));
+        assertEquals(MountRepository.TransferStatus.PERSISTENCE_FAILURE,
+                repository.markCandidateSpawnIntent(operation.getOperationId()));
+
+        assertEquals(TransferPhase.PREPARED,
+                repository.findTransfer(operation.getOperationId()).get().getPhase());
+        assertEquals(MountCondition.OPERATION_IN_PROGRESS,
+                repository.find(record.getMountId()).get().getCondition());
+        assertFalse(repository.prepareRecall(
+                owner, record.getMountId(), record.getPhysicalEntityId()).isPresent());
+        assertEquals(2L, repository.getStoreRevision());
+    }
+
+    @Test
+    void preAssociationTransferCanRollBackWithoutChangingIdentityOrCooldown() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord record = register(
+                repository, owner, UUID.randomUUID(), null).getRecord().get();
+        TransferOperation operation = operation(record);
+
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.beginTransfer(operation));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.markCandidateSpawnIntent(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.cancelTransfer(operation.getOperationId()));
+
+        assertEquals(record.getPhysicalEntityId(),
+                repository.find(record.getMountId()).get().getPhysicalEntityId());
+        assertEquals(0L, repository.getRecallCooldownDeadline(owner));
+        assertTrue(repository.getPendingTransfers().isEmpty());
+    }
+
+    @Test
+    void changedAssociationQuarantinesTransferInsteadOfGuessing() {
+        MountRepository repository = new MountRepository();
+        MountRecord first = register(
+                repository, UUID.randomUUID(), UUID.randomUUID(), null).getRecord().get();
+        MountRecord second = register(
+                repository, UUID.randomUUID(), UUID.randomUUID(), null).getRecord().get();
+        NBTTagCompound snapshot = new NBTTagCompound();
+        snapshot.setString("id", HORSE.toString());
+        TransferOperation operation = new TransferOperation(
+                UUID.randomUUID(), first.getMountId(), first.getOwnerId(),
+                first.getPhysicalEntityId(), second.getPhysicalEntityId(),
+                first.getLastKnown(), new LastKnownEvidence(1, 8.0D, 64.0D, 8.0D),
+                snapshot, 200L, 200L, TransferPhase.PREPARED, null);
+
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.beginTransfer(operation));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.markCandidateSpawnIntent(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.markCandidateSpawned(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.INTEGRITY_CONFLICT,
+                repository.associateTransferCandidate(operation.getOperationId()));
+        assertEquals(MountCondition.INTEGRITY_BLOCKED,
+                repository.find(first.getMountId()).get().getCondition());
+        assertEquals(TransferPhase.INTEGRITY_BLOCKED,
+                repository.findTransfer(operation.getOperationId()).get().getPhase());
+        assertEquals(MountCondition.LIVING,
+                repository.find(second.getMountId()).get().getCondition());
+    }
+
+    @Test
+    void snapshotTypeMismatchIsRejectedBeforeJournalMutation() {
+        MountRepository repository = new MountRepository();
+        int[] commits = {0};
+        repository.setAcknowledgedPersistence(snapshot -> {
+            commits[0]++;
+            return true;
+        });
+        MountRecord record = register(
+                repository, UUID.randomUUID(), UUID.randomUUID(), null).getRecord().get();
+        NBTTagCompound wrongType = new NBTTagCompound();
+        wrongType.setString("id", "minecraft:pig");
+        wrongType.setUniqueId("UUID", record.getPhysicalEntityId());
+        TransferOperation operation = new TransferOperation(
+                UUID.randomUUID(), record.getMountId(), record.getOwnerId(),
+                record.getPhysicalEntityId(), UUID.randomUUID(), record.getLastKnown(),
+                new LastKnownEvidence(1, 8.0D, 64.0D, 8.0D),
+                wrongType, 200L, 200L, TransferPhase.PREPARED, null);
+
+        assertEquals(MountRepository.TransferStatus.REJECTED,
+                repository.beginTransfer(operation));
+        assertEquals(0, commits[0]);
+        assertEquals(MountCondition.LIVING,
+                repository.find(record.getMountId()).get().getCondition());
+        assertTrue(repository.getPendingTransfers().isEmpty());
+    }
+
+    @Test
+    void snapshotWithoutTypeCannotBecomeATransferOperation() {
+        MountRepository repository = new MountRepository();
+        MountRecord record = register(
+                repository, UUID.randomUUID(), UUID.randomUUID(), null).getRecord().get();
+
+        assertThrows(IllegalArgumentException.class, () -> new TransferOperation(
+                UUID.randomUUID(), record.getMountId(), record.getOwnerId(),
+                record.getPhysicalEntityId(), UUID.randomUUID(), record.getLastKnown(),
+                new LastKnownEvidence(1, 8.0D, 64.0D, 8.0D),
+                new NBTTagCompound(), 200L, 200L, TransferPhase.PREPARED, null));
+        assertEquals(MountCondition.LIVING,
+                repository.find(record.getMountId()).get().getCondition());
+        assertTrue(repository.getPendingTransfers().isEmpty());
+    }
+
+    @Test
+    void relocatedEvidenceIsAcknowledgedAndRolledBackOnPersistenceFailure() {
+        MountRepository repository = new MountRepository();
+        int[] commits = {0};
+        repository.setAcknowledgedPersistence(snapshot -> ++commits[0] != 2);
+        MountRecord record = register(
+                repository, UUID.randomUUID(), UUID.randomUUID(), null).getRecord().get();
+        TransferOperation operation = operation(record);
+        LastKnownEvidence movedSource = new LastKnownEvidence(0, 33.0D, 70.0D, 34.0D);
+
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.beginTransfer(operation));
+        assertEquals(MountRepository.TransferStatus.PERSISTENCE_FAILURE,
+                repository.updateTransferEvidence(
+                        operation.getOperationId(), movedSource, operation.getDestinationEvidence()));
+
+        assertEquals(operation.getSourceEvidence(), repository
+                .findTransfer(operation.getOperationId()).get().getSourceEvidence());
+        assertEquals(operation.getSourceEvidence(), repository
+                .find(record.getMountId()).get().getLastKnown());
+
+        repository.setAcknowledgedPersistence(snapshot -> true);
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.updateTransferEvidence(
+                        operation.getOperationId(), movedSource, operation.getDestinationEvidence()));
+        assertEquals(movedSource, repository
+                .findTransfer(operation.getOperationId()).get().getSourceEvidence());
+        assertEquals(movedSource, repository.find(record.getMountId()).get().getLastKnown());
+    }
+
+    @Test
+    void associatedRollbackRestoresExactSourceAndIsAtomicOnPersistenceFailure() {
+        MountRepository repository = new MountRepository();
+        MountRecord record = register(
+                repository, UUID.randomUUID(), UUID.randomUUID(), null).getRecord().get();
+        TransferOperation operation = operation(record);
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.beginTransfer(operation));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.markCandidateSpawnIntent(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.markCandidateSpawned(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.associateTransferCandidate(operation.getOperationId()));
+
+        repository.setAcknowledgedPersistence(snapshot -> false);
+        assertEquals(MountRepository.TransferStatus.PERSISTENCE_FAILURE,
+                repository.rollbackAssociatedTransfer(operation.getOperationId()));
+        assertEquals(operation.getCandidateEntityId(),
+                repository.find(record.getMountId()).get().getPhysicalEntityId());
+        assertEquals(TransferPhase.ASSOCIATED,
+                repository.findTransfer(operation.getOperationId()).get().getPhase());
+
+        repository.setAcknowledgedPersistence(snapshot -> true);
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.rollbackAssociatedTransfer(operation.getOperationId()));
+        assertEquals(operation.getSourceEntityId(),
+                repository.find(record.getMountId()).get().getPhysicalEntityId());
+        assertEquals(MountCondition.LIVING,
+                repository.find(record.getMountId()).get().getCondition());
+        assertTrue(repository.getPendingTransfers().isEmpty());
+    }
+
+    @Test
+    void sourceRemovalIntentRollbackIsAtomicAndReturnsToAssociated() {
+        MountRepository repository = new MountRepository();
+        MountRecord record = register(
+                repository, UUID.randomUUID(), UUID.randomUUID(), null).getRecord().get();
+        TransferOperation operation = operation(record);
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.beginTransfer(operation));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.markCandidateSpawnIntent(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.markCandidateSpawned(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.associateTransferCandidate(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.markSourceRemovalIntent(operation.getOperationId()));
+
+        repository.setAcknowledgedPersistence(snapshot -> false);
+        assertEquals(MountRepository.TransferStatus.PERSISTENCE_FAILURE,
+                repository.rollbackSourceRemovalIntent(operation.getOperationId()));
+        assertEquals(TransferPhase.SOURCE_REMOVAL_INTENT,
+                repository.findTransfer(operation.getOperationId()).get().getPhase());
+        assertEquals(operation.getCandidateEntityId(),
+                repository.find(record.getMountId()).get().getPhysicalEntityId());
+
+        repository.setAcknowledgedPersistence(snapshot -> true);
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.rollbackSourceRemovalIntent(operation.getOperationId()));
+        assertEquals(TransferPhase.ASSOCIATED,
+                repository.findTransfer(operation.getOperationId()).get().getPhase());
+    }
+
+    private static TransferOperation operation(MountRecord record) {
+        NBTTagCompound snapshot = new NBTTagCompound();
+        snapshot.setString("id", HORSE.toString());
+        snapshot.setUniqueId("UUID", record.getPhysicalEntityId());
+        return new TransferOperation(
+                UUID.randomUUID(), record.getMountId(), record.getOwnerId(),
+                record.getPhysicalEntityId(), UUID.randomUUID(), record.getLastKnown(),
+                new LastKnownEvidence(1, 8.0D, 64.0D, 8.0D),
+                snapshot, 200L, 200L, TransferPhase.PREPARED, null);
     }
 
     private static MountRepository.RegistrationResult register(

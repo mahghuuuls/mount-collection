@@ -1,19 +1,31 @@
 package com.mahghuuuls.mountcollection.persistence;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.nbt.NBTTagList;
+import net.minecraft.nbt.CompressedStreamTools;
 import net.minecraft.util.ResourceLocation;
 
 final class MountStoreCodec {
 
-    static final int CURRENT_ROOT_VERSION = 2;
+    static final int CURRENT_ROOT_VERSION = 4;
+    private static final int INT_TAG = 3;
+    private static final int LONG_TAG = 4;
+    private static final int DOUBLE_TAG = 6;
+    private static final int STRING_TAG = 8;
+    private static final int LIST_TAG = 9;
     private static final int COMPOUND_TAG = 10;
     private static final int MAX_KEY_LENGTH = 128;
+    private static final int MAX_TRANSFER_SNAPSHOT_BYTES = 1_048_576;
+    private static final int MAX_RETAINED_MALFORMED_TRANSFERS = 128;
 
     private MountStoreCodec() {}
 
@@ -22,18 +34,32 @@ final class MountStoreCodec {
     }
 
     static boolean hasValidRootShape(NBTTagCompound root) {
+        int version = readRootVersion(root);
+        if (version == CURRENT_ROOT_VERSION) {
+            return root.hasKey("RootVersion", INT_TAG)
+                    && root.hasKey("NextRegistrationOrder", LONG_TAG)
+                    && root.hasKey("ActiveTick", LONG_TAG)
+                    && root.hasKey("StoreRevision", LONG_TAG)
+                    && hasRequiredCompoundList(root, "Records")
+                    && hasRequiredCompoundList(root, "Players")
+                    && hasRequiredCompoundList(root, "Transfers");
+        }
         return hasNumericIfPresent(root, "RootVersion")
                 && hasNumericIfPresent(root, "NextRegistrationOrder")
                 && hasNumericIfPresent(root, "ActiveTick")
+                && (!root.hasKey("StoreRevision") || root.hasKey("StoreRevision", LONG_TAG))
                 && hasCompoundList(root, "Records")
-                && hasCompoundList(root, "Players");
+                && hasCompoundList(root, "Players")
+                && hasCompoundList(root, "Transfers");
     }
 
     static MountRepository.RepositorySnapshot decodeKnown(NBTTagCompound root) {
         Map<MountId, MountRecord> records = new LinkedHashMap<>();
         Map<UUID, MountRepository.PlayerState> players = new LinkedHashMap<>();
+        Map<UUID, TransferOperation> transfers = new LinkedHashMap<>();
         List<NBTTagCompound> retainedMalformedRecords = new ArrayList<>();
         List<NBTTagCompound> retainedMalformedPlayers = new ArrayList<>();
+        List<NBTTagCompound> retainedMalformedTransfers = new ArrayList<>();
 
         NBTTagList recordList = root.getTagList("Records", COMPOUND_TAG);
         for (int index = 0; index < recordList.tagCount(); index++) {
@@ -47,6 +73,74 @@ final class MountStoreCodec {
                 }
             } catch (RuntimeException exception) {
                 retainMalformedRecord(raw, records, retainedMalformedRecords);
+            }
+        }
+
+        NBTTagList transferList = root.getTagList("Transfers", COMPOUND_TAG);
+        Map<MountId, UUID> transferMounts = new LinkedHashMap<>();
+        Map<UUID, NBTTagCompound> acceptedTransferRaw = new LinkedHashMap<>();
+        Set<UUID> quarantinedOperationIds = new LinkedHashSet<>();
+        Set<MountId> quarantinedTransferMounts = new LinkedHashSet<>();
+        for (int index = 0; index < transferList.tagCount(); index++) {
+            NBTTagCompound raw = transferList.getCompoundTagAt(index).copy();
+            try {
+                TransferOperation operation = decodeTransfer(raw);
+                if (quarantinedOperationIds.contains(operation.getOperationId())
+                        || quarantinedTransferMounts.contains(operation.getMountId())) {
+                    retainBounded(raw, retainedMalformedTransfers);
+                    blockTransferRecord(records, operation.getMountId(),
+                            "duplicate persisted transfer operation");
+                    quarantinedOperationIds.add(operation.getOperationId());
+                    quarantinedTransferMounts.add(operation.getMountId());
+                    continue;
+                }
+                TransferOperation duplicateOperation = transfers.get(operation.getOperationId());
+                UUID duplicateMountOperation = transferMounts.get(operation.getMountId());
+                if (duplicateOperation != null || duplicateMountOperation != null) {
+                    retainBounded(raw, retainedMalformedTransfers);
+                    blockTransferRecord(records, operation.getMountId(),
+                            "duplicate persisted transfer operation");
+                    if (duplicateOperation != null) {
+                        quarantinedOperationIds.add(duplicateOperation.getOperationId());
+                        quarantinedTransferMounts.add(duplicateOperation.getMountId());
+                        blockTransferRecord(records, duplicateOperation.getMountId(),
+                                "duplicate persisted transfer operation");
+                        retainBounded(
+                                acceptedTransferRaw.get(duplicateOperation.getOperationId()),
+                                retainedMalformedTransfers);
+                        transfers.remove(duplicateOperation.getOperationId());
+                        transferMounts.remove(duplicateOperation.getMountId());
+                    }
+                    else if (duplicateMountOperation != null) {
+                        TransferOperation first = transfers.remove(duplicateMountOperation);
+                        if (first != null) {
+                            quarantinedOperationIds.add(first.getOperationId());
+                            quarantinedTransferMounts.add(first.getMountId());
+                            blockTransferRecord(records, first.getMountId(),
+                                    "duplicate persisted transfer operation");
+                            retainBounded(
+                                    acceptedTransferRaw.get(first.getOperationId()),
+                                    retainedMalformedTransfers);
+                        }
+                        transferMounts.remove(operation.getMountId());
+                    }
+                    quarantinedOperationIds.add(operation.getOperationId());
+                    quarantinedTransferMounts.add(operation.getMountId());
+                } else {
+                    transfers.put(operation.getOperationId(), operation);
+                    transferMounts.put(operation.getMountId(), operation.getOperationId());
+                    acceptedTransferRaw.put(operation.getOperationId(), raw);
+                }
+            } catch (RuntimeException exception) {
+                retainMalformedTransfer(
+                        raw,
+                        records,
+                        transfers,
+                        transferMounts,
+                        acceptedTransferRaw,
+                        quarantinedOperationIds,
+                        quarantinedTransferMounts,
+                        retainedMalformedTransfers);
             }
         }
 
@@ -102,13 +196,19 @@ final class MountStoreCodec {
             nextOrder = derivedNextOrder;
         }
         long activeTick = root.hasKey("ActiveTick") ? root.getLong("ActiveTick") : 0L;
+        long storeRevision = root.hasKey("StoreRevision")
+                ? requireNonNegative(root.getLong("StoreRevision"), "storeRevision")
+                : 0L;
         return new MountRepository.RepositorySnapshot(
                 records,
                 players,
+                transfers,
                 retainedMalformedRecords,
                 retainedMalformedPlayers,
+                retainedMalformedTransfers,
                 nextOrder,
                 activeTick,
+                storeRevision,
                 false);
     }
 
@@ -116,6 +216,7 @@ final class MountStoreCodec {
         root.setInteger("RootVersion", CURRENT_ROOT_VERSION);
         root.setLong("NextRegistrationOrder", snapshot.nextRegistrationOrder);
         root.setLong("ActiveTick", snapshot.activeTick);
+        root.setLong("StoreRevision", snapshot.storeRevision);
 
         NBTTagList records = new NBTTagList();
         for (MountRecord record : snapshot.records.values()) {
@@ -152,7 +253,155 @@ final class MountStoreCodec {
             players.appendTag(retained.copy());
         }
         root.setTag("Players", players);
+
+        NBTTagList transfers = new NBTTagList();
+        for (TransferOperation operation : snapshot.transfers.values()) {
+            transfers.appendTag(encodeTransfer(operation));
+        }
+        for (NBTTagCompound retained : snapshot.retainedMalformedTransfers) {
+            transfers.appendTag(retained.copy());
+        }
+        root.setTag("Transfers", transfers);
         return root;
+    }
+
+    private static TransferOperation decodeTransfer(NBTTagCompound raw) {
+        requireTag(raw, "Version", INT_TAG);
+        int version = raw.getInteger("Version");
+        if (version != TransferOperation.CURRENT_VERSION) {
+            throw new IllegalArgumentException("unsupported transfer operation schema");
+        }
+        requireTag(raw, "OperationId", STRING_TAG);
+        requireTag(raw, "MountId", STRING_TAG);
+        requireTag(raw, "OwnerId", STRING_TAG);
+        requireTag(raw, "SourceEntityId", STRING_TAG);
+        requireTag(raw, "CandidateEntityId", STRING_TAG);
+        requireTag(raw, "SourceSnapshot", COMPOUND_TAG);
+        requireTag(raw, "SourceEvidence", COMPOUND_TAG);
+        requireTag(raw, "DestinationEvidence", COMPOUND_TAG);
+        requireTag(raw, "CooldownDeadline", LONG_TAG);
+        requireTag(raw, "CooldownDuration", LONG_TAG);
+        requireTag(raw, "Phase", STRING_TAG);
+        NBTTagCompound snapshot = raw.getCompoundTag("SourceSnapshot");
+        requireTag(snapshot, "id", STRING_TAG);
+        requireBounded(snapshot.getString("id"), "source entity type");
+        requireBoundedSnapshot(snapshot);
+        TransferPhase phase = TransferPhase.valueOf(
+                requireBounded(raw.getString("Phase"), "transfer phase"));
+        String integrityReason = null;
+        if (raw.hasKey("IntegrityReason")) {
+            requireTag(raw, "IntegrityReason", STRING_TAG);
+            integrityReason = requireBoundedLength(
+                    raw.getString("IntegrityReason"), "integrity reason", 160);
+        }
+        if ((phase == TransferPhase.INTEGRITY_BLOCKED) != (integrityReason != null)) {
+            throw new IllegalArgumentException("transfer integrity reason does not match phase");
+        }
+        return new TransferOperation(
+                parseUuid(raw.getString("OperationId")),
+                MountId.parse(raw.getString("MountId")),
+                parseUuid(raw.getString("OwnerId")),
+                parseUuid(raw.getString("SourceEntityId")),
+                parseUuid(raw.getString("CandidateEntityId")),
+                decodeEvidence(raw.getCompoundTag("SourceEvidence")),
+                decodeEvidence(raw.getCompoundTag("DestinationEvidence")),
+                snapshot,
+                requireNonNegative(raw.getLong("CooldownDeadline"), "cooldownDeadline"),
+                requireNonNegative(raw.getLong("CooldownDuration"), "cooldownDuration"),
+                phase,
+                integrityReason);
+    }
+
+    private static NBTTagCompound encodeTransfer(TransferOperation operation) {
+        NBTTagCompound raw = new NBTTagCompound();
+        raw.setInteger("Version", TransferOperation.CURRENT_VERSION);
+        raw.setString("OperationId", operation.getOperationId().toString());
+        raw.setString("MountId", operation.getMountId().toString());
+        raw.setString("OwnerId", operation.getOwnerId().toString());
+        raw.setString("SourceEntityId", operation.getSourceEntityId().toString());
+        raw.setString("CandidateEntityId", operation.getCandidateEntityId().toString());
+        raw.setTag("SourceEvidence", encodeEvidence(operation.getSourceEvidence()));
+        raw.setTag("DestinationEvidence", encodeEvidence(operation.getDestinationEvidence()));
+        raw.setTag("SourceSnapshot", operation.copySourceSnapshot());
+        raw.setLong("CooldownDeadline", operation.getCooldownDeadline());
+        raw.setLong("CooldownDuration", operation.getCooldownDuration());
+        raw.setString("Phase", operation.getPhase().name());
+        if (operation.getIntegrityReason() != null) {
+            raw.setString("IntegrityReason", operation.getIntegrityReason());
+        }
+        return raw;
+    }
+
+    private static void retainMalformedTransfer(
+            NBTTagCompound raw,
+            Map<MountId, MountRecord> records,
+            Map<UUID, TransferOperation> transfers,
+            Map<MountId, UUID> transferMounts,
+            Map<UUID, NBTTagCompound> acceptedTransferRaw,
+            Set<UUID> quarantinedOperationIds,
+            Set<MountId> quarantinedTransferMounts,
+            List<NBTTagCompound> retained) {
+        Set<MountId> implicated = new LinkedHashSet<>();
+        UUID operationId = parseUuidIfPossible(raw, "OperationId");
+        if (operationId != null) {
+            quarantinedOperationIds.add(operationId);
+            TransferOperation accepted = transfers.remove(operationId);
+            if (accepted != null) {
+                implicated.add(accepted.getMountId());
+                transferMounts.remove(accepted.getMountId());
+                retainBounded(acceptedTransferRaw.get(operationId), retained);
+            }
+        }
+        try {
+            MountId mountId = MountId.parse(raw.getString("MountId"));
+            implicated.add(mountId);
+        } catch (RuntimeException ignored) {
+            // Other persisted identities can still implicate a known record below.
+        }
+        UUID sourceId = parseUuidIfPossible(raw, "SourceEntityId");
+        UUID candidateId = parseUuidIfPossible(raw, "CandidateEntityId");
+        UUID ownerId = parseUuidIfPossible(raw, "OwnerId");
+        for (MountRecord record : records.values()) {
+            if ((sourceId != null && sourceId.equals(record.getPhysicalEntityId()))
+                    || (candidateId != null && candidateId.equals(record.getPhysicalEntityId()))
+                    || (ownerId != null && ownerId.equals(record.getOwnerId()))) {
+                implicated.add(record.getMountId());
+            }
+        }
+        for (MountId mountId : implicated) {
+            quarantinedTransferMounts.add(mountId);
+            UUID acceptedOperationId = transferMounts.remove(mountId);
+            if (acceptedOperationId != null) {
+                TransferOperation accepted = transfers.remove(acceptedOperationId);
+                quarantinedOperationIds.add(acceptedOperationId);
+                if (accepted != null) {
+                    quarantinedTransferMounts.add(accepted.getMountId());
+                }
+                retainBounded(acceptedTransferRaw.get(acceptedOperationId), retained);
+            }
+            blockTransferRecord(records, mountId,
+                    "malformed persisted transfer operation");
+        }
+        retainBounded(raw, retained);
+    }
+
+    private static UUID parseUuidIfPossible(NBTTagCompound raw, String key) {
+        if (!raw.hasKey(key, STRING_TAG)) {
+            return null;
+        }
+        try {
+            return parseUuid(raw.getString(key));
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    private static void blockTransferRecord(
+            Map<MountId, MountRecord> records, MountId mountId, String reason) {
+        MountRecord record = records.get(mountId);
+        if (record != null) {
+            records.put(mountId, record.integrityBlocked(reason));
+        }
     }
 
     private static MountRecord decodeRecord(NBTTagCompound raw) {
@@ -258,6 +507,10 @@ final class MountStoreCodec {
     }
 
     private static LastKnownEvidence decodeEvidence(NBTTagCompound raw) {
+        requireTag(raw, "Dimension", INT_TAG);
+        requireTag(raw, "X", DOUBLE_TAG);
+        requireTag(raw, "Y", DOUBLE_TAG);
+        requireTag(raw, "Z", DOUBLE_TAG);
         return new LastKnownEvidence(
                 raw.getInteger("Dimension"), raw.getDouble("X"), raw.getDouble("Y"), raw.getDouble("Z"));
     }
@@ -298,6 +551,14 @@ final class MountStoreCodec {
         return value.length() <= maximumLength ? value : value.substring(0, maximumLength);
     }
 
+    private static String requireBoundedLength(
+            String value, String name, int maximumLength) {
+        if (value == null || value.isEmpty() || value.length() > maximumLength) {
+            throw new IllegalArgumentException(name + " is missing or oversized");
+        }
+        return value;
+    }
+
     private static long requireNonNegative(long value, String name) {
         if (value < 0L) {
             throw new IllegalArgumentException(name + " must not be negative");
@@ -309,14 +570,43 @@ final class MountStoreCodec {
         if (!root.hasKey(key)) {
             return true;
         }
-        if (root.getTagId(key) != 9) {
+        if (root.getTagId(key) != LIST_TAG) {
             return false;
         }
         NBTTagList list = (NBTTagList) root.getTag(key);
         return list.tagCount() == 0 || list.getTagType() == COMPOUND_TAG;
     }
 
+    private static boolean hasRequiredCompoundList(NBTTagCompound root, String key) {
+        return root.hasKey(key) && hasCompoundList(root, key);
+    }
+
     private static boolean hasNumericIfPresent(NBTTagCompound root, String key) {
         return !root.hasKey(key) || root.hasKey(key, 99);
+    }
+
+    private static void requireTag(NBTTagCompound root, String key, int type) {
+        if (!root.hasKey(key, type)) {
+            throw new IllegalArgumentException("missing or wrongly typed " + key);
+        }
+    }
+
+    private static void requireBoundedSnapshot(NBTTagCompound snapshot) {
+        try {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            CompressedStreamTools.writeCompressed(snapshot, output);
+            if (output.size() > MAX_TRANSFER_SNAPSHOT_BYTES) {
+                throw new IllegalArgumentException("transfer snapshot is oversized");
+            }
+        } catch (IOException exception) {
+            throw new IllegalArgumentException("transfer snapshot could not be measured", exception);
+        }
+    }
+
+    private static void retainBounded(
+            NBTTagCompound raw, List<NBTTagCompound> retained) {
+        if (raw != null && retained.size() < MAX_RETAINED_MALFORMED_TRANSFERS) {
+            retained.add(raw.copy());
+        }
     }
 }

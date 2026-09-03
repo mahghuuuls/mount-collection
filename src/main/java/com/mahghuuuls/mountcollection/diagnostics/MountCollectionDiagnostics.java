@@ -56,6 +56,14 @@ public final class MountCollectionDiagnostics implements DiagnosticSink, ConfigW
     }
 
     @Override
+    public void essentialLifecycleWarning(String event, String detail) {
+        logger.warn(
+                "Mount Collection lifecycle warning event={} detail={}",
+                sanitize(event, MAX_KEY_LENGTH),
+                sanitize(detail, MAX_VALUE_LENGTH));
+    }
+
+    @Override
     public void warn(String key, String rejectedValue, String fallback) {
         essentialWarning(key, rejectedValue, fallback);
     }

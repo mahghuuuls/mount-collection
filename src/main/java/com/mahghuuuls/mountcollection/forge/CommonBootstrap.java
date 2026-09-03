@@ -9,6 +9,8 @@ import com.mahghuuuls.mountcollection.persistence.EntityMountEvidence;
 import com.mahghuuuls.mountcollection.persistence.LastKnownEvidence;
 import com.mahghuuuls.mountcollection.persistence.MountRepository;
 import com.mahghuuuls.mountcollection.persistence.MountSavedData;
+import com.mahghuuuls.mountcollection.persistence.TransferOperation;
+import com.mahghuuuls.mountcollection.persistence.TransferPhase;
 import com.mahghuuuls.mountcollection.policy.ActiveServerClock;
 import com.mahghuuuls.mountcollection.policy.ActiveTimeResult;
 import com.mahghuuuls.mountcollection.policy.ValidatedMountConfig;
@@ -17,6 +19,7 @@ import com.mahghuuuls.mountcollection.provider.vanilla.VanillaMountProvider;
 import java.io.File;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.UUID;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraft.util.ClassInheritanceMultiMap;
@@ -36,6 +39,8 @@ public final class CommonBootstrap {
     private final Logger logger;
     private final MountNetwork network;
     private final MountCollectionServices services;
+    private final PendingTransferRecoveryScheduler transferRecovery =
+            new PendingTransferRecoveryScheduler();
     private ForgeMountConfiguration configuration;
 
     public CommonBootstrap(Logger logger, MountNetwork network) {
@@ -87,6 +92,7 @@ public final class CommonBootstrap {
     }
 
     public void serverStopped() {
+        transferRecovery.reset();
         services.clearActiveConfig();
     }
 
@@ -112,33 +118,73 @@ public final class CommonBootstrap {
                     repository.updateActiveTick(advanced.getValue());
                 }
             });
+            java.util.Optional<com.mahghuuuls.mountcollection.lifecycle.MountLifecycleService>
+                    lifecycle = services.getLifecycleService();
+            java.util.Optional<MountRepository> activeRepository = services.getActiveRepository();
+            PendingTransferRecoveryScheduler.Request request;
+            while (lifecycle.isPresent()
+                    && activeRepository.isPresent()
+                    && (request = transferRecovery.poll()) != null) {
+                PendingTransferRecoveryScheduler.Request queuedRequest = request;
+                UUID operationId = request.getOperationId();
+                boolean accepted = services.submitLifecycleMutation(() -> {
+                    lifecycle.get().reconcilePendingTransfer(
+                            operationId,
+                            queuedRequest.isSourceObserved(),
+                            queuedRequest.isCandidateObserved());
+                    java.util.Optional<TransferOperation> remaining =
+                            activeRepository.get().findTransfer(operationId);
+                    if (!remaining.isPresent()
+                            || remaining.get().getPhase() == TransferPhase.INTEGRITY_BLOCKED) {
+                        transferRecovery.operationFinished(operationId);
+                    }
+                });
+                if (!accepted) {
+                    transferRecovery.defer(request);
+                    break;
+                }
+            }
+            services.getLifecycleMutationExecutor().drainAtServerTickEnd();
         }
     }
 
     @SubscribeEvent
     public void onWorldLoad(WorldEvent.Load event) {
-        if (!(event.getWorld() instanceof WorldServer)
-                || event.getWorld().isRemote
-                || event.getWorld().provider.getDimension() != 0) {
+        if (!(event.getWorld() instanceof WorldServer) || event.getWorld().isRemote) {
             return;
         }
-        MountRepository repository = MountSavedData.get((WorldServer) event.getWorld()).getRepository();
-        repository.reconcileProviderPayloads(
-                services.getProviderRegistry()::validatePersistedPayload);
-        services.activateRepository(repository);
-        ActiveTimeResult restored = services.getActiveServerClock().restore(repository.getActiveTick(), 0L);
-        logger.info(
-                "Activated {} repository: records={}, readOnly={}, clock={}",
-                Tags.MOD_NAME,
-                repository.getTotalRecordCount(),
-                repository.isReadOnly(),
-                restored.getStatus());
+        if (event.getWorld().provider.getDimension() == 0) {
+            MountRepository repository = MountSavedData.get(
+                    (WorldServer) event.getWorld(),
+                    services.getDevelopmentControls()::consumeJournalAcknowledgementFault,
+                    (stage, cause) -> services.getDiagnostics().essentialLifecycleWarning(
+                            "acknowledged_store_failure",
+                            "stage=" + stage + " cause=" + cause))
+                    .getRepository();
+            repository.reconcileProviderPayloads(
+                    services.getProviderRegistry()::validatePersistedPayload);
+            services.activateRepository(repository);
+            transferRecovery.repositoryActivated();
+            ActiveTimeResult restored = services.getActiveServerClock().restore(repository.getActiveTick(), 0L);
+            logger.info(
+                    "Activated {} repository: records={}, readOnly={}, clock={}",
+                    Tags.MOD_NAME,
+                    repository.getTotalRecordCount(),
+                    repository.isReadOnly(),
+                    restored.getStatus());
+        }
+        transferRecovery.worldLoaded();
     }
 
     @SubscribeEvent
     public void onEntityJoin(EntityJoinWorldEvent event) {
         if (!event.getWorld().isRemote) {
-            reconcileEntity(event.getEntity());
+            TransferOperation controlled = reconcileEntity(event.getEntity());
+            if (controlled != null) {
+                transferRecovery.controlledEntityJoined(
+                        controlled.getOperationId(),
+                        controlled.getCandidateEntityId().equals(event.getEntity().getUniqueID()));
+            }
         }
     }
 
@@ -155,36 +201,76 @@ public final class CommonBootstrap {
     }
 
     @SubscribeEvent
+    public void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
+        if (event.player instanceof EntityPlayerMP) {
+            transferRecovery.playerJoined();
+        }
+    }
+
+    @SubscribeEvent
     public void onPlayerLoggedOut(PlayerEvent.PlayerLoggedOutEvent event) {
         if (event.player instanceof EntityPlayerMP) {
             network.playerLoggedOut((EntityPlayerMP) event.player);
         }
     }
 
-    private void reconcileEntity(Entity entity) {
-        services.getActiveRepository().ifPresent(repository -> {
-            EntityMountEvidence.ReadResult evidence = EntityMountEvidence.read(entity);
-            MountRepository.ReconciliationStatus status;
-            if (evidence.getStatus() == EntityMountEvidence.Status.MALFORMED) {
-                status = repository.reportMalformedEvidence(entity.getUniqueID());
-            } else {
-                status = repository.reconcile(
-                        entity.getUniqueID(),
-                        evidence.getMountId().orElse(null),
-                        new LastKnownEvidence(entity.dimension, entity.posX, entity.posY, entity.posZ));
+    private TransferOperation reconcileEntity(Entity entity) {
+        java.util.Optional<MountRepository> activeRepository = services.getActiveRepository();
+        if (!activeRepository.isPresent()) {
+            return null;
+        }
+        MountRepository repository = activeRepository.get();
+        EntityMountEvidence.ReadResult evidence = EntityMountEvidence.read(entity);
+        if (evidence.getMountId().isPresent()) {
+            java.util.Optional<TransferOperation> pending =
+                    repository.findTransferByMount(evidence.getMountId().get());
+            if (pending.isPresent()
+                    && pending.get().getPhase() != TransferPhase.INTEGRITY_BLOCKED
+                    && (pending.get().getCandidateEntityId().equals(entity.getUniqueID())
+                            || pending.get().getSourceEntityId().equals(entity.getUniqueID()))) {
+                return pending.get();
             }
-            if (status == MountRepository.ReconciliationStatus.REATTACH_REQUIRED) {
-                repository.findByPhysicalEntity(entity.getUniqueID())
-                        .ifPresent(record -> EntityMountEvidence.attach(entity, record.getMountId()));
+        }
+        java.util.Optional<java.util.UUID> transfer =
+                EntityMountEvidence.readTransferOperation(entity);
+        if (transfer.isPresent() && evidence.getMountId().isPresent()) {
+            if (repository.isControlledTransferCandidate(
+                    transfer.get(), evidence.getMountId().get(), entity.getUniqueID())) {
+                return repository.findTransfer(transfer.get()).orElse(null);
             }
-            if (status == MountRepository.ReconciliationStatus.INTEGRITY_CONFLICT) {
-                Map<String, String> fields = new LinkedHashMap<>();
-                fields.put("outcome", status.name());
-                services.getDiagnostics().detail(
-                        com.mahghuuuls.mountcollection.diagnostics.DiagnosticCategory.PROVIDER,
-                        "entity_reconciliation",
-                        fields);
+            java.util.Optional<com.mahghuuuls.mountcollection.persistence.MountRecord> authoritative =
+                    repository.findByPhysicalEntity(entity.getUniqueID());
+            if (authoritative.isPresent()
+                    && authoritative.get().getMountId().equals(evidence.getMountId().get())) {
+                EntityMountEvidence.clearTransferOperation(entity);
             }
-        });
+        }
+        if (evidence.getMountId().isPresent()
+                && repository.isControlledTransferSource(
+                        evidence.getMountId().get(), entity.getUniqueID())) {
+            return repository.findTransferByMount(evidence.getMountId().get()).orElse(null);
+        }
+        MountRepository.ReconciliationStatus status;
+        if (evidence.getStatus() == EntityMountEvidence.Status.MALFORMED) {
+            status = repository.reportMalformedEvidence(entity.getUniqueID());
+        } else {
+            status = repository.reconcile(
+                    entity.getUniqueID(),
+                    evidence.getMountId().orElse(null),
+                    new LastKnownEvidence(entity.dimension, entity.posX, entity.posY, entity.posZ));
+        }
+        if (status == MountRepository.ReconciliationStatus.REATTACH_REQUIRED) {
+            repository.findByPhysicalEntity(entity.getUniqueID())
+                    .ifPresent(record -> EntityMountEvidence.attach(entity, record.getMountId()));
+        }
+        if (status == MountRepository.ReconciliationStatus.INTEGRITY_CONFLICT) {
+            Map<String, String> fields = new LinkedHashMap<>();
+            fields.put("outcome", status.name());
+            services.getDiagnostics().detail(
+                    com.mahghuuuls.mountcollection.diagnostics.DiagnosticCategory.PROVIDER,
+                    "entity_reconciliation",
+                    fields);
+        }
+        return null;
     }
 }

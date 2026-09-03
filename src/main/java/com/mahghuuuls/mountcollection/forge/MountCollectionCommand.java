@@ -4,6 +4,8 @@ import com.mahghuuuls.mountcollection.persistence.LastKnownEvidence;
 import com.mahghuuuls.mountcollection.persistence.MountId;
 import com.mahghuuuls.mountcollection.persistence.MountRecord;
 import com.mahghuuuls.mountcollection.persistence.MountRepository;
+import com.mahghuuuls.mountcollection.persistence.TransferOperation;
+import com.mahghuuuls.mountcollection.persistence.TransferPhase;
 import com.mojang.authlib.GameProfile;
 import java.util.Collections;
 import java.util.List;
@@ -32,7 +34,8 @@ final class MountCollectionCommand extends CommandBase {
 
     @Override
     public String getUsage(ICommandSender sender) {
-        return "/mountcollection inspect <player <name>|mount <mount-id>>";
+        return "/mountcollection inspect <player <name>|mount <mount-id>>"
+                + " | /mountcollection dev <status|clear|fault <journal_ack|candidate_intent_fatal|source_intent_fatal|fence_post_drain>|pause <stable-phase>>";
     }
 
     @Override
@@ -43,6 +46,10 @@ final class MountCollectionCommand extends CommandBase {
     @Override
     public void execute(MinecraftServer server, ICommandSender sender, String[] arguments)
             throws CommandException {
+        if (arguments.length >= 2 && "dev".equals(arguments[0])) {
+            executeDevelopment(sender, arguments);
+            return;
+        }
         if (arguments.length != 3 || !"inspect".equals(arguments[0])) {
             throw new WrongUsageException(getUsage(sender));
         }
@@ -66,6 +73,78 @@ final class MountCollectionCommand extends CommandBase {
         throw new WrongUsageException(getUsage(sender));
     }
 
+    private void executeDevelopment(ICommandSender sender, String[] arguments)
+            throws CommandException {
+        TransferDevelopmentControls controls = services.getDevelopmentControls();
+        if (!controls.isAvailable()) {
+            throw new CommandException("Mount Collection development controls are unavailable.");
+        }
+        if (arguments.length == 2 && "status".equals(arguments[1])) {
+            sendDevelopmentStatus(sender, controls);
+            return;
+        }
+        if (arguments.length == 2 && "clear".equals(arguments[1])) {
+            controls.clear();
+            sendDevelopmentStatus(sender, controls);
+            return;
+        }
+        if (arguments.length == 3 && "fault".equals(arguments[1])) {
+            if ("candidate_intent_fatal".equals(arguments[2])) {
+                armFatalBoundary(sender, controls, TransferPhase.CANDIDATE_SPAWN_INTENT);
+                return;
+            }
+            if ("source_intent_fatal".equals(arguments[2])) {
+                armFatalBoundary(sender, controls, TransferPhase.SOURCE_REMOVAL_INTENT);
+                return;
+            }
+            TransferDevelopmentControls.Fault fault;
+            if ("journal_ack".equals(arguments[2])) {
+                fault = TransferDevelopmentControls.Fault.JOURNAL_ACKNOWLEDGEMENT;
+            } else if ("fence_post_drain".equals(arguments[2])) {
+                fault = TransferDevelopmentControls.Fault.PHYSICAL_FENCE_POST_DRAIN;
+            } else {
+                throw new CommandException("Unknown Mount Collection development fault.");
+            }
+            if (!controls.armFault(fault)) {
+                throw new CommandException("Mount Collection development fault was not armed.");
+            }
+            sendDevelopmentStatus(sender, controls);
+            return;
+        }
+        if (arguments.length == 3 && "pause".equals(arguments[1])) {
+            com.mahghuuuls.mountcollection.persistence.TransferPhase phase;
+            try {
+                phase = com.mahghuuuls.mountcollection.persistence.TransferPhase.valueOf(
+                        arguments[2].toUpperCase(java.util.Locale.ROOT));
+            } catch (IllegalArgumentException exception) {
+                throw new CommandException("Unknown Mount Collection transfer phase.");
+            }
+            if (phase == com.mahghuuuls.mountcollection.persistence.TransferPhase.INTEGRITY_BLOCKED
+                    || !controls.armPause(phase)) {
+                throw new CommandException("Mount Collection transfer phase cannot be paused.");
+            }
+            sendDevelopmentStatus(sender, controls);
+            return;
+        }
+        throw new WrongUsageException(getUsage(sender));
+    }
+
+    private static void armFatalBoundary(
+            ICommandSender sender,
+            TransferDevelopmentControls controls,
+            TransferPhase phase) throws CommandException {
+        if (!controls.armFatalAfterIntent(phase)) {
+            throw new CommandException("Mount Collection fatal boundary was not armed.");
+        }
+        sendDevelopmentStatus(sender, controls);
+    }
+
+    private static void sendDevelopmentStatus(
+            ICommandSender sender, TransferDevelopmentControls controls) {
+        sender.sendMessage(new TextComponentString(
+                "Mount Collection development controls " + controls.describe()));
+    }
+
     private static void inspectPlayer(
             MinecraftServer server,
             ICommandSender sender,
@@ -85,7 +164,8 @@ final class MountCollectionCommand extends CommandBase {
                         + " selected=" + inspection.getSelectedMountId()
                                 .map(MountId::toString)
                                 .orElse("none")
-                        + " revision=" + inspection.getRevision()
+                        + " playerRevision=" + inspection.getRevision()
+                        + " storeRevision=" + repository.getStoreRevision()
                         + " activeTick=" + activeTick
                         + " cooldownDeadline=" + deadline
                         + " cooldownRemaining=" + remaining));
@@ -106,6 +186,7 @@ final class MountCollectionCommand extends CommandBase {
         }
         MountRecord record = found.get();
         LastKnownEvidence lastKnown = record.getLastKnown();
+        Optional<TransferOperation> transfer = repository.findTransferByMount(mountId);
         sender.sendMessage(new TextComponentString(
                 "Mount Collection mount=" + record.getMountId()
                         + " owner=" + record.getOwnerId()
@@ -120,7 +201,16 @@ final class MountCollectionCommand extends CommandBase {
                                 : " lastKnown=" + lastKnown.getDimensionId()
                                         + ":" + lastKnown.getX()
                                         + "," + lastKnown.getY()
-                                        + "," + lastKnown.getZ())));
+                                        + "," + lastKnown.getZ())
+                        + (transfer.isPresent()
+                                ? " transfer=" + transfer.get().getOperationId()
+                                        + ":" + transfer.get().getPhase()
+                                        + ":candidate=" + transfer.get().getCandidateEntityId()
+                                        + (transfer.get().getIntegrityReason() == null
+                                                ? ""
+                                                : ":reason=" + bounded(
+                                                        transfer.get().getIntegrityReason()))
+                                : " transfer=none")));
     }
 
     @Override
