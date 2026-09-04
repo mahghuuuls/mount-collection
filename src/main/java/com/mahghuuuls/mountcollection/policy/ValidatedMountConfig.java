@@ -12,6 +12,7 @@ public final class ValidatedMountConfig {
     private final long summonCooldownTicks;
     private final int normalPlacementRadius;
     private final int fallbackPlacementRadius;
+    private final boolean flyingMountRecallDisabled;
     private final boolean recoveryEnabled;
     private final long recoveryDurationTicks;
     private final boolean inhibitedRecallBlockingEnabled;
@@ -28,12 +29,30 @@ public final class ValidatedMountConfig {
             long recoveryDurationTicks,
             boolean inhibitedRecallBlockingEnabled,
             boolean detailedDiagnosticsEnabled) {
+        this(registrationEntities, summoningEntities, destinationDimensions, summonCooldownTicks,
+                normalPlacementRadius, fallbackPlacementRadius, false, recoveryEnabled,
+                recoveryDurationTicks, inhibitedRecallBlockingEnabled, detailedDiagnosticsEnabled);
+    }
+
+    public ValidatedMountConfig(
+            ConfiguredFilter<ResourceLocation> registrationEntities,
+            ConfiguredFilter<ResourceLocation> summoningEntities,
+            ConfiguredFilter<Integer> destinationDimensions,
+            long summonCooldownTicks,
+            int normalPlacementRadius,
+            int fallbackPlacementRadius,
+            boolean flyingMountRecallDisabled,
+            boolean recoveryEnabled,
+            long recoveryDurationTicks,
+            boolean inhibitedRecallBlockingEnabled,
+            boolean detailedDiagnosticsEnabled) {
         this.registrationEntities = registrationEntities;
         this.summoningEntities = summoningEntities;
         this.destinationDimensions = destinationDimensions;
         this.summonCooldownTicks = summonCooldownTicks;
         this.normalPlacementRadius = normalPlacementRadius;
         this.fallbackPlacementRadius = fallbackPlacementRadius;
+        this.flyingMountRecallDisabled = flyingMountRecallDisabled;
         this.recoveryEnabled = recoveryEnabled;
         this.recoveryDurationTicks = recoveryDurationTicks;
         this.inhibitedRecallBlockingEnabled = inhibitedRecallBlockingEnabled;
@@ -62,6 +81,10 @@ public final class ValidatedMountConfig {
 
     public int getFallbackPlacementRadius() {
         return fallbackPlacementRadius;
+    }
+
+    public boolean isFlyingMountRecallDisabled() {
+        return flyingMountRecallDisabled;
     }
 
     public boolean isRecoveryEnabled() {

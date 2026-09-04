@@ -274,7 +274,7 @@ final class MountLifecycleFatalSafetyTest {
         public Optional<Destination> plan(
                 EntityPlayerMP player,
                 Source source,
-                com.mahghuuuls.mountcollection.api.MountProvider provider,
+                com.mahghuuuls.mountcollection.api.MountCharacteristics characteristics,
                 int normalRadius,
                 int fallbackRadius) {
             return Optional.empty();

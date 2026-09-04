@@ -60,6 +60,11 @@ public final class ForgeMountConfiguration {
         String fallbackRadius = configuration.getString(
                 "fallback_placement_radius", "recall", Integer.toString(MountConfigValidator.DEFAULT_FALLBACK_RADIUS),
                 "Fallback safe-placement search radius in blocks. Must be at least the normal radius. Changes require a server restart.");
+        boolean disableFlyingMountRecall = configuration.getBoolean(
+                "disable_flying_mount_recall",
+                "summoning",
+                MountConfigValidator.DEFAULT_DISABLE_FLYING_MOUNT_RECALL,
+                "Prevent mounts with the FLYING trait from being recalled or restored from Recovery. Registration and collection management remain available. Changes require a server restart.");
 
         boolean recoveryEnabled = configuration.getBoolean(
                 "enabled", "recovery", MountConfigValidator.DEFAULT_RECOVERY_ENABLED,
@@ -88,6 +93,7 @@ public final class ForgeMountConfiguration {
                 cooldown,
                 normalRadius,
                 fallbackRadius,
+                disableFlyingMountRecall,
                 recoveryEnabled,
                 recoveryDuration,
                 inhibitedBlocking,

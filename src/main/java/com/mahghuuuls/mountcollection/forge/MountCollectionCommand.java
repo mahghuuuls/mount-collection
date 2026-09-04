@@ -192,6 +192,8 @@ final class MountCollectionCommand extends CommandBase {
                         + " owner=" + record.getOwnerId()
                         + " provider=" + record.getProviderId()
                         + " entity=" + record.getEntityTypeId()
+                        + " placement=" + record.getCharacteristics().getPlacementProfile().name()
+                        + " traits=" + record.getCharacteristics().getTraits()
                         + " condition=" + record.getCondition()
                         + " ordinal=" + record.getFallbackOrdinal()
                         + " order=" + record.getRegistrationOrder()

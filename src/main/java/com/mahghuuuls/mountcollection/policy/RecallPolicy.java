@@ -1,5 +1,6 @@
 package com.mahghuuuls.mountcollection.policy;
 
+import com.mahghuuuls.mountcollection.api.MountTrait;
 import com.mahghuuuls.mountcollection.integration.inhibited.InhibitedStatus;
 import com.mahghuuuls.mountcollection.lifecycle.ContextualOutcome;
 import com.mahghuuuls.mountcollection.persistence.MountCondition;
@@ -23,6 +24,10 @@ public final class RecallPolicy {
         }
         if (hasPassengers) {
             return ContextualOutcome.Status.PASSENGER_PRESENT;
+        }
+        if (config.isFlyingMountRecallDisabled()
+                && record.getCharacteristics().hasTrait(MountTrait.FLYING)) {
+            return ContextualOutcome.Status.SUMMON_DISALLOWED;
         }
         if (!config.getSummoningEntities().allows(record.getEntityTypeId())) {
             return ContextualOutcome.Status.SUMMON_DISALLOWED;

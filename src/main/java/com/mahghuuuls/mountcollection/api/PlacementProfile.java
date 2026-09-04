@@ -6,5 +6,5 @@ package com.mahghuuuls.mountcollection.api;
 public enum PlacementProfile {
     SOLID_GROUND,
     WATER,
-    PROVIDER_SPECIFIC
+    LAVA
 }

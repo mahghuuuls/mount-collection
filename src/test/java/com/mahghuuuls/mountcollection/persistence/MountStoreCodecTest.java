@@ -4,6 +4,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.mahghuuuls.mountcollection.api.MountCharacteristics;
+import com.mahghuuuls.mountcollection.api.MountTrait;
+import com.mahghuuuls.mountcollection.api.PlacementProfile;
+import com.mahghuuuls.mountcollection.api.ProviderPayload;
+import java.util.EnumSet;
 import java.util.UUID;
 import com.mahghuuuls.mountcollection.policy.ActiveServerClock;
 import com.mahghuuuls.mountcollection.policy.ActiveTimeResult;
@@ -40,6 +45,77 @@ final class MountStoreCodecTest {
         assertEquals(4321L, restored.getRepository().getActiveTick());
         assertEquals(4400L, restored.getRepository().getRecallCooldownDeadline(owner));
         assertEquals(79L, restored.getRepository().getRecallCooldown(owner).getDuration());
+    }
+
+    @Test
+    void currentRecordRoundTripPreservesBoundedCharacteristics() {
+        MountSavedData source = new MountSavedData("test");
+        MountCharacteristics characteristics = new MountCharacteristics(
+                PlacementProfile.LAVA, EnumSet.of(MountTrait.FLYING));
+        MountRecord record = register(
+                source.getRepository(), UUID.randomUUID(), UUID.randomUUID(), characteristics)
+                .getRecord().get();
+
+        NBTTagCompound encoded = source.writeToNBT(new NBTTagCompound());
+        NBTTagCompound raw = encoded.getTagList("Records", 10).getCompoundTagAt(0);
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(encoded);
+
+        assertEquals(MountRecord.CURRENT_VERSION, raw.getInteger("Version"));
+        assertEquals("LAVA", raw.getString("PlacementProfile"));
+        assertEquals("FLYING", raw.getTagList("MountTraits", 8).getStringTagAt(0));
+        assertEquals(characteristics,
+                restored.getRepository().find(record.getMountId()).get().getCharacteristics());
+    }
+
+    @Test
+    void legacyRecordMigratesUnambiguouslyToGroundWithoutTraits() {
+        MountSavedData source = new MountSavedData("test");
+        MountRecord record = register(
+                source.getRepository(), UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        NBTTagCompound root = source.writeToNBT(new NBTTagCompound());
+        root.setInteger("RootVersion", 4);
+        NBTTagCompound raw = root.getTagList("Records", 10).getCompoundTagAt(0);
+        raw.setInteger("Version", 1);
+        raw.removeTag("PlacementProfile");
+        raw.removeTag("MountTraits");
+
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(root);
+        NBTTagCompound migrated = restored.writeToNBT(new NBTTagCompound())
+                .getTagList("Records", 10).getCompoundTagAt(0);
+
+        assertEquals(MountCharacteristics.solidGround(),
+                restored.getRepository().find(record.getMountId()).get().getCharacteristics());
+        assertTrue(restored.isDirty());
+        assertEquals(MountRecord.CURRENT_VERSION, migrated.getInteger("Version"));
+        assertEquals("SOLID_GROUND", migrated.getString("PlacementProfile"));
+        assertEquals(0, migrated.getTagList("MountTraits", 8).tagCount());
+    }
+
+    @Test
+    void malformedOrUnknownCurrentCharacteristicsAreRetainedAndBlocked() {
+        assertCharacteristicRecordBlocked(raw -> raw.setString("PlacementProfile", "AERIAL"));
+        assertCharacteristicRecordBlocked(raw -> raw.removeTag("PlacementProfile"));
+        assertCharacteristicRecordBlocked(raw -> {
+            NBTTagList traits = new NBTTagList();
+            traits.appendTag(new NBTTagString("UNKNOWN"));
+            raw.setTag("MountTraits", traits);
+        });
+        assertCharacteristicRecordBlocked(raw -> {
+            NBTTagList traits = new NBTTagList();
+            traits.appendTag(new NBTTagString("FLYING"));
+            traits.appendTag(new NBTTagString("FLYING"));
+            raw.setTag("MountTraits", traits);
+        });
+    }
+
+    @Test
+    void malformedOrLegacyRecordVersionCannotBypassCurrentCharacteristicDecoding() {
+        assertCharacteristicRecordBlocked(raw -> raw.removeTag("Version"));
+        assertCharacteristicRecordBlocked(raw -> raw.setString("Version", "1"));
+        assertCharacteristicRecordBlocked(raw -> raw.setInteger("Version", -1));
+        assertCharacteristicRecordBlocked(raw -> raw.setInteger("Version", 1));
     }
 
     @Test
@@ -789,6 +865,14 @@ final class MountStoreCodecTest {
 
     private static MountRepository.RegistrationResult register(
             MountRepository repository, UUID owner, UUID physical) {
+        return register(repository, owner, physical, MountCharacteristics.solidGround());
+    }
+
+    private static MountRepository.RegistrationResult register(
+            MountRepository repository,
+            UUID owner,
+            UUID physical,
+            MountCharacteristics characteristics) {
         ResourceLocation horse = new ResourceLocation("minecraft:horse");
         return repository.register(new MountRepository.RegistrationCandidate(
                 owner,
@@ -797,6 +881,24 @@ final class MountStoreCodecTest {
                 horse.toString(),
                 physical,
                 new LastKnownEvidence(0, 0.0, 64.0, 0.0),
-                null));
+                null,
+                characteristics,
+                new ProviderPayload(0, new NBTTagCompound())));
+    }
+
+    private static void assertCharacteristicRecordBlocked(
+            java.util.function.Consumer<NBTTagCompound> mutation) {
+        MountSavedData source = new MountSavedData("test");
+        MountRecord record = register(
+                source.getRepository(), UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        NBTTagCompound root = source.writeToNBT(new NBTTagCompound());
+        NBTTagCompound raw = root.getTagList("Records", 10).getCompoundTagAt(0);
+        mutation.accept(raw);
+
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(root);
+
+        assertEquals(MountCondition.INTEGRITY_BLOCKED,
+                restored.getRepository().find(record.getMountId()).get().getCondition());
     }
 }

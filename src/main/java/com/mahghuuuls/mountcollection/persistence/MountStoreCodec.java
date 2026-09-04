@@ -1,5 +1,8 @@
 package com.mahghuuuls.mountcollection.persistence;
 
+import com.mahghuuuls.mountcollection.api.MountCharacteristics;
+import com.mahghuuuls.mountcollection.api.MountTrait;
+import com.mahghuuuls.mountcollection.api.PlacementProfile;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -11,12 +14,13 @@ import java.util.Set;
 import java.util.UUID;
 import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.nbt.NBTTagList;
+import net.minecraft.nbt.NBTTagString;
 import net.minecraft.nbt.CompressedStreamTools;
 import net.minecraft.util.ResourceLocation;
 
 final class MountStoreCodec {
 
-    static final int CURRENT_ROOT_VERSION = 4;
+    static final int CURRENT_ROOT_VERSION = 5;
     private static final int INT_TAG = 3;
     private static final int LONG_TAG = 4;
     private static final int DOUBLE_TAG = 6;
@@ -54,6 +58,7 @@ final class MountStoreCodec {
     }
 
     static MountRepository.RepositorySnapshot decodeKnown(NBTTagCompound root) {
+        int rootVersion = readRootVersion(root);
         Map<MountId, MountRecord> records = new LinkedHashMap<>();
         Map<UUID, MountRepository.PlayerState> players = new LinkedHashMap<>();
         Map<UUID, TransferOperation> transfers = new LinkedHashMap<>();
@@ -65,7 +70,7 @@ final class MountStoreCodec {
         for (int index = 0; index < recordList.tagCount(); index++) {
             NBTTagCompound raw = recordList.getCompoundTagAt(index).copy();
             try {
-                MountRecord record = decodeRecord(raw);
+                MountRecord record = decodeRecord(raw, rootVersion);
                 if (records.putIfAbsent(record.getMountId(), record) != null) {
                     retainedMalformedRecords.add(raw);
                     MountRecord first = records.get(record.getMountId());
@@ -404,12 +409,17 @@ final class MountStoreCodec {
         }
     }
 
-    private static MountRecord decodeRecord(NBTTagCompound raw) {
-        int version = raw.hasKey("Version") ? raw.getInteger("Version") : 0;
+    private static MountRecord decodeRecord(NBTTagCompound raw, int rootVersion) {
+        requireTag(raw, "Version", INT_TAG);
+        int version = raw.getInteger("Version");
         MountId mountId = MountId.parse(raw.getString("MountId"));
         UUID ownerId = parseUuid(raw.getString("OwnerId"));
         if (version > MountRecord.CURRENT_VERSION) {
             return retainedBlocked(mountId, ownerId, raw, "future record schema");
+        }
+        boolean legacyCharacteristics = rootVersion == 4 && version == 1;
+        if (version < 1 || (!legacyCharacteristics && version != MountRecord.CURRENT_VERSION)) {
+            throw new IllegalArgumentException("unsupported record schema for root schema");
         }
         ResourceLocation providerId = parseId(raw.getString("ProviderId"));
         ResourceLocation entityTypeId = parseId(raw.getString("EntityTypeId"));
@@ -438,9 +448,13 @@ final class MountStoreCodec {
         NBTTagCompound payload = raw.hasKey("ProviderPayload", COMPOUND_TAG)
                 ? raw.getCompoundTag("ProviderPayload")
                 : new NBTTagCompound();
+        MountCharacteristics characteristics = legacyCharacteristics
+                ? MountCharacteristics.solidGround()
+                : decodeCharacteristics(raw);
         return new MountRecord(
                 mountId, ownerId, providerId, entityTypeId, typeKey, ordinal, order,
-                physicalId, evidence, condition, reason, payloadVersion, payload, null);
+                physicalId, evidence, condition, reason, characteristics,
+                payloadVersion, payload, null);
     }
 
     private static NBTTagCompound encodeRecord(MountRecord record) {
@@ -465,7 +479,32 @@ final class MountStoreCodec {
         }
         raw.setInteger("ProviderPayloadVersion", record.getProviderPayloadVersion());
         raw.setTag("ProviderPayload", record.copyProviderPayload());
+        raw.setString("PlacementProfile", record.getCharacteristics().getPlacementProfile().name());
+        NBTTagList traits = new NBTTagList();
+        for (MountTrait trait : record.getCharacteristics().getTraits()) {
+            traits.appendTag(new NBTTagString(trait.name()));
+        }
+        raw.setTag("MountTraits", traits);
         return raw;
+    }
+
+    private static MountCharacteristics decodeCharacteristics(NBTTagCompound raw) {
+        requireTag(raw, "PlacementProfile", STRING_TAG);
+        requireTag(raw, "MountTraits", LIST_TAG);
+        PlacementProfile profile = PlacementProfile.valueOf(raw.getString("PlacementProfile"));
+        NBTTagList rawTraits = (NBTTagList) raw.getTag("MountTraits");
+        if (rawTraits.tagCount() > MountTrait.values().length
+                || rawTraits.tagCount() > 0 && rawTraits.getTagType() != STRING_TAG) {
+            throw new IllegalArgumentException("malformed mount traits");
+        }
+        Set<MountTrait> traits = new LinkedHashSet<>();
+        for (int index = 0; index < rawTraits.tagCount(); index++) {
+            MountTrait trait = MountTrait.valueOf(rawTraits.getStringTagAt(index));
+            if (!traits.add(trait)) {
+                throw new IllegalArgumentException("duplicate mount trait");
+            }
+        }
+        return new MountCharacteristics(profile, traits);
     }
 
     private static MountRecord retainedBlocked(
@@ -482,6 +521,7 @@ final class MountStoreCodec {
                 null,
                 MountCondition.INTEGRITY_BLOCKED,
                 reason,
+                MountCharacteristics.solidGround(),
                 0,
                 new NBTTagCompound(),
                 raw);

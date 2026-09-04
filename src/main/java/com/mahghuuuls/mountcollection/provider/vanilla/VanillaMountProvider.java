@@ -1,9 +1,8 @@
 package com.mahghuuuls.mountcollection.provider.vanilla;
 
 import com.mahghuuuls.mountcollection.Tags;
+import com.mahghuuuls.mountcollection.api.MountCharacteristics;
 import com.mahghuuuls.mountcollection.api.MountProvider;
-import com.mahghuuuls.mountcollection.api.PlacementProfile;
-import com.mahghuuuls.mountcollection.api.PlacementSupport;
 import com.mahghuuuls.mountcollection.api.ProviderFailure;
 import com.mahghuuuls.mountcollection.api.ProviderResult;
 import com.mahghuuuls.mountcollection.api.RegistrationProfile;
@@ -20,7 +19,7 @@ import net.minecraft.entity.passive.EntitySkeletonHorse;
 import net.minecraft.entity.passive.EntityZombieHorse;
 import net.minecraft.util.ResourceLocation;
 
-public final class VanillaMountProvider implements MountProvider, PlacementSupport {
+public final class VanillaMountProvider implements MountProvider {
 
     public static final ResourceLocation ID = new ResourceLocation(Tags.MOD_ID, "vanilla");
 
@@ -55,14 +54,8 @@ public final class VanillaMountProvider implements MountProvider, PlacementSuppo
         if (entityTypeId == null) {
             return ProviderResult.failure(ProviderFailure.INVALID_STATE);
         }
-        return ProviderResult.success(new RegistrationProfile(entityTypeId, entityTypeId.toString()));
-    }
-
-    @Override
-    public ProviderResult<PlacementProfile> getPlacementProfile(Entity mount) {
-        return supports(mount)
-                ? ProviderResult.success(PlacementProfile.SOLID_GROUND)
-                : ProviderResult.failure(ProviderFailure.UNSUPPORTED);
+        return ProviderResult.success(new RegistrationProfile(
+                entityTypeId, entityTypeId.toString(), MountCharacteristics.solidGround()));
     }
 
     static VanillaEligibility.Kind kindOfClass(Class<?> type) {

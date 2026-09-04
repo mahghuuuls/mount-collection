@@ -1,5 +1,6 @@
 package com.mahghuuuls.mountcollection.persistence;
 
+import com.mahghuuuls.mountcollection.api.MountCharacteristics;
 import com.mahghuuuls.mountcollection.api.ProviderPayload;
 import java.util.Objects;
 import java.util.UUID;
@@ -8,7 +9,7 @@ import net.minecraft.util.ResourceLocation;
 
 public final class MountRecord {
 
-    public static final int CURRENT_VERSION = 1;
+    public static final int CURRENT_VERSION = 2;
 
     private final MountId mountId;
     private final UUID ownerId;
@@ -19,6 +20,7 @@ public final class MountRecord {
     private final long registrationOrder;
     private final UUID physicalEntityId;
     private final LastKnownEvidence lastKnown;
+    private final MountCharacteristics characteristics;
     private final MountCondition condition;
     private final String integrityReason;
     private final int providerPayloadVersion;
@@ -40,6 +42,28 @@ public final class MountRecord {
             int providerPayloadVersion,
             NBTTagCompound providerPayload,
             NBTTagCompound preservedRaw) {
+        this(mountId, ownerId, providerId, entityTypeId, fallbackTypeKey, fallbackOrdinal,
+                registrationOrder, physicalEntityId, lastKnown, condition, integrityReason,
+                MountCharacteristics.solidGround(), providerPayloadVersion, providerPayload,
+                preservedRaw);
+    }
+
+    MountRecord(
+            MountId mountId,
+            UUID ownerId,
+            ResourceLocation providerId,
+            ResourceLocation entityTypeId,
+            String fallbackTypeKey,
+            int fallbackOrdinal,
+            long registrationOrder,
+            UUID physicalEntityId,
+            LastKnownEvidence lastKnown,
+            MountCondition condition,
+            String integrityReason,
+            MountCharacteristics characteristics,
+            int providerPayloadVersion,
+            NBTTagCompound providerPayload,
+            NBTTagCompound preservedRaw) {
         this.mountId = Objects.requireNonNull(mountId, "mountId");
         this.ownerId = Objects.requireNonNull(ownerId, "ownerId");
         this.providerId = Objects.requireNonNull(providerId, "providerId");
@@ -55,6 +79,7 @@ public final class MountRecord {
         this.registrationOrder = registrationOrder;
         this.physicalEntityId = physicalEntityId;
         this.lastKnown = lastKnown;
+        this.characteristics = Objects.requireNonNull(characteristics, "characteristics");
         this.condition = Objects.requireNonNull(condition, "condition");
         if (condition.retainsAuthoritativePhysicalAssociation()
                 && (physicalEntityId == null || lastKnown == null)) {
@@ -79,6 +104,7 @@ public final class MountRecord {
     public long getRegistrationOrder() { return registrationOrder; }
     public UUID getPhysicalEntityId() { return physicalEntityId; }
     public LastKnownEvidence getLastKnown() { return lastKnown; }
+    public MountCharacteristics getCharacteristics() { return characteristics; }
     public MountCondition getCondition() { return condition; }
     public String getIntegrityReason() { return integrityReason; }
     public int getProviderPayloadVersion() { return providerPayloadVersion; }
@@ -129,7 +155,8 @@ public final class MountRecord {
         return new MountRecord(
                 mountId, ownerId, providerId, entityTypeId, fallbackTypeKey,
                 fallbackOrdinal, registrationOrder, physicalEntityId, lastKnown,
-                MountCondition.LIVING, null, payload.getVersion(), payload.copyData(), preservedRaw);
+                MountCondition.LIVING, null, characteristics, payload.getVersion(),
+                payload.copyData(), preservedRaw);
     }
 
     private MountRecord copy(
@@ -140,7 +167,8 @@ public final class MountRecord {
         return new MountRecord(
                 mountId, ownerId, providerId, entityTypeId, fallbackTypeKey,
                 fallbackOrdinal, registrationOrder, nextPhysicalId, nextEvidence,
-                nextCondition, nextReason, providerPayloadVersion, providerPayload, preservedRaw);
+                nextCondition, nextReason, characteristics, providerPayloadVersion,
+                providerPayload, preservedRaw);
     }
 
     private static String requireBounded(String value, String name, int maximumLength) {

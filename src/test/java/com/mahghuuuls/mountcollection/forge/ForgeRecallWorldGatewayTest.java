@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.mahghuuuls.mountcollection.api.MountProvider;
+import com.mahghuuuls.mountcollection.api.PlacementProfile;
 import com.mahghuuuls.mountcollection.api.PreparationSupport;
 import com.mahghuuuls.mountcollection.api.ProviderFailure;
 import com.mahghuuuls.mountcollection.api.ProviderResult;
@@ -79,6 +80,53 @@ final class ForgeRecallWorldGatewayTest {
 
         assertTrue(provider.called);
         assertEquals("prepared-candidate", candidate.getCustomNameTag());
+    }
+
+    @Test
+    void placementSafetyRejectsEveryCommonWorldConstraint() {
+        PlacementProbeState probe = new PlacementProbeState();
+        assertTrue(ForgeRecallWorldGateway.safe(PlacementProfile.SOLID_GROUND, probe));
+
+        probe.withinVerticalBounds = false;
+        assertFalse(ForgeRecallWorldGateway.safe(PlacementProfile.SOLID_GROUND, probe));
+        probe = new PlacementProbeState();
+        probe.insideWorldBorder = false;
+        assertFalse(ForgeRecallWorldGateway.safe(PlacementProfile.SOLID_GROUND, probe));
+        probe = new PlacementProbeState();
+        probe.chunksLoaded = false;
+        assertFalse(ForgeRecallWorldGateway.safe(PlacementProfile.SOLID_GROUND, probe));
+        probe = new PlacementProbeState();
+        probe.blockCollisionFree = false;
+        assertFalse(ForgeRecallWorldGateway.safe(PlacementProfile.SOLID_GROUND, probe));
+        probe = new PlacementProbeState();
+        probe.entityCollisionFree = false;
+        assertFalse(ForgeRecallWorldGateway.safe(PlacementProfile.SOLID_GROUND, probe));
+        probe = new PlacementProbeState();
+        probe.hazardFree = false;
+        assertFalse(ForgeRecallWorldGateway.safe(PlacementProfile.SOLID_GROUND, probe));
+    }
+
+    @Test
+    void placementSafetyAppliesProfileSpecificSupportAndCompleteVolumeRules() {
+        PlacementProbeState probe = new PlacementProbeState();
+        probe.solidSupport = false;
+        assertFalse(ForgeRecallWorldGateway.safe(PlacementProfile.SOLID_GROUND, probe));
+        probe = new PlacementProbeState();
+        probe.liquid = true;
+        assertFalse(ForgeRecallWorldGateway.safe(PlacementProfile.SOLID_GROUND, probe));
+
+        probe = new PlacementProbeState();
+        probe.completeVolumeMatch = false;
+        assertFalse(ForgeRecallWorldGateway.safe(PlacementProfile.WATER, probe));
+        assertFalse(ForgeRecallWorldGateway.safe(PlacementProfile.LAVA, probe));
+
+        probe = new PlacementProbeState();
+        probe.solidSupport = false;
+        probe.liquid = true;
+        assertTrue(ForgeRecallWorldGateway.safe(PlacementProfile.WATER, probe));
+        assertEquals(PlacementProfile.WATER, probe.requestedProfile);
+        assertTrue(ForgeRecallWorldGateway.safe(PlacementProfile.LAVA, probe));
+        assertEquals(PlacementProfile.LAVA, probe.requestedProfile);
     }
 
     @Test
@@ -569,6 +617,66 @@ final class ForgeRecallWorldGatewayTest {
         @Override
         public boolean isRemoved() {
             return false;
+        }
+    }
+
+    private static final class PlacementProbeState
+            implements ForgeRecallWorldGateway.PlacementProbe {
+        private boolean withinVerticalBounds = true;
+        private boolean insideWorldBorder = true;
+        private boolean chunksLoaded = true;
+        private boolean blockCollisionFree = true;
+        private boolean entityCollisionFree = true;
+        private boolean hazardFree = true;
+        private boolean completeVolumeMatch = true;
+        private boolean solidSupport = true;
+        private boolean liquid;
+        private PlacementProfile requestedProfile;
+
+        @Override
+        public boolean isWithinVerticalBounds() {
+            return withinVerticalBounds;
+        }
+
+        @Override
+        public boolean isInsideWorldBorder() {
+            return insideWorldBorder;
+        }
+
+        @Override
+        public boolean areChunksLoaded() {
+            return chunksLoaded;
+        }
+
+        @Override
+        public boolean isBlockCollisionFree() {
+            return blockCollisionFree;
+        }
+
+        @Override
+        public boolean isEntityCollisionFree() {
+            return entityCollisionFree;
+        }
+
+        @Override
+        public boolean isHazardFree() {
+            return hazardFree;
+        }
+
+        @Override
+        public boolean doesCompleteVolumeMatch(PlacementProfile profile) {
+            requestedProfile = profile;
+            return completeVolumeMatch;
+        }
+
+        @Override
+        public boolean hasSolidSupport() {
+            return solidSupport;
+        }
+
+        @Override
+        public boolean containsLiquid() {
+            return liquid;
         }
     }
 }

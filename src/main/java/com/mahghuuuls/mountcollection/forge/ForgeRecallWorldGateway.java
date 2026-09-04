@@ -1,8 +1,8 @@
 package com.mahghuuuls.mountcollection.forge;
 
 import com.mahghuuuls.mountcollection.api.MountProvider;
+import com.mahghuuuls.mountcollection.api.MountCharacteristics;
 import com.mahghuuuls.mountcollection.api.PlacementProfile;
-import com.mahghuuuls.mountcollection.api.PlacementSupport;
 import com.mahghuuuls.mountcollection.api.PreparationSupport;
 import com.mahghuuuls.mountcollection.api.ProviderResult;
 import com.mahghuuuls.mountcollection.diagnostics.DiagnosticCategory;
@@ -77,6 +77,18 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         boolean isExact();
         void remove();
         boolean isRemoved();
+    }
+
+    interface PlacementProbe {
+        boolean isWithinVerticalBounds();
+        boolean isInsideWorldBorder();
+        boolean areChunksLoaded();
+        boolean isBlockCollisionFree();
+        boolean isEntityCollisionFree();
+        boolean isHazardFree();
+        boolean doesCompleteVolumeMatch(PlacementProfile profile);
+        boolean hasSolidSupport();
+        boolean containsLiquid();
     }
 
     private final ChunkPersistence chunkPersistence;
@@ -200,14 +212,11 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
     public Optional<Destination> plan(
             EntityPlayerMP player,
             Source source,
-            MountProvider provider,
+            MountCharacteristics characteristics,
             int normalRadius,
             int fallbackRadius) {
         Entity entity = entity(source);
-        PlacementProfile profile = placementProfile(provider, entity);
-        if (profile == null || profile == PlacementProfile.PROVIDER_SPECIFIC) {
-            return Optional.empty();
-        }
+        PlacementProfile profile = characteristics.getPlacementProfile();
         BlockPos origin = player.getPosition();
         return placementSearch.find(normalRadius, fallbackRadius, (dx, dy, dz) -> safe(
                         player.getServerWorld(),
@@ -715,27 +724,76 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
 
     private static boolean safe(
             WorldServer world, Entity entity, PlacementProfile profile, double x, double y, double z) {
-        if (y < 1.0D || y + entity.height >= world.getHeight()) {
-            return false;
-        }
         AxisAlignedBB candidate = entity.getEntityBoundingBox().offset(
                 x - entity.posX, y - entity.posY, z - entity.posZ);
-        if (!world.getWorldBorder().contains(candidate)
-                || !allLoaded(world, candidate)
-                || !world.getCollisionBoxes(entity, candidate).isEmpty()
-                || !world.checkNoEntityCollision(candidate, entity)
-                || containsHazard(world, candidate)) {
+        BlockPos feet = new BlockPos(x, y, z);
+        return safe(profile, new PlacementProbe() {
+            @Override
+            public boolean isWithinVerticalBounds() {
+                return y >= 1.0D && y + entity.height < world.getHeight();
+            }
+
+            @Override
+            public boolean isInsideWorldBorder() {
+                return world.getWorldBorder().contains(candidate);
+            }
+
+            @Override
+            public boolean areChunksLoaded() {
+                return allLoaded(world, candidate);
+            }
+
+            @Override
+            public boolean isBlockCollisionFree() {
+                return world.getCollisionBoxes(entity, candidate).isEmpty();
+            }
+
+            @Override
+            public boolean isEntityCollisionFree() {
+                return world.checkNoEntityCollision(candidate, entity);
+            }
+
+            @Override
+            public boolean isHazardFree() {
+                return !containsHazard(world, candidate, profile);
+            }
+
+            @Override
+            public boolean doesCompleteVolumeMatch(PlacementProfile requiredProfile) {
+                Material required = requiredProfile == PlacementProfile.WATER
+                        ? Material.WATER
+                        : Material.LAVA;
+                return PlacementVolume.allCellsMatch(candidate,
+                        (cellX, cellY, cellZ) -> world.getBlockState(
+                                new BlockPos(cellX, cellY, cellZ)).getMaterial() == required);
+            }
+
+            @Override
+            public boolean hasSolidSupport() {
+                IBlockState support = world.getBlockState(feet.down());
+                return support.isTopSolid() && !isHazard(support);
+            }
+
+            @Override
+            public boolean containsLiquid() {
+                return world.containsAnyLiquid(candidate);
+            }
+        });
+    }
+
+    static boolean safe(PlacementProfile profile, PlacementProbe probe) {
+        if (!probe.isWithinVerticalBounds()
+                || !probe.isInsideWorldBorder()
+                || !probe.areChunksLoaded()
+                || !probe.isBlockCollisionFree()
+                || !probe.isEntityCollisionFree()
+                || !probe.isHazardFree()) {
             return false;
         }
-        BlockPos feet = new BlockPos(x, y, z);
-        if (profile == PlacementProfile.WATER) {
-            return world.isMaterialInBB(candidate, Material.WATER)
-                    && !world.isMaterialInBB(candidate, Material.LAVA);
+        if (profile == PlacementProfile.WATER || profile == PlacementProfile.LAVA) {
+            return probe.doesCompleteVolumeMatch(profile);
         }
-        IBlockState support = world.getBlockState(feet.down());
-        return support.isTopSolid()
-                && !isHazard(support)
-                && !world.containsAnyLiquid(candidate);
+        return probe.hasSolidSupport() && !probe.containsLiquid();
     }
 
     private static boolean allLoaded(WorldServer world, AxisAlignedBB box) {
@@ -749,11 +807,12 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         return true;
     }
 
-    private static boolean containsHazard(WorldServer world, AxisAlignedBB box) {
+    private static boolean containsHazard(
+            WorldServer world, AxisAlignedBB box, PlacementProfile profile) {
         BlockPos min = new BlockPos(box.minX, box.minY - 1.0D, box.minZ);
         BlockPos max = new BlockPos(box.maxX, box.maxY, box.maxZ);
         for (BlockPos pos : BlockPos.getAllInBoxMutable(min, max)) {
-            if (isHazard(world.getBlockState(pos))) {
+            if (isHazard(world.getBlockState(pos), profile)) {
                 return true;
             }
         }
@@ -761,28 +820,17 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
     }
 
     private static boolean isHazard(IBlockState state) {
+        return isHazard(state, PlacementProfile.SOLID_GROUND);
+    }
+
+    private static boolean isHazard(IBlockState state, PlacementProfile profile) {
         Block block = state.getBlock();
         Material material = state.getMaterial();
-        return material == Material.LAVA
+        return (material == Material.LAVA && profile != PlacementProfile.LAVA)
                 || material == Material.FIRE
                 || block == Blocks.FIRE
                 || block == Blocks.CACTUS
                 || block == Blocks.MAGMA;
-    }
-
-    private static PlacementProfile placementProfile(MountProvider provider, Entity entity) {
-        if (!(provider instanceof PlacementSupport)) {
-            return PlacementProfile.SOLID_GROUND;
-        }
-        try {
-            ProviderResult<PlacementProfile> result =
-                    ((PlacementSupport) provider).getPlacementProfile(entity);
-            return result != null && result.isSuccess() && result.getValue().isPresent()
-                    ? result.getValue().get()
-                    : null;
-        } catch (RuntimeException exception) {
-            return null;
-        }
     }
 
     static boolean prepareCandidate(Entity entity, MountProvider provider) {

@@ -204,6 +204,7 @@ public final class MountLifecycleService {
                 ? cooldown.getDuration()
                 : config.getSummonCooldownTicks();
         ActiveTimeResult remaining = clock.remainingUntil(cooldown.getDeadline(), cooldownBound);
+        recordCharacteristics(correlationId, "recall_characteristics", record);
         if (remaining.getStatus() != ActiveTimeResult.Status.VALID) {
             Map<String, String> clockFields = new LinkedHashMap<>();
             clockFields.put("correlation", correlationId.toString());
@@ -230,8 +231,15 @@ public final class MountLifecycleService {
                     ContextualOutcome.failure(denial));
         }
         java.util.Optional<RecallWorldGateway.Destination> destination = worldGateway.plan(
-                player, source, provider, config.getNormalPlacementRadius(),
+                player, source, record.getCharacteristics(), config.getNormalPlacementRadius(),
                 config.getFallbackPlacementRadius());
+        Map<String, String> placementFields = new LinkedHashMap<>();
+        placementFields.put("correlation", correlationId.toString());
+        placementFields.put("mount", record.getMountId().toString());
+        placementFields.put("profile",
+                record.getCharacteristics().getPlacementProfile().name());
+        placementFields.put("result", destination.isPresent() ? "FOUND" : "NONE");
+        diagnostics.detail(DiagnosticCategory.LIFECYCLE, "placement_result", placementFields);
         if (!destination.isPresent()) {
             return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
                     ContextualOutcome.failure(ContextualOutcome.Status.NO_SAFE_DESTINATION));
@@ -896,6 +904,7 @@ public final class MountLifecycleService {
                 physicalEntityId,
                 lastKnown,
                 claimedMountId,
+                profile.getCharacteristics(),
                 profile.getProviderPayload());
         MountRepository.RegistrationStatus preflight = repository.preflightRegistration(candidate);
         if (preflight != MountRepository.RegistrationStatus.SUCCESS) {
@@ -914,7 +923,18 @@ public final class MountLifecycleService {
                     fromRepositoryFailure(result.getStatus()));
         }
         MountRecord record = result.getRecord().get();
+        recordCharacteristics(correlationId, "registration_characteristics", record);
         return finish(correlationId, providerId.toString(), RegistrationOutcome.success(record.getMountId()));
+    }
+
+    private void recordCharacteristics(
+            UUID correlationId, String event, MountRecord record) {
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("correlation", correlationId.toString());
+        fields.put("mount", record.getMountId().toString());
+        fields.put("profile", record.getCharacteristics().getPlacementProfile().name());
+        fields.put("traits", record.getCharacteristics().getTraits().toString());
+        diagnostics.detail(DiagnosticCategory.LIFECYCLE, event, fields);
     }
 
     private RegistrationOutcome finish(

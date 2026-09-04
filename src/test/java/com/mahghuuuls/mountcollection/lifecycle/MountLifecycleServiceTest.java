@@ -6,7 +6,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.mahghuuuls.mountcollection.api.ProviderPayload;
+import com.mahghuuuls.mountcollection.api.MountCharacteristics;
 import com.mahghuuuls.mountcollection.api.MountProvider;
+import com.mahghuuuls.mountcollection.api.MountTrait;
+import com.mahghuuuls.mountcollection.api.PlacementProfile;
 import com.mahghuuuls.mountcollection.api.ProviderResult;
 import com.mahghuuuls.mountcollection.api.RegistrationProfile;
 import com.mahghuuuls.mountcollection.diagnostics.DiagnosticCategory;
@@ -25,6 +28,7 @@ import com.mahghuuuls.mountcollection.policy.FilterMode;
 import com.mahghuuuls.mountcollection.policy.ValidatedMountConfig;
 import com.mahghuuuls.mountcollection.provider.ProviderRegistry;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -130,6 +134,23 @@ final class MountLifecycleServiceTest {
     }
 
     @Test
+    void registrationPersistsProviderCharacteristicsAsRecallAuthority() {
+        MountRepository repository = new MountRepository();
+        MountLifecycleService service = service(repository, FilterMode.BLACKLIST);
+        MountCharacteristics aquatic =
+                new MountCharacteristics(PlacementProfile.WATER, Collections.emptySet());
+
+        RegistrationOutcome outcome = service.commitVerifiedRegistration(
+                UUID.randomUUID(), UUID.randomUUID(), PROVIDER,
+                new RegistrationProfile(HORSE, HORSE.toString(), aquatic),
+                UUID.randomUUID(), new LastKnownEvidence(0, 1.0D, 64.0D, 1.0D), null);
+
+        assertEquals(RegistrationOutcome.Status.SUCCESS, outcome.getStatus());
+        assertEquals(aquatic,
+                repository.find(outcome.getMountId().get()).get().getCharacteristics());
+    }
+
+    @Test
     void successfulRecallCommitsDestinationAndCooldownOnlyAfterWorldCommit() {
         MountRepository repository = new MountRepository();
         UUID owner = UUID.randomUUID();
@@ -149,6 +170,7 @@ final class MountLifecycleServiceTest {
         assertEquals(300L, repository.getRecallCooldownDeadline(owner));
         assertEquals(9.0D, repository.find(record.getMountId()).get().getLastKnown().getX());
         assertEquals(1, gateway.commitCalls);
+        assertEquals(record.getCharacteristics(), gateway.plannedCharacteristics);
         ContextualOutcome repeated = service.recallVerified(
                 UUID.randomUUID(), null, owner, 0, InhibitedStatus.UNAFFECTED, config());
         assertEquals(ContextualOutcome.Status.COOLDOWN, repeated.getStatus());
@@ -207,13 +229,43 @@ final class MountLifecycleServiceTest {
     }
 
     @Test
+    void flyingRecallOverrideStopsBeforePlacementMutationOrCooldown() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountCharacteristics flying = new MountCharacteristics(
+                PlacementProfile.SOLID_GROUND, EnumSet.of(MountTrait.FLYING));
+        MountRecord record = repository.register(new MountRepository.RegistrationCandidate(
+                owner, PROVIDER, HORSE, HORSE.toString(), UUID.randomUUID(),
+                new LastKnownEvidence(0, 1.0D, 64.0D, 1.0D), null, flying,
+                new ProviderPayload(0, new NBTTagCompound()))).getRecord().get();
+        FakeRecallWorld gateway = new FakeRecallWorld(record, false, true);
+        MountLifecycleService service = recallService(
+                repository, new ActiveServerClock(), gateway);
+
+        ContextualOutcome outcome = service.recallVerified(
+                UUID.randomUUID(), null, owner, 0,
+                InhibitedStatus.UNAFFECTED, config(true));
+
+        assertEquals(ContextualOutcome.Status.SUMMON_DISALLOWED, outcome.getStatus());
+        assertEquals(0, gateway.planCalls);
+        assertEquals(0, gateway.commitCalls);
+        assertEquals(0L, repository.getRecallCooldownDeadline(owner));
+        assertEquals(record.getLastKnown(),
+                repository.find(record.getMountId()).get().getLastKnown());
+    }
+
+    @Test
     void successfulCrossDimensionRecallUsesJournalAndChangesPhysicalUuid() {
         MountRepository repository = new MountRepository();
         UUID owner = UUID.randomUUID();
         UUID sourceId = UUID.randomUUID();
+        MountCharacteristics characteristics = new MountCharacteristics(
+                PlacementProfile.WATER, EnumSet.of(MountTrait.FLYING));
         MountRecord record = repository.register(new MountRepository.RegistrationCandidate(
                 owner, PROVIDER, HORSE, HORSE.toString(), sourceId,
-                new LastKnownEvidence(0, 1.0D, 64.0D, 1.0D), null)).getRecord().get();
+                new LastKnownEvidence(0, 1.0D, 64.0D, 1.0D), null,
+                characteristics, new ProviderPayload(0, new NBTTagCompound())))
+                .getRecord().get();
         ActiveServerClock clock = new ActiveServerClock();
         clock.restore(100L, 0L);
         FakeTransferWorld gateway = new FakeTransferWorld(record);
@@ -226,6 +278,8 @@ final class MountLifecycleServiceTest {
         assertEquals(gateway.candidateId,
                 repository.find(record.getMountId()).get().getPhysicalEntityId());
         assertEquals(1, repository.find(record.getMountId()).get().getLastKnown().getDimensionId());
+        assertEquals(characteristics,
+                repository.find(record.getMountId()).get().getCharacteristics());
         assertEquals(300L, repository.getRecallCooldownDeadline(owner));
         assertTrue(repository.getPendingTransfers().isEmpty());
         assertEquals(1, gateway.spawnCalls);
@@ -1196,11 +1250,15 @@ final class MountLifecycleServiceTest {
     }
 
     private static ValidatedMountConfig config() {
+        return config(false);
+    }
+
+    private static ValidatedMountConfig config(boolean flyingDisabled) {
         return new ValidatedMountConfig(
                 new ConfiguredFilter<>(FilterMode.BLACKLIST, Collections.emptySet()),
                 new ConfiguredFilter<>(FilterMode.BLACKLIST, Collections.emptySet()),
                 new ConfiguredFilter<>(FilterMode.BLACKLIST, Collections.emptySet()),
-                200L, 4, 16, true, 6000L, true, false);
+                200L, 4, 16, flyingDisabled, true, 6000L, true, false);
     }
 
     private static final class TestProvider implements MountProvider {
@@ -1220,6 +1278,7 @@ final class MountLifecycleServiceTest {
         private LocateResult locateResult;
         private int planCalls;
         private int commitCalls;
+        private MountCharacteristics plannedCharacteristics;
 
         private FakeRecallWorld(MountRecord record, boolean passenger, boolean commitSucceeds) {
             this(record, passenger, commitSucceeds, true);
@@ -1251,8 +1310,10 @@ final class MountLifecycleServiceTest {
         @Override
         public Optional<Destination> plan(
                 net.minecraft.entity.player.EntityPlayerMP player, Source source,
-                MountProvider provider, int normalRadius, int fallbackRadius) {
+                com.mahghuuuls.mountcollection.api.MountCharacteristics characteristics,
+                int normalRadius, int fallbackRadius) {
             planCalls++;
+            plannedCharacteristics = characteristics;
             return planSucceeds
                     ? Optional.of(new Destination(
                             new LastKnownEvidence(0, 9.0D, 64.0D, 9.0D)))
@@ -1318,7 +1379,8 @@ final class MountLifecycleServiceTest {
         @Override
         public Optional<Destination> plan(
                 net.minecraft.entity.player.EntityPlayerMP player, Source source,
-                MountProvider provider, int normalRadius, int fallbackRadius) {
+                com.mahghuuuls.mountcollection.api.MountCharacteristics characteristics,
+                int normalRadius, int fallbackRadius) {
             return Optional.of(new Destination(new LastKnownEvidence(1, 9.0D, 64.0D, 9.0D)));
         }
 

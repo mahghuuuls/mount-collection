@@ -11,6 +11,7 @@ public final class MountConfigValidator {
     public static final long DEFAULT_COOLDOWN_SECONDS = 10L;
     public static final int DEFAULT_NORMAL_RADIUS = 4;
     public static final int DEFAULT_FALLBACK_RADIUS = 16;
+    public static final boolean DEFAULT_DISABLE_FLYING_MOUNT_RECALL = false;
     public static final boolean DEFAULT_RECOVERY_ENABLED = true;
     public static final long DEFAULT_RECOVERY_SECONDS = 300L;
     public static final boolean DEFAULT_INHIBITED_BLOCKING_ENABLED = true;
@@ -60,6 +61,7 @@ public final class MountConfigValidator {
                 cooldownTicks,
                 normalRadius,
                 fallbackRadius,
+                raw.disableFlyingMountRecall,
                 raw.recoveryEnabled,
                 recoveryTicks,
                 raw.inhibitedBlockingEnabled,

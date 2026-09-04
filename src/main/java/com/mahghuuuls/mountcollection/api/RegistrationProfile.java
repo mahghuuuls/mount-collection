@@ -11,18 +11,36 @@ public final class RegistrationProfile {
 
     private final ResourceLocation entityTypeId;
     private final String fallbackTypeKey;
+    private final MountCharacteristics characteristics;
     private final ProviderPayload providerPayload;
 
     public RegistrationProfile(ResourceLocation entityTypeId, String fallbackTypeKey) {
-        this(entityTypeId, fallbackTypeKey, new ProviderPayload(0, new NBTTagCompound()));
+        this(entityTypeId, fallbackTypeKey, MountCharacteristics.solidGround());
+    }
+
+    public RegistrationProfile(
+            ResourceLocation entityTypeId,
+            String fallbackTypeKey,
+            MountCharacteristics characteristics) {
+        this(entityTypeId, fallbackTypeKey, characteristics,
+                new ProviderPayload(0, new NBTTagCompound()));
     }
 
     public RegistrationProfile(
             ResourceLocation entityTypeId,
             String fallbackTypeKey,
             ProviderPayload providerPayload) {
+        this(entityTypeId, fallbackTypeKey, MountCharacteristics.solidGround(), providerPayload);
+    }
+
+    public RegistrationProfile(
+            ResourceLocation entityTypeId,
+            String fallbackTypeKey,
+            MountCharacteristics characteristics,
+            ProviderPayload providerPayload) {
         this.entityTypeId = Objects.requireNonNull(entityTypeId, "entityTypeId");
         this.fallbackTypeKey = requireBounded(fallbackTypeKey, "fallbackTypeKey", 128);
+        this.characteristics = Objects.requireNonNull(characteristics, "characteristics");
         this.providerPayload = Objects.requireNonNull(providerPayload, "providerPayload");
     }
 
@@ -32,6 +50,10 @@ public final class RegistrationProfile {
 
     public String getFallbackTypeKey() {
         return fallbackTypeKey;
+    }
+
+    public MountCharacteristics getCharacteristics() {
+        return characteristics;
     }
 
     public ProviderPayload getProviderPayload() {

@@ -39,6 +39,7 @@ final class MountConfigValidatorTest {
         assertEquals(200L, config.getSummonCooldownTicks());
         assertEquals(4, config.getNormalPlacementRadius());
         assertEquals(16, config.getFallbackPlacementRadius());
+        assertFalse(config.isFlyingMountRecallDisabled());
         assertTrue(config.isRecoveryEnabled());
         assertEquals(6000L, config.getRecoveryDurationTicks());
         assertTrue(config.isInhibitedRecallBlockingEnabled());
@@ -134,6 +135,20 @@ final class MountConfigValidatorTest {
         assertEquals(200L, config.getSummonCooldownTicks());
         assertEquals(6000L, config.getRecoveryDurationTicks());
         assertEquals(2, warnings.values.size());
+    }
+
+    @Test
+    void flyingRecallOverrideIsIndependentOfSummoningFilterMode() {
+        RawMountConfig raw = new RawMountConfig(
+                "blacklist", new String[0], "whitelist",
+                new String[] {"minecraft:horse"}, "blacklist", new String[0],
+                "10", "4", "16", true, true, "300", true, false);
+
+        ValidatedMountConfig config = MountConfigValidator.validate(
+                raw, KNOWN_VANILLA, new RecordingWarnings());
+
+        assertTrue(config.isFlyingMountRecallDisabled());
+        assertTrue(config.getSummoningEntities().allows(new ResourceLocation("minecraft:horse")));
     }
 
     private static RawMountConfig defaultRaw() {

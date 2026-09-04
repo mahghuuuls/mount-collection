@@ -1,6 +1,7 @@
 package com.mahghuuuls.mountcollection.lifecycle;
 
 import com.mahghuuuls.mountcollection.api.MountProvider;
+import com.mahghuuuls.mountcollection.api.MountCharacteristics;
 import com.mahghuuuls.mountcollection.persistence.LastKnownEvidence;
 import com.mahghuuuls.mountcollection.persistence.MountRecord;
 import com.mahghuuuls.mountcollection.persistence.TransferOperation;
@@ -19,7 +20,7 @@ public interface RecallWorldGateway {
     Optional<Destination> plan(
             EntityPlayerMP player,
             Source source,
-            MountProvider provider,
+            MountCharacteristics characteristics,
             int normalRadius,
             int fallbackRadius);
 

@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.Collections;
+import java.util.EnumSet;
 import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.util.ResourceLocation;
 import org.junit.jupiter.api.Test;
@@ -58,5 +60,27 @@ final class ProviderValueTest {
                 () -> new RegistrationProfile(
                         new ResourceLocation("minecraft:horse"),
                         new String(new char[129]).replace('\0', 'x')));
+    }
+
+    @Test
+    void characteristicsAreBoundedImmutableAndDefaultToGround() {
+        EnumSet<MountTrait> source = EnumSet.of(MountTrait.FLYING);
+        MountCharacteristics characteristics =
+                new MountCharacteristics(PlacementProfile.WATER, source);
+        source.clear();
+
+        assertEquals(PlacementProfile.WATER, characteristics.getPlacementProfile());
+        assertEquals(Collections.singleton(MountTrait.FLYING), characteristics.getTraits());
+        assertThrows(UnsupportedOperationException.class,
+                () -> characteristics.getTraits().clear());
+        assertThrows(NullPointerException.class,
+                () -> new MountCharacteristics(null, Collections.emptySet()));
+        assertThrows(NullPointerException.class,
+                () -> new MountCharacteristics(PlacementProfile.LAVA,
+                        Collections.singleton(null)));
+
+        RegistrationProfile defaults = new RegistrationProfile(
+                new ResourceLocation("minecraft:horse"), "minecraft:horse");
+        assertEquals(MountCharacteristics.solidGround(), defaults.getCharacteristics());
     }
 }

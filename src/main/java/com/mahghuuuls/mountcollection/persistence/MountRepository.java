@@ -1,5 +1,6 @@
 package com.mahghuuuls.mountcollection.persistence;
 
+import com.mahghuuuls.mountcollection.api.MountCharacteristics;
 import com.mahghuuuls.mountcollection.api.ProviderPayload;
 import com.mahghuuuls.mountcollection.api.ProviderResult;
 import java.util.ArrayList;
@@ -63,6 +64,7 @@ public final class MountRepository {
         private final UUID physicalEntityId;
         private final LastKnownEvidence lastKnown;
         private final MountId claimedMountId;
+        private final MountCharacteristics characteristics;
         private final ProviderPayload providerPayload;
 
         public RegistrationCandidate(
@@ -74,7 +76,8 @@ public final class MountRepository {
                 LastKnownEvidence lastKnown,
                 MountId claimedMountId) {
             this(ownerId, providerId, entityTypeId, fallbackTypeKey, physicalEntityId,
-                    lastKnown, claimedMountId, new ProviderPayload(0, new NBTTagCompound()));
+                    lastKnown, claimedMountId, MountCharacteristics.solidGround(),
+                    new ProviderPayload(0, new NBTTagCompound()));
         }
 
         public RegistrationCandidate(
@@ -86,6 +89,20 @@ public final class MountRepository {
                 LastKnownEvidence lastKnown,
                 MountId claimedMountId,
                 ProviderPayload providerPayload) {
+            this(ownerId, providerId, entityTypeId, fallbackTypeKey, physicalEntityId,
+                    lastKnown, claimedMountId, MountCharacteristics.solidGround(), providerPayload);
+        }
+
+        public RegistrationCandidate(
+                UUID ownerId,
+                ResourceLocation providerId,
+                ResourceLocation entityTypeId,
+                String fallbackTypeKey,
+                UUID physicalEntityId,
+                LastKnownEvidence lastKnown,
+                MountId claimedMountId,
+                MountCharacteristics characteristics,
+                ProviderPayload providerPayload) {
             this.ownerId = Objects.requireNonNull(ownerId, "ownerId");
             this.providerId = Objects.requireNonNull(providerId, "providerId");
             this.entityTypeId = Objects.requireNonNull(entityTypeId, "entityTypeId");
@@ -93,6 +110,7 @@ public final class MountRepository {
             this.physicalEntityId = Objects.requireNonNull(physicalEntityId, "physicalEntityId");
             this.lastKnown = Objects.requireNonNull(lastKnown, "lastKnown");
             this.claimedMountId = claimedMountId;
+            this.characteristics = Objects.requireNonNull(characteristics, "characteristics");
             this.providerPayload = Objects.requireNonNull(providerPayload, "providerPayload");
         }
     }
@@ -248,6 +266,7 @@ public final class MountRepository {
                 candidate.lastKnown,
                 MountCondition.LIVING,
                 null,
+                candidate.characteristics,
                 candidate.providerPayload.getVersion(),
                 candidate.providerPayload.copyData(),
                 null);
