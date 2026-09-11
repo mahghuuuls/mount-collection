@@ -16,6 +16,7 @@ public final class ContextualOutcome {
         OWNED_BY_OTHER("mountcollection.message.owned_by_other"),
         NO_SELECTION("mountcollection.message.no_selection"),
         MOUNT_MISSING("mountcollection.message.mount_missing"),
+        RECOVERING("mountcollection.message.recovery_waiting"),
         PROVIDER_UNAVAILABLE("mountcollection.message.provider_unavailable"),
         PASSENGER_PRESENT("mountcollection.message.passenger_present"),
         SUMMON_DISALLOWED("mountcollection.message.summon_disallowed"),

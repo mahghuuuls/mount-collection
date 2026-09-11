@@ -20,7 +20,7 @@ import net.minecraft.util.ResourceLocation;
 
 final class MountStoreCodec {
 
-    static final int CURRENT_ROOT_VERSION = 5;
+    static final int CURRENT_ROOT_VERSION = 6;
     private static final int INT_TAG = 3;
     private static final int LONG_TAG = 4;
     private static final int DOUBLE_TAG = 6;
@@ -46,7 +46,8 @@ final class MountStoreCodec {
                     && root.hasKey("StoreRevision", LONG_TAG)
                     && hasRequiredCompoundList(root, "Records")
                     && hasRequiredCompoundList(root, "Players")
-                    && hasRequiredCompoundList(root, "Transfers");
+                    && hasRequiredCompoundList(root, "Transfers")
+                    && hasRequiredCompoundList(root, "Restorations");
         }
         return hasNumericIfPresent(root, "RootVersion")
                 && hasNumericIfPresent(root, "NextRegistrationOrder")
@@ -62,9 +63,11 @@ final class MountStoreCodec {
         Map<MountId, MountRecord> records = new LinkedHashMap<>();
         Map<UUID, MountRepository.PlayerState> players = new LinkedHashMap<>();
         Map<UUID, TransferOperation> transfers = new LinkedHashMap<>();
+        Map<UUID, RestorationOperation> restorations = new LinkedHashMap<>();
         List<NBTTagCompound> retainedMalformedRecords = new ArrayList<>();
         List<NBTTagCompound> retainedMalformedPlayers = new ArrayList<>();
         List<NBTTagCompound> retainedMalformedTransfers = new ArrayList<>();
+        List<NBTTagCompound> retainedMalformedRestorations = new ArrayList<>();
 
         NBTTagList recordList = root.getTagList("Records", COMPOUND_TAG);
         for (int index = 0; index < recordList.tagCount(); index++) {
@@ -78,6 +81,60 @@ final class MountStoreCodec {
                 }
             } catch (RuntimeException exception) {
                 retainMalformedRecord(raw, records, retainedMalformedRecords);
+            }
+        }
+
+        NBTTagList restorationList = root.getTagList("Restorations", COMPOUND_TAG);
+        Map<MountId, UUID> restorationMounts = new LinkedHashMap<>();
+        Map<UUID, NBTTagCompound> acceptedRestorationRaw = new LinkedHashMap<>();
+        Set<UUID> quarantinedRestorationIds = new LinkedHashSet<>();
+        Set<MountId> quarantinedRestorationMounts = new LinkedHashSet<>();
+        for (int index = 0; index < restorationList.tagCount(); index++) {
+            NBTTagCompound raw = restorationList.getCompoundTagAt(index).copy();
+            try {
+                RestorationOperation operation = decodeRestoration(raw);
+                if (quarantinedRestorationIds.contains(operation.getOperationId())
+                        || quarantinedRestorationMounts.contains(operation.getMountId())) {
+                    retainBounded(raw, retainedMalformedRestorations);
+                    blockTransferRecord(records, operation.getMountId(),
+                            "duplicate persisted restoration operation");
+                    continue;
+                }
+                RestorationOperation duplicateOperation =
+                        restorations.get(operation.getOperationId());
+                UUID duplicateMountOperation = restorationMounts.get(operation.getMountId());
+                if (duplicateOperation != null || duplicateMountOperation != null) {
+                    retainBounded(raw, retainedMalformedRestorations);
+                    blockTransferRecord(records, operation.getMountId(),
+                            "duplicate persisted restoration operation");
+                    RestorationOperation first = duplicateOperation != null
+                            ? duplicateOperation : restorations.get(duplicateMountOperation);
+                    if (first != null) {
+                        retainBounded(
+                                acceptedRestorationRaw.get(first.getOperationId()),
+                                retainedMalformedRestorations);
+                        restorations.remove(first.getOperationId());
+                        restorationMounts.remove(first.getMountId());
+                        quarantinedRestorationIds.add(first.getOperationId());
+                        quarantinedRestorationMounts.add(first.getMountId());
+                        blockTransferRecord(records, first.getMountId(),
+                                "duplicate persisted restoration operation");
+                    }
+                    quarantinedRestorationIds.add(operation.getOperationId());
+                    quarantinedRestorationMounts.add(operation.getMountId());
+                } else {
+                    restorations.put(operation.getOperationId(), operation);
+                    restorationMounts.put(operation.getMountId(), operation.getOperationId());
+                    acceptedRestorationRaw.put(operation.getOperationId(), raw);
+                }
+            } catch (RuntimeException exception) {
+                retainBounded(raw, retainedMalformedRestorations);
+                try {
+                    blockTransferRecord(records, MountId.parse(raw.getString("MountId")),
+                            "malformed persisted restoration operation");
+                } catch (RuntimeException ignored) {
+                    // The raw entry is retained even when it cannot identify a known record.
+                }
             }
         }
 
@@ -149,11 +206,41 @@ final class MountStoreCodec {
             }
         }
 
+        for (RestorationOperation restoration :
+                new java.util.ArrayList<>(restorations.values())) {
+            TransferOperation conflictingTransfer = null;
+            for (TransferOperation transfer : transfers.values()) {
+                if (transfer.getMountId().equals(restoration.getMountId())) {
+                    conflictingTransfer = transfer;
+                    break;
+                }
+            }
+            if (conflictingTransfer != null) {
+                retainBounded(
+                        acceptedRestorationRaw.get(restoration.getOperationId()),
+                        retainedMalformedRestorations);
+                retainBounded(
+                        acceptedTransferRaw.get(conflictingTransfer.getOperationId()),
+                        retainedMalformedTransfers);
+                restorations.remove(restoration.getOperationId());
+                transfers.remove(conflictingTransfer.getOperationId());
+                blockTransferRecord(records, restoration.getMountId(),
+                        "conflicting persisted transfer and restoration operations");
+            }
+        }
+
         NBTTagList playerList = root.getTagList("Players", COMPOUND_TAG);
         for (int index = 0; index < playerList.tagCount(); index++) {
             try {
                 NBTTagCompound raw = playerList.getCompoundTagAt(index);
-                if (raw.hasKey("Version") && raw.getInteger("Version") > 2) {
+                if (rootVersion == CURRENT_ROOT_VERSION) {
+                    requireTag(raw, "Version", INT_TAG);
+                    if (raw.getInteger("Version") != 3) {
+                        throw new IllegalArgumentException("unsupported current player schema");
+                    }
+                } else if (raw.hasKey("Version")
+                        && (!raw.hasKey("Version", INT_TAG)
+                                || raw.getInteger("Version") > 3)) {
                     throw new IllegalArgumentException("future player schema");
                 }
                 UUID ownerId = parseUuid(raw.getString("OwnerId"));
@@ -169,6 +256,11 @@ final class MountStoreCodec {
                         : 0L;
                 if (raw.hasKey("SelectedMountId")) {
                     state.selectedMountId = MountId.parse(raw.getString("SelectedMountId"));
+                }
+                if (raw.hasKey("PendingNotification")) {
+                    requireTag(raw, "PendingNotification", STRING_TAG);
+                    state.pendingNotificationKey = requireBounded(
+                            raw.getString("PendingNotification"), "pendingNotification");
                 }
                 if (raw.hasKey("Ordinals") && !hasCompoundList(raw, "Ordinals")) {
                     throw new IllegalArgumentException("malformed ordinal container");
@@ -208,9 +300,11 @@ final class MountStoreCodec {
                 records,
                 players,
                 transfers,
+                restorations,
                 retainedMalformedRecords,
                 retainedMalformedPlayers,
                 retainedMalformedTransfers,
+                retainedMalformedRestorations,
                 nextOrder,
                 activeTick,
                 storeRevision,
@@ -236,7 +330,7 @@ final class MountStoreCodec {
         NBTTagList players = new NBTTagList();
         for (Map.Entry<UUID, MountRepository.PlayerState> entry : snapshot.players.entrySet()) {
             NBTTagCompound player = new NBTTagCompound();
-            player.setInteger("Version", 2);
+            player.setInteger("Version", 3);
             player.setString("OwnerId", entry.getKey().toString());
             if (entry.getValue().selectedMountId != null) {
                 player.setString("SelectedMountId", entry.getValue().selectedMountId.toString());
@@ -244,6 +338,9 @@ final class MountStoreCodec {
             player.setLong("Revision", entry.getValue().revision);
             player.setLong("RecallCooldownDeadline", entry.getValue().recallCooldownDeadline);
             player.setLong("RecallCooldownDuration", entry.getValue().recallCooldownDuration);
+            if (entry.getValue().pendingNotificationKey != null) {
+                player.setString("PendingNotification", entry.getValue().pendingNotificationKey);
+            }
             NBTTagList ordinals = new NBTTagList();
             for (Map.Entry<String, Integer> ordinalEntry : entry.getValue().nextOrdinals.entrySet()) {
                 NBTTagCompound ordinal = new NBTTagCompound();
@@ -267,6 +364,15 @@ final class MountStoreCodec {
             transfers.appendTag(retained.copy());
         }
         root.setTag("Transfers", transfers);
+
+        NBTTagList restorations = new NBTTagList();
+        for (RestorationOperation operation : snapshot.restorations.values()) {
+            restorations.appendTag(encodeRestoration(operation));
+        }
+        for (NBTTagCompound retained : snapshot.retainedMalformedRestorations) {
+            restorations.appendTag(retained.copy());
+        }
+        root.setTag("Restorations", restorations);
         return root;
     }
 
@@ -328,6 +434,56 @@ final class MountStoreCodec {
         raw.setTag("SourceEvidence", encodeEvidence(operation.getSourceEvidence()));
         raw.setTag("DestinationEvidence", encodeEvidence(operation.getDestinationEvidence()));
         raw.setTag("SourceSnapshot", operation.copySourceSnapshot());
+        raw.setLong("CooldownDeadline", operation.getCooldownDeadline());
+        raw.setLong("CooldownDuration", operation.getCooldownDuration());
+        raw.setString("Phase", operation.getPhase().name());
+        if (operation.getIntegrityReason() != null) {
+            raw.setString("IntegrityReason", operation.getIntegrityReason());
+        }
+        return raw;
+    }
+
+    private static RestorationOperation decodeRestoration(NBTTagCompound raw) {
+        requireTag(raw, "Version", INT_TAG);
+        requireTag(raw, "OperationId", STRING_TAG);
+        requireTag(raw, "MountId", STRING_TAG);
+        requireTag(raw, "OwnerId", STRING_TAG);
+        requireTag(raw, "CandidateEntityId", STRING_TAG);
+        requireTag(raw, "DestinationEvidence", COMPOUND_TAG);
+        requireTag(raw, "CooldownDeadline", LONG_TAG);
+        requireTag(raw, "CooldownDuration", LONG_TAG);
+        requireTag(raw, "Phase", STRING_TAG);
+        if (raw.getInteger("Version") != RestorationOperation.CURRENT_VERSION) {
+            throw new IllegalArgumentException("unsupported restoration schema");
+        }
+        RestorationPhase phase;
+        try {
+            phase = RestorationPhase.valueOf(raw.getString("Phase"));
+        } catch (RuntimeException exception) {
+            throw new IllegalArgumentException("unknown restoration phase", exception);
+        }
+        String reason = raw.hasKey("IntegrityReason")
+                ? requireBounded(raw.getString("IntegrityReason"), "integrityReason") : null;
+        return new RestorationOperation(
+                parseUuid(raw.getString("OperationId")),
+                MountId.parse(raw.getString("MountId")),
+                parseUuid(raw.getString("OwnerId")),
+                parseUuid(raw.getString("CandidateEntityId")),
+                decodeEvidence(raw.getCompoundTag("DestinationEvidence")),
+                requireNonNegative(raw.getLong("CooldownDeadline"), "cooldownDeadline"),
+                requireNonNegative(raw.getLong("CooldownDuration"), "cooldownDuration"),
+                phase,
+                reason);
+    }
+
+    private static NBTTagCompound encodeRestoration(RestorationOperation operation) {
+        NBTTagCompound raw = new NBTTagCompound();
+        raw.setInteger("Version", RestorationOperation.CURRENT_VERSION);
+        raw.setString("OperationId", operation.getOperationId().toString());
+        raw.setString("MountId", operation.getMountId().toString());
+        raw.setString("OwnerId", operation.getOwnerId().toString());
+        raw.setString("CandidateEntityId", operation.getCandidateEntityId().toString());
+        raw.setTag("DestinationEvidence", encodeEvidence(operation.getDestinationEvidence()));
         raw.setLong("CooldownDeadline", operation.getCooldownDeadline());
         raw.setLong("CooldownDuration", operation.getCooldownDuration());
         raw.setString("Phase", operation.getPhase().name());
@@ -418,7 +574,10 @@ final class MountStoreCodec {
             return retainedBlocked(mountId, ownerId, raw, "future record schema");
         }
         boolean legacyCharacteristics = rootVersion == 4 && version == 1;
-        if (version < 1 || (!legacyCharacteristics && version != MountRecord.CURRENT_VERSION)) {
+        boolean characteristicsOnly = rootVersion == 5 && version == 2;
+        boolean current = rootVersion == CURRENT_ROOT_VERSION
+                && version == MountRecord.CURRENT_VERSION;
+        if (!legacyCharacteristics && !characteristicsOnly && !current) {
             throw new IllegalArgumentException("unsupported record schema for root schema");
         }
         ResourceLocation providerId = parseId(raw.getString("ProviderId"));
@@ -451,10 +610,11 @@ final class MountStoreCodec {
         MountCharacteristics characteristics = legacyCharacteristics
                 ? MountCharacteristics.solidGround()
                 : decodeCharacteristics(raw);
+        RecoveryState recoveryState = current ? decodeRecoveryState(raw, condition) : null;
         return new MountRecord(
                 mountId, ownerId, providerId, entityTypeId, typeKey, ordinal, order,
                 physicalId, evidence, condition, reason, characteristics,
-                payloadVersion, payload, null);
+                payloadVersion, payload, recoveryState, null);
     }
 
     private static NBTTagCompound encodeRecord(MountRecord record) {
@@ -485,7 +645,65 @@ final class MountStoreCodec {
             traits.appendTag(new NBTTagString(trait.name()));
         }
         raw.setTag("MountTraits", traits);
+        if (record.getRecoveryState() != null) {
+            raw.setTag("Recovery", encodeRecoveryState(record.getRecoveryState()));
+        }
         return raw;
+    }
+
+    private static RecoveryState decodeRecoveryState(
+            NBTTagCompound raw, MountCondition condition) {
+        boolean required = condition == MountCondition.RECOVERING
+                || condition == MountCondition.READY_FOR_RECALL;
+        boolean allowed = required
+                || condition == MountCondition.OPERATION_IN_PROGRESS
+                || condition == MountCondition.INTEGRITY_BLOCKED;
+        if (!raw.hasKey("Recovery")) {
+            if (required) {
+                throw new IllegalArgumentException("Recovery state is missing");
+            }
+            return null;
+        }
+        requireTag(raw, "Recovery", COMPOUND_TAG);
+        if (!allowed) {
+            throw new IllegalArgumentException("unexpected Recovery state");
+        }
+        NBTTagCompound recovery = raw.getCompoundTag("Recovery");
+        requireTag(recovery, "Version", INT_TAG);
+        requireTag(recovery, "SourceEntityId", STRING_TAG);
+        requireTag(recovery, "SourceEvidence", COMPOUND_TAG);
+        requireTag(recovery, "ProviderPayloadVersion", INT_TAG);
+        requireTag(recovery, "ProviderPayload", COMPOUND_TAG);
+        requireTag(recovery, "Deadline", LONG_TAG);
+        requireTag(recovery, "Duration", LONG_TAG);
+        if (recovery.getInteger("Version") != RecoveryState.CURRENT_VERSION) {
+            throw new IllegalArgumentException("unsupported Recovery state schema");
+        }
+        int payloadVersion = recovery.getInteger("ProviderPayloadVersion");
+        if (payloadVersion < 0) {
+            throw new IllegalArgumentException("negative Recovery provider payload version");
+        }
+        NBTTagCompound payload = recovery.getCompoundTag("ProviderPayload");
+        requireBoundedSnapshot(payload, "Recovery provider payload");
+        return new RecoveryState(
+                parseUuid(recovery.getString("SourceEntityId")),
+                decodeEvidence(recovery.getCompoundTag("SourceEvidence")),
+                new com.mahghuuuls.mountcollection.api.ProviderPayload(payloadVersion, payload),
+                requireNonNegative(recovery.getLong("Deadline"), "Recovery deadline"),
+                requireNonNegative(recovery.getLong("Duration"), "Recovery duration"));
+    }
+
+    private static NBTTagCompound encodeRecoveryState(RecoveryState state) {
+        NBTTagCompound recovery = new NBTTagCompound();
+        recovery.setInteger("Version", RecoveryState.CURRENT_VERSION);
+        recovery.setString("SourceEntityId", state.getSourceEntityId().toString());
+        recovery.setTag("SourceEvidence", encodeEvidence(state.getSourceEvidence()));
+        com.mahghuuuls.mountcollection.api.ProviderPayload payload = state.getProviderPayload();
+        recovery.setInteger("ProviderPayloadVersion", payload.getVersion());
+        recovery.setTag("ProviderPayload", payload.copyData());
+        recovery.setLong("Deadline", state.getDeadline());
+        recovery.setLong("Duration", state.getDuration());
+        return recovery;
     }
 
     private static MountCharacteristics decodeCharacteristics(NBTTagCompound raw) {
@@ -632,14 +850,18 @@ final class MountStoreCodec {
     }
 
     private static void requireBoundedSnapshot(NBTTagCompound snapshot) {
+        requireBoundedSnapshot(snapshot, "transfer snapshot");
+    }
+
+    private static void requireBoundedSnapshot(NBTTagCompound snapshot, String label) {
         try {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             CompressedStreamTools.writeCompressed(snapshot, output);
             if (output.size() > MAX_TRANSFER_SNAPSHOT_BYTES) {
-                throw new IllegalArgumentException("transfer snapshot is oversized");
+                throw new IllegalArgumentException(label + " is oversized");
             }
         } catch (IOException exception) {
-            throw new IllegalArgumentException("transfer snapshot could not be measured", exception);
+            throw new IllegalArgumentException(label + " could not be measured", exception);
         }
     }
 

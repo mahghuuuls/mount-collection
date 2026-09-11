@@ -3,3 +3,12 @@
 
 // If you wish to use the default helper methods, uncomment the line below
 // apply from: 'gradle/scripts/helpers.gradle'
+
+// Concurrent development JVMs must never rotate or overwrite each other's logs.
+// Keep logging resources outside src/main/resources so they do not ship in the mod.
+['runClient': 'client', 'runServer': 'server'].each { taskName, side ->
+    tasks.named(taskName, JavaExec).configure {
+        systemProperty 'log4j.configurationFile',
+                rootProject.file("gradle/logging/${side}.xml").toURI().toString()
+    }
+}

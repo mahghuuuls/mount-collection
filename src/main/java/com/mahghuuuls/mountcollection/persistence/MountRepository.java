@@ -56,6 +56,12 @@ public final class MountRepository {
         PERSISTENCE_FAILURE
     }
 
+    public enum RecoveryStatus {
+        SUCCESS,
+        REJECTED,
+        PERSISTENCE_FAILURE
+    }
+
     public static final class RegistrationCandidate {
         private final UUID ownerId;
         private final ResourceLocation providerId;
@@ -211,9 +217,11 @@ public final class MountRepository {
     private final Map<UUID, LinkedHashSet<MountId>> ownerIndex = new LinkedHashMap<>();
     private final Map<UUID, PlayerState> players = new LinkedHashMap<>();
     private final Map<UUID, TransferOperation> transfers = new LinkedHashMap<>();
+    private final Map<UUID, RestorationOperation> restorations = new LinkedHashMap<>();
     private final List<NBTTagCompound> retainedMalformedRecords = new ArrayList<>();
     private final List<NBTTagCompound> retainedMalformedPlayers = new ArrayList<>();
     private final List<NBTTagCompound> retainedMalformedTransfers = new ArrayList<>();
+    private final List<NBTTagCompound> retainedMalformedRestorations = new ArrayList<>();
     private final Runnable dirtyMarker;
     private AcknowledgedPersistence acknowledgedPersistence = ignored -> true;
 
@@ -455,6 +463,340 @@ public final class MountRepository {
         player.recallCooldownDuration = cooldownDuration;
         dirtyMarker.run();
         return RecallCommitStatus.SUCCESS;
+    }
+
+    /**
+     * Durably replaces the living physical association with one Recovery snapshot.
+     * The caller must not suppress vanilla death unless this acknowledgement succeeds.
+     */
+    public synchronized RecoveryStatus enterRecovery(
+            UUID ownerId,
+            MountId mountId,
+            UUID physicalEntityId,
+            RecoveryState recoveryState) {
+        Objects.requireNonNull(ownerId, "ownerId");
+        Objects.requireNonNull(mountId, "mountId");
+        Objects.requireNonNull(physicalEntityId, "physicalEntityId");
+        Objects.requireNonNull(recoveryState, "recoveryState");
+        PlayerState player = players.get(ownerId);
+        MountRecord record = records.get(mountId);
+        if (readOnly
+                || player == null
+                || player.selectionIntegrityBlocked
+                || record == null
+                || record.getCondition() != MountCondition.LIVING
+                || !ownerId.equals(record.getOwnerId())
+                || !physicalEntityId.equals(record.getPhysicalEntityId())
+                || !physicalEntityId.equals(recoveryState.getSourceEntityId())
+                || recoveryState.getDeadline()
+                        > saturatedAdd(activeTick, recoveryState.getDuration())) {
+            return RecoveryStatus.REJECTED;
+        }
+        RepositorySnapshot before = snapshot();
+        physicalIndex.remove(physicalEntityId);
+        records.put(mountId, record.enterRecovery(
+                recoveryState, recoveryState.getDeadline() <= activeTick));
+        player.pendingNotificationKey = recoveryState.getDeadline() <= activeTick
+                ? "mountcollection.message.recovery_ready"
+                : "mountcollection.message.recovery_started";
+        return durableCheckpoint(before)
+                ? RecoveryStatus.SUCCESS
+                : RecoveryStatus.PERSISTENCE_FAILURE;
+    }
+
+    public synchronized RecoveryStatus markRecoveryReady(MountId mountId, long currentTick) {
+        Objects.requireNonNull(mountId, "mountId");
+        MountRecord record = records.get(mountId);
+        if (readOnly || currentTick < 0L || record == null
+                || record.getCondition() != MountCondition.RECOVERING
+                || record.getRecoveryState() == null
+                || record.getRecoveryState().getDeadline() > currentTick) {
+            return RecoveryStatus.REJECTED;
+        }
+        RepositorySnapshot before = snapshot();
+        records.put(mountId, record.recoveryReady());
+        PlayerState player = players.get(record.getOwnerId());
+        if (player != null) {
+            player.pendingNotificationKey = "mountcollection.message.recovery_ready";
+        }
+        return durableCheckpoint(before)
+                ? RecoveryStatus.SUCCESS
+                : RecoveryStatus.PERSISTENCE_FAILURE;
+    }
+
+    public synchronized List<MountRecord> getRecoveringRecords() {
+        List<MountRecord> result = new ArrayList<>();
+        for (MountRecord record : records.values()) {
+            if (record.getCondition() == MountCondition.RECOVERING) {
+                result.add(record);
+            }
+        }
+        return Collections.unmodifiableList(result);
+    }
+
+    public synchronized boolean isControlledRecoverySource(
+            MountId mountId, UUID sourceEntityId) {
+        MountRecord record = records.get(Objects.requireNonNull(mountId, "mountId"));
+        return record != null
+                && record.getRecoveryState() != null
+                && (record.getCondition() == MountCondition.RECOVERING
+                        || record.getCondition() == MountCondition.READY_FOR_RECALL
+                        || record.getCondition() == MountCondition.OPERATION_IN_PROGRESS)
+                && record.getRecoveryState().getSourceEntityId().equals(
+                        Objects.requireNonNull(sourceEntityId, "sourceEntityId"));
+    }
+
+    /** Removes tracking while leaving the physical entity's ordinary death path untouched. */
+    public synchronized boolean removeForNormalDeath(UUID physicalEntityId) {
+        return removeForNormalDeath(
+                physicalEntityId, "mountcollection.message.recovery_unavailable");
+    }
+
+    public synchronized boolean removeForNormalDeath(
+            UUID physicalEntityId, String notificationKey) {
+        Objects.requireNonNull(physicalEntityId, "physicalEntityId");
+        Objects.requireNonNull(notificationKey, "notificationKey");
+        MountId mountId = physicalIndex.get(physicalEntityId);
+        MountRecord record = mountId == null ? null : records.get(mountId);
+        if (readOnly || record == null
+                || (record.getCondition() != MountCondition.LIVING
+                        && record.getCondition() != MountCondition.PROVIDER_UNAVAILABLE)
+                || !physicalEntityId.equals(record.getPhysicalEntityId())) {
+            return false;
+        }
+        physicalIndex.remove(physicalEntityId);
+        records.remove(mountId);
+        Set<MountId> owned = ownerIndex.get(record.getOwnerId());
+        if (owned != null) {
+            owned.remove(mountId);
+            if (owned.isEmpty()) {
+                ownerIndex.remove(record.getOwnerId());
+            }
+        }
+        PlayerState player = players.get(record.getOwnerId());
+        if (player != null && mountId.equals(player.selectedMountId)) {
+            player.selectedMountId = null;
+            player.selectionIntegrityBlocked = false;
+            if (player.revision != Long.MAX_VALUE) {
+                player.revision++;
+            }
+        }
+        if (player != null) {
+            player.pendingNotificationKey = notificationKey;
+        }
+        dirtyMarker.run();
+        return true;
+    }
+
+    public synchronized Optional<String> consumePendingNotification(UUID ownerId) {
+        Objects.requireNonNull(ownerId, "ownerId");
+        PlayerState player = players.get(ownerId);
+        if (player == null || player.pendingNotificationKey == null) {
+            return Optional.empty();
+        }
+        String result = player.pendingNotificationKey;
+        player.pendingNotificationKey = null;
+        dirtyMarker.run();
+        return Optional.of(result);
+    }
+
+    public synchronized java.util.List<UUID> getPendingNotificationOwners() {
+        java.util.List<UUID> owners = new java.util.ArrayList<>();
+        for (Map.Entry<UUID, PlayerState> entry : players.entrySet()) {
+            if (entry.getValue().pendingNotificationKey != null) {
+                owners.add(entry.getKey());
+            }
+        }
+        return java.util.Collections.unmodifiableList(owners);
+    }
+
+    public synchronized TransferStatus beginRestoration(RestorationOperation operation) {
+        Objects.requireNonNull(operation, "operation");
+        MountRecord record = records.get(operation.getMountId());
+        PlayerState player = players.get(operation.getOwnerId());
+        if (readOnly || operation.getPhase() != RestorationPhase.PREPARED
+                || restorations.containsKey(operation.getOperationId())
+                || record == null || record.getCondition() != MountCondition.READY_FOR_RECALL
+                || record.getRecoveryState() == null
+                || player == null || player.selectionIntegrityBlocked
+                || !operation.getMountId().equals(player.selectedMountId)
+                || !operation.getOwnerId().equals(record.getOwnerId())
+                || operation.getCooldownDeadline()
+                        > saturatedAdd(activeTick, operation.getCooldownDuration())) {
+            return TransferStatus.REJECTED;
+        }
+        if (findTransferByMount(operation.getMountId()).isPresent()
+                || findRestorationByMount(operation.getMountId()).isPresent()) {
+            return TransferStatus.INTEGRITY_CONFLICT;
+        }
+        RepositorySnapshot before = snapshot();
+        restorations.put(operation.getOperationId(), operation);
+        records.put(operation.getMountId(), record.restorationInProgress(null, null));
+        return durableCheckpoint(before) ? TransferStatus.SUCCESS : TransferStatus.PERSISTENCE_FAILURE;
+    }
+
+    public synchronized Optional<RestorationOperation> findRestoration(UUID operationId) {
+        return Optional.ofNullable(restorations.get(operationId));
+    }
+
+    public synchronized Optional<RestorationOperation> findRestorationByMount(MountId mountId) {
+        for (RestorationOperation operation : restorations.values()) {
+            if (operation.getMountId().equals(mountId)) {
+                return Optional.of(operation);
+            }
+        }
+        return Optional.empty();
+    }
+
+    public synchronized List<RestorationOperation> getPendingRestorations() {
+        return Collections.unmodifiableList(new ArrayList<>(restorations.values()));
+    }
+
+    public synchronized boolean isControlledRestorationCandidate(
+            UUID operationId, MountId mountId, UUID candidateEntityId) {
+        RestorationOperation operation = restorations.get(operationId);
+        return operation != null
+                && operation.getPhase() != RestorationPhase.INTEGRITY_BLOCKED
+                && operation.getMountId().equals(mountId)
+                && operation.getCandidateEntityId().equals(candidateEntityId);
+    }
+
+    public synchronized TransferStatus markRestorationSpawnIntent(UUID operationId) {
+        return advanceRestoration(operationId, RestorationPhase.PREPARED,
+                RestorationPhase.CANDIDATE_SPAWN_INTENT);
+    }
+
+    public synchronized TransferStatus relocateRestorationEvidence(
+            UUID operationId, LastKnownEvidence evidence, boolean source) {
+        Objects.requireNonNull(evidence, "evidence");
+        RestorationOperation operation = restorations.get(operationId);
+        MountRecord record = operation == null ? null : records.get(operation.getMountId());
+        if (readOnly || record == null || record.getRecoveryState() == null
+                || record.getCondition() != MountCondition.OPERATION_IN_PROGRESS
+                || (source ? operation.getPhase() != RestorationPhase.PREPARED
+                        : operation.getPhase() != RestorationPhase.CANDIDATE_SPAWNED
+                                && operation.getPhase() != RestorationPhase.ASSOCIATED)) {
+            return TransferStatus.REJECTED;
+        }
+        RepositorySnapshot before = snapshot();
+        if (source) {
+            records.put(record.getMountId(), record.withRecoverySourceEvidence(evidence));
+        } else {
+            restorations.put(operationId, operation.withEvidence(evidence));
+            if (operation.getPhase() == RestorationPhase.ASSOCIATED) {
+                records.put(record.getMountId(), record.withLastKnown(evidence));
+            }
+        }
+        return durableCheckpoint(before) ? TransferStatus.SUCCESS : TransferStatus.PERSISTENCE_FAILURE;
+    }
+
+    public synchronized TransferStatus relocateCapturedSource(MountId mountId, LastKnownEvidence evidence) {
+        MountRecord record = records.get(mountId);
+        if (readOnly || record == null || record.getRecoveryState() == null
+                || record.getCondition() == MountCondition.INTEGRITY_BLOCKED) {
+            return TransferStatus.REJECTED;
+        }
+        RestorationOperation operation = findRestorationByMount(mountId).orElse(null);
+        if (operation != null && operation.getPhase() != RestorationPhase.PREPARED) {
+            return TransferStatus.REJECTED;
+        }
+        RepositorySnapshot before = snapshot();
+        records.put(mountId, record.withRecoverySourceEvidence(evidence));
+        return durableCheckpoint(before) ? TransferStatus.SUCCESS : TransferStatus.PERSISTENCE_FAILURE;
+    }
+
+    public synchronized TransferStatus markRestorationCandidateSpawned(UUID operationId) {
+        return advanceRestoration(operationId, RestorationPhase.CANDIDATE_SPAWN_INTENT,
+                RestorationPhase.CANDIDATE_SPAWNED);
+    }
+
+    public synchronized TransferStatus rollbackRestorationSpawnIntent(UUID operationId) {
+        return advanceRestoration(operationId, RestorationPhase.CANDIDATE_SPAWN_INTENT,
+                RestorationPhase.PREPARED);
+    }
+
+    /** Caller must have removed the exact candidate and durably verified its absence. */
+    public synchronized TransferStatus cancelContainedRestoration(UUID operationId) {
+        RestorationOperation operation = restorations.get(operationId);
+        MountRecord record = operation == null ? null : records.get(operation.getMountId());
+        if (readOnly || operation == null
+                || operation.getPhase() != RestorationPhase.CANDIDATE_SPAWN_INTENT
+                || record == null || record.getCondition() != MountCondition.OPERATION_IN_PROGRESS
+                || record.getRecoveryState() == null
+                || physicalIndex.containsKey(operation.getCandidateEntityId())) {
+            return TransferStatus.REJECTED;
+        }
+        RepositorySnapshot before = snapshot();
+        // Retaining PREPARED here would let queued observations retry a reported failure.
+        restorations.remove(operationId);
+        records.put(operation.getMountId(), record.restorationCancelled());
+        return durableCheckpoint(before) ? TransferStatus.SUCCESS : TransferStatus.PERSISTENCE_FAILURE;
+    }
+
+    public synchronized TransferStatus associateRestorationCandidate(UUID operationId) {
+        RestorationOperation operation = restorations.get(operationId);
+        MountRecord record = operation == null ? null : records.get(operation.getMountId());
+        if (readOnly || operation == null
+                || operation.getPhase() != RestorationPhase.CANDIDATE_SPAWNED
+                || record == null || record.getCondition() != MountCondition.OPERATION_IN_PROGRESS
+                || physicalIndex.containsKey(operation.getCandidateEntityId())) {
+            return operation == null ? TransferStatus.REJECTED
+                    : blockRestorationInternal(operation, "restoration association evidence changed");
+        }
+        RepositorySnapshot before = snapshot();
+        physicalIndex.put(operation.getCandidateEntityId(), operation.getMountId());
+        records.put(operation.getMountId(), record.restorationInProgress(
+                operation.getCandidateEntityId(), operation.getDestinationEvidence()));
+        restorations.put(operationId, operation.withPhase(RestorationPhase.ASSOCIATED));
+        return durableCheckpoint(before) ? TransferStatus.SUCCESS : TransferStatus.PERSISTENCE_FAILURE;
+    }
+
+    public synchronized TransferStatus finishRestoration(UUID operationId) {
+        RestorationOperation operation = restorations.get(operationId);
+        MountRecord record = operation == null ? null : records.get(operation.getMountId());
+        PlayerState player = operation == null ? null : players.get(operation.getOwnerId());
+        if (readOnly || operation == null || operation.getPhase() != RestorationPhase.ASSOCIATED
+                || record == null || record.getCondition() != MountCondition.OPERATION_IN_PROGRESS
+                || record.getRecoveryState() == null || player == null
+                || !operation.getCandidateEntityId().equals(record.getPhysicalEntityId())) {
+            return operation == null ? TransferStatus.REJECTED
+                    : blockRestorationInternal(operation, "restoration finalization evidence changed");
+        }
+        RepositorySnapshot before = snapshot();
+        player.recallCooldownDeadline = operation.getCooldownDeadline();
+        player.recallCooldownDuration = operation.getCooldownDuration();
+        records.put(operation.getMountId(), record.restorationCompleted());
+        restorations.remove(operationId);
+        return durableCheckpoint(before) ? TransferStatus.SUCCESS : TransferStatus.PERSISTENCE_FAILURE;
+    }
+
+    public synchronized TransferStatus blockRestoration(UUID operationId, String reason) {
+        RestorationOperation operation = restorations.get(operationId);
+        return operation == null || readOnly ? TransferStatus.REJECTED
+                : blockRestorationInternal(operation, reason);
+    }
+
+    private TransferStatus advanceRestoration(
+            UUID operationId, RestorationPhase expected, RestorationPhase next) {
+        RestorationOperation operation = restorations.get(operationId);
+        if (readOnly || operation == null || operation.getPhase() != expected) {
+            return TransferStatus.REJECTED;
+        }
+        RepositorySnapshot before = snapshot();
+        restorations.put(operationId, operation.withPhase(next));
+        return durableCheckpoint(before) ? TransferStatus.SUCCESS : TransferStatus.PERSISTENCE_FAILURE;
+    }
+
+    private TransferStatus blockRestorationInternal(
+            RestorationOperation operation, String reason) {
+        RepositorySnapshot before = snapshot();
+        restorations.put(operation.getOperationId(), operation.integrityBlocked(reason));
+        MountRecord record = records.get(operation.getMountId());
+        if (record != null) {
+            blockIntegrity(record, reason);
+        }
+        return durableCheckpoint(before)
+                ? TransferStatus.INTEGRITY_CONFLICT : TransferStatus.PERSISTENCE_FAILURE;
     }
 
     public synchronized TransferStatus beginTransfer(TransferOperation operation) {
@@ -847,6 +1189,15 @@ public final class MountRepository {
             player.recallCooldownDeadline = tick;
             player.recallCooldownDuration = 0L;
         }
+        for (MountRecord record : new ArrayList<>(records.values())) {
+            if (record.getCondition() == MountCondition.RECOVERING) {
+                records.put(record.getMountId(), record.recoveryReady());
+                PlayerState player = players.get(record.getOwnerId());
+                if (player != null) {
+                    player.pendingNotificationKey = "mountcollection.message.recovery_ready";
+                }
+            }
+        }
         dirtyMarker.run();
     }
 
@@ -855,9 +1206,11 @@ public final class MountRepository {
                 records,
                 players,
                 transfers,
+                restorations,
                 retainedMalformedRecords,
                 retainedMalformedPlayers,
                 retainedMalformedTransfers,
+                retainedMalformedRestorations,
                 nextRegistrationOrder,
                 activeTick,
                 storeRevision,
@@ -876,9 +1229,12 @@ public final class MountRepository {
         players.putAll(snapshot.players);
         transfers.clear();
         transfers.putAll(snapshot.transfers);
+        restorations.clear();
+        restorations.putAll(snapshot.restorations);
         copyRaw(snapshot.retainedMalformedRecords, retainedMalformedRecords);
         copyRaw(snapshot.retainedMalformedPlayers, retainedMalformedPlayers);
         copyRaw(snapshot.retainedMalformedTransfers, retainedMalformedTransfers);
+        copyRaw(snapshot.retainedMalformedRestorations, retainedMalformedRestorations);
         nextRegistrationOrder = snapshot.nextRegistrationOrder;
         activeTick = snapshot.activeTick;
         storeRevision = snapshot.storeRevision;
@@ -895,6 +1251,14 @@ public final class MountRepository {
                     .add(record.getMountId());
             PlayerState player = players.computeIfAbsent(record.getOwnerId(), ignored -> new PlayerState());
             player.ensureNextOrdinalAfter(record.getFallbackTypeKey(), record.getFallbackOrdinal());
+            RecoveryState recovery = record.getRecoveryState();
+            if (recovery != null
+                    && (recovery.getDeadline() > saturatedAdd(activeTick, recovery.getDuration())
+                            || (record.getCondition() == MountCondition.READY_FOR_RECALL
+                                    && recovery.getDeadline() > activeTick))) {
+                blockIntegrity(record, "persisted Recovery timing is inconsistent");
+                continue;
+            }
             if (!record.getCondition().retainsAuthoritativePhysicalAssociation()) {
                 continue;
             }
@@ -967,6 +1331,45 @@ public final class MountRepository {
                 records.put(record.getMountId(), record.operationInProgress());
             }
         }
+        for (RestorationOperation operation : new ArrayList<>(restorations.values())) {
+            MountRecord record = records.get(operation.getMountId());
+            boolean associated = operation.getPhase() == RestorationPhase.ASSOCIATED;
+            boolean conflictsWithTransfer = findTransferByMount(operation.getMountId()).isPresent();
+            boolean consistent = record != null
+                    && record.getRecoveryState() != null
+                    && operation.getOwnerId().equals(record.getOwnerId())
+                    && operation.getCooldownDeadline()
+                            <= saturatedAdd(activeTick, operation.getCooldownDuration())
+                    && (associated
+                            ? record.getCondition() == MountCondition.OPERATION_IN_PROGRESS
+                                    && operation.getCandidateEntityId().equals(
+                                            record.getPhysicalEntityId())
+                                    && operation.getDestinationEvidence().equals(
+                                            record.getLastKnown())
+                            : record.getCondition() == MountCondition.OPERATION_IN_PROGRESS
+                                    && record.getPhysicalEntityId() == null);
+            if (operation.getPhase() == RestorationPhase.INTEGRITY_BLOCKED) {
+                if (record != null) {
+                    records.put(record.getMountId(), record.integrityBlocked(
+                            operation.getIntegrityReason() == null
+                                    ? "persisted restoration is integrity-blocked"
+                                    : operation.getIntegrityReason()));
+                    if (record.getPhysicalEntityId() != null) {
+                        physicalIndex.remove(record.getPhysicalEntityId());
+                    }
+                }
+            } else if (!consistent || conflictsWithTransfer) {
+                restorations.put(operation.getOperationId(), operation.integrityBlocked(
+                        "persisted restoration association is inconsistent"));
+                if (record != null) {
+                    records.put(record.getMountId(), record.integrityBlocked(
+                            "persisted restoration association is inconsistent"));
+                    if (record.getPhysicalEntityId() != null) {
+                        physicalIndex.remove(record.getPhysicalEntityId());
+                    }
+                }
+            }
+        }
         for (Map.Entry<UUID, PlayerState> entry : players.entrySet()) {
             MountRecord selected = entry.getValue().selectedMountId == null
                     ? null
@@ -975,7 +1378,9 @@ public final class MountRepository {
                     ? entry.getValue().selectedMountId != null
                     : !entry.getKey().equals(selected.getOwnerId())
                             || (selected.getCondition() != MountCondition.LIVING
-                                    && selected.getCondition() != MountCondition.OPERATION_IN_PROGRESS);
+                                    && selected.getCondition() != MountCondition.OPERATION_IN_PROGRESS
+                                    && selected.getCondition() != MountCondition.RECOVERING
+                                    && selected.getCondition() != MountCondition.READY_FOR_RECALL);
         }
     }
 
@@ -1035,6 +1440,7 @@ public final class MountRepository {
         long recallCooldownDeadline;
         long recallCooldownDuration;
         boolean selectionIntegrityBlocked;
+        String pendingNotificationKey;
         final Map<String, Integer> nextOrdinals = new LinkedHashMap<>();
 
         private int peekNextOrdinal(String typeKey) {
@@ -1055,9 +1461,11 @@ public final class MountRepository {
         final Map<MountId, MountRecord> records;
         final Map<UUID, PlayerState> players;
         final Map<UUID, TransferOperation> transfers;
+        final Map<UUID, RestorationOperation> restorations;
         final List<NBTTagCompound> retainedMalformedRecords;
         final List<NBTTagCompound> retainedMalformedPlayers;
         final List<NBTTagCompound> retainedMalformedTransfers;
+        final List<NBTTagCompound> retainedMalformedRestorations;
         final long nextRegistrationOrder;
         final long activeTick;
         final long storeRevision;
@@ -1067,9 +1475,11 @@ public final class MountRepository {
                 Map<MountId, MountRecord> records,
                 Map<UUID, PlayerState> players,
                 Map<UUID, TransferOperation> transfers,
+                Map<UUID, RestorationOperation> restorations,
                 List<NBTTagCompound> retainedMalformedRecords,
                 List<NBTTagCompound> retainedMalformedPlayers,
                 List<NBTTagCompound> retainedMalformedTransfers,
+                List<NBTTagCompound> retainedMalformedRestorations,
                 long nextRegistrationOrder,
                 long activeTick,
                 long storeRevision,
@@ -1077,9 +1487,11 @@ public final class MountRepository {
             this.records = new LinkedHashMap<>(records);
             this.players = copyPlayers(players);
             this.transfers = new LinkedHashMap<>(transfers);
+            this.restorations = new LinkedHashMap<>(restorations);
             this.retainedMalformedRecords = copyRaw(retainedMalformedRecords);
             this.retainedMalformedPlayers = copyRaw(retainedMalformedPlayers);
             this.retainedMalformedTransfers = copyRaw(retainedMalformedTransfers);
+            this.retainedMalformedRestorations = copyRaw(retainedMalformedRestorations);
             this.nextRegistrationOrder = nextRegistrationOrder;
             this.activeTick = activeTick;
             this.storeRevision = storeRevision;
@@ -1103,6 +1515,7 @@ public final class MountRepository {
                 player.recallCooldownDeadline = entry.getValue().recallCooldownDeadline;
                 player.recallCooldownDuration = entry.getValue().recallCooldownDuration;
                 player.selectionIntegrityBlocked = entry.getValue().selectionIntegrityBlocked;
+                player.pendingNotificationKey = entry.getValue().pendingNotificationKey;
                 player.nextOrdinals.putAll(entry.getValue().nextOrdinals);
                 copy.put(entry.getKey(), player);
             }

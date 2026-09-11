@@ -16,6 +16,18 @@ final class LifecycleMutationExecutor {
     private final Queue<Runnable> queued = new ArrayDeque<>();
     private boolean fatal;
     private boolean draining;
+    private FatalTransferSafetyException callbackFailure;
+
+    synchronized void latchCallbackFailure(FatalTransferSafetyException failure) {
+        boolean first = callbackFailure == null;
+        callbackFailure = failure;
+        fatal = true;
+        queued.clear();
+        if (first) {
+            diagnostics.essentialLifecycleWarning("fatal_captured_source_safety",
+                    failure.boundedDiagnosticDetail());
+        }
+    }
 
     LifecycleMutationExecutor(DiagnosticSink diagnostics) {
         this(diagnostics, DEFAULT_MAX_QUEUED);
@@ -41,6 +53,9 @@ final class LifecycleMutationExecutor {
     void drainAtServerTickEnd() {
         final int initialCount;
         synchronized (this) {
+            if (callbackFailure != null) {
+                throw callbackFailure;
+            }
             if (fatal || draining) {
                 return;
             }
@@ -88,5 +103,6 @@ final class LifecycleMutationExecutor {
         queued.clear();
         fatal = false;
         draining = false;
+        callbackFailure = null;
     }
 }

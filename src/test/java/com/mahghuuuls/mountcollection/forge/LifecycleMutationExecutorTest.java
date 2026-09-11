@@ -23,6 +23,20 @@ import org.junit.jupiter.api.Test;
 final class LifecycleMutationExecutorTest {
 
     @Test
+    void callbackFailureCannotBeLostIfAnOuterCommandHandlerCatchesIt() {
+        LifecycleMutationExecutor executor = new LifecycleMutationExecutor(new CapturingDiagnostics());
+        executor.enqueue(() -> { throw new AssertionError("must not execute"); });
+        FatalTransferSafetyException failure = FatalTransferSafetyException.capturedSourceFailure(
+                UUID.randomUUID(), new IllegalStateException("injected"));
+        executor.latchCallbackFailure(failure);
+        assertFalse(executor.enqueue(() -> {}));
+        assertEquals(failure, assertThrows(FatalTransferSafetyException.class, executor::drainAtServerTickEnd));
+        assertEquals(0, executor.queuedCount());
+        executor.reset();
+        executor.drainAtServerTickEnd();
+    }
+
+    @Test
     void boundedQueueRunsOnlyWhenTickEndDrainIsInvoked() {
         CapturingDiagnostics diagnostics = new CapturingDiagnostics();
         LifecycleMutationExecutor executor = new LifecycleMutationExecutor(diagnostics, 2);

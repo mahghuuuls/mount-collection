@@ -4,7 +4,9 @@ import com.mahghuuuls.mountcollection.Tags;
 import com.mahghuuuls.mountcollection.api.MountCharacteristics;
 import com.mahghuuuls.mountcollection.api.MountProvider;
 import com.mahghuuuls.mountcollection.api.ProviderFailure;
+import com.mahghuuuls.mountcollection.api.ProviderPayload;
 import com.mahghuuuls.mountcollection.api.ProviderResult;
+import com.mahghuuuls.mountcollection.api.RecoverySupport;
 import com.mahghuuuls.mountcollection.api.RegistrationProfile;
 import java.util.UUID;
 import net.minecraft.entity.Entity;
@@ -17,9 +19,10 @@ import net.minecraft.entity.passive.EntityMule;
 import net.minecraft.entity.passive.EntityPig;
 import net.minecraft.entity.passive.EntitySkeletonHorse;
 import net.minecraft.entity.passive.EntityZombieHorse;
+import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.util.ResourceLocation;
 
-public final class VanillaMountProvider implements MountProvider {
+public final class VanillaMountProvider implements MountProvider, RecoverySupport {
 
     public static final ResourceLocation ID = new ResourceLocation(Tags.MOD_ID, "vanilla");
 
@@ -56,6 +59,39 @@ public final class VanillaMountProvider implements MountProvider {
         }
         return ProviderResult.success(new RegistrationProfile(
                 entityTypeId, entityTypeId.toString(), MountCharacteristics.solidGround()));
+    }
+
+    @Override
+    public ProviderResult<ProviderPayload> capturePersistentState(Entity mount) {
+        if (!supports(mount)) {
+            return ProviderResult.failure(ProviderFailure.UNSUPPORTED);
+        }
+        try {
+            NBTTagCompound entityData = new NBTTagCompound();
+            mount.writeToNBT(entityData);
+            NBTTagCompound payload = new NBTTagCompound();
+            payload.setTag("Entity", entityData);
+            return ProviderResult.success(new ProviderPayload(1, payload));
+        } catch (RuntimeException exception) {
+            return ProviderResult.failure(ProviderFailure.INTERNAL_ERROR);
+        }
+    }
+
+    @Override
+    public ProviderResult<Void> applyPersistentState(Entity mount, ProviderPayload payload) {
+        if (!supports(mount) || payload == null || payload.getVersion() != 1) {
+            return ProviderResult.failure(ProviderFailure.INVALID_STATE);
+        }
+        try {
+            NBTTagCompound data = payload.copyData();
+            if (!data.hasKey("Entity", 10)) {
+                return ProviderResult.failure(ProviderFailure.INVALID_STATE);
+            }
+            mount.readFromNBT(data.getCompoundTag("Entity"));
+            return ProviderResult.success();
+        } catch (RuntimeException exception) {
+            return ProviderResult.failure(ProviderFailure.INTERNAL_ERROR);
+        }
     }
 
     static VanillaEligibility.Kind kindOfClass(Class<?> type) {

@@ -4,6 +4,8 @@ import com.mahghuuuls.mountcollection.api.MountProvider;
 import com.mahghuuuls.mountcollection.api.ProviderFailure;
 import com.mahghuuuls.mountcollection.api.ProviderResult;
 import com.mahghuuuls.mountcollection.api.RegistrationProfile;
+import com.mahghuuuls.mountcollection.api.RecoverySupport;
+import com.mahghuuuls.mountcollection.api.ProviderPayload;
 import com.mahghuuuls.mountcollection.diagnostics.DiagnosticCategory;
 import com.mahghuuuls.mountcollection.diagnostics.DiagnosticSink;
 import com.mahghuuuls.mountcollection.integration.inhibited.InhibitedIntegration;
@@ -16,10 +18,14 @@ import com.mahghuuuls.mountcollection.persistence.MountCondition;
 import com.mahghuuuls.mountcollection.persistence.MountRepository;
 import com.mahghuuuls.mountcollection.persistence.TransferOperation;
 import com.mahghuuuls.mountcollection.persistence.TransferPhase;
+import com.mahghuuuls.mountcollection.persistence.RecoveryState;
+import com.mahghuuuls.mountcollection.persistence.RestorationOperation;
+import com.mahghuuuls.mountcollection.persistence.RestorationPhase;
 import com.mahghuuuls.mountcollection.policy.ValidatedMountConfig;
 import com.mahghuuuls.mountcollection.policy.ActiveServerClock;
 import com.mahghuuuls.mountcollection.policy.ActiveTimeResult;
 import com.mahghuuuls.mountcollection.policy.RecallPolicy;
+import com.mahghuuuls.mountcollection.policy.RecoveryDeadlineIndex;
 import com.mahghuuuls.mountcollection.provider.ProviderRegistry;
 import com.mahghuuuls.mountcollection.provider.ProviderResolution;
 import java.util.LinkedHashMap;
@@ -27,6 +33,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.function.Supplier;
+import java.util.function.BooleanSupplier;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.EntityPlayerMP;
 
@@ -39,7 +46,9 @@ public final class MountLifecycleService {
     private final ActiveServerClock clock;
     private final InhibitedIntegration inhibitedIntegration;
     private final RecallWorldGateway worldGateway;
+    private final BooleanSupplier recoveryProviderUnavailable;
     private final RecallPolicy recallPolicy = new RecallPolicy();
+    private final RecoveryDeadlineIndex recoveryDeadlines = new RecoveryDeadlineIndex();
     private boolean reconcilingTransfers;
 
     private enum TransferAdvanceOutcome {
@@ -56,7 +65,7 @@ public final class MountLifecycleService {
             Supplier<ValidatedMountConfig> configSupplier,
             DiagnosticSink diagnostics) {
         this(repository, providers, configSupplier, diagnostics, new ActiveServerClock(),
-                new InhibitedIntegration(), null);
+                new InhibitedIntegration(), null, () -> false);
     }
 
     public MountLifecycleService(
@@ -67,6 +76,19 @@ public final class MountLifecycleService {
             ActiveServerClock clock,
             InhibitedIntegration inhibitedIntegration,
             RecallWorldGateway worldGateway) {
+        this(repository, providers, configSupplier, diagnostics, clock,
+                inhibitedIntegration, worldGateway, () -> false);
+    }
+
+    public MountLifecycleService(
+            MountRepository repository,
+            ProviderRegistry providers,
+            Supplier<ValidatedMountConfig> configSupplier,
+            DiagnosticSink diagnostics,
+            ActiveServerClock clock,
+            InhibitedIntegration inhibitedIntegration,
+            RecallWorldGateway worldGateway,
+            BooleanSupplier recoveryProviderUnavailable) {
         this.repository = Objects.requireNonNull(repository, "repository");
         this.providers = Objects.requireNonNull(providers, "providers");
         this.configSupplier = Objects.requireNonNull(configSupplier, "configSupplier");
@@ -74,6 +96,137 @@ public final class MountLifecycleService {
         this.clock = Objects.requireNonNull(clock, "clock");
         this.inhibitedIntegration = Objects.requireNonNull(inhibitedIntegration, "inhibitedIntegration");
         this.worldGateway = worldGateway;
+        this.recoveryProviderUnavailable = Objects.requireNonNull(
+                recoveryProviderUnavailable, "recoveryProviderUnavailable");
+        this.recoveryDeadlines.rebuild(repository.getRecoveringRecords());
+    }
+
+    public RecoveryDeathOutcome handleLethalDamage(Entity mount) {
+        Objects.requireNonNull(mount, "mount");
+        MountRecord record = repository.findByPhysicalEntity(mount.getUniqueID()).orElse(null);
+        if (record == null) {
+            return RecoveryDeathOutcome.untracked();
+        }
+        ValidatedMountConfig config = configSupplier.get();
+        if (!config.isRecoveryEnabled()) {
+            return normalDeath(record,
+                    RecoveryDeathOutcome.Status.NORMAL_DEATH_RECOVERY_DISABLED);
+        }
+        MountProvider provider = providers.find(record.getProviderId()).orElse(null);
+        if (!(provider instanceof RecoverySupport)) {
+            return normalDeath(record,
+                    RecoveryDeathOutcome.Status.NORMAL_DEATH_PROVIDER_UNAVAILABLE);
+        }
+        ProviderResult<ProviderPayload> captured;
+        try {
+            captured = ((RecoverySupport) provider).capturePersistentState(mount);
+        } catch (RuntimeException exception) {
+            captured = null;
+        }
+        if (captured == null || !captured.isSuccess() || !captured.getValue().isPresent()) {
+            return normalDeath(record,
+                    RecoveryDeathOutcome.Status.NORMAL_DEATH_CAPTURE_FAILED);
+        }
+        return commitCapturedRecovery(
+                record, mount.getUniqueID(), evidenceFor(mount),
+                captured.getValue().get(), config.getRecoveryDurationTicks());
+    }
+
+    /** Records exact captured-source relocation before the adapter suppresses its rejoin. */
+    public void acknowledgeCapturedSourceLocation(MountRecord record, Entity source) {
+        LastKnownEvidence actual = evidenceFor(source);
+        if (!actual.equals(record.getRecoveryState().getSourceEvidence())
+                && repository.relocateCapturedSource(record.getMountId(), actual)
+                        != MountRepository.TransferStatus.SUCCESS) {
+            source.captureDrops = true;
+            source.isDead = true;
+            throw FatalTransferSafetyException.capturedSourceFailure(source.getUniqueID(),
+                    new IllegalStateException("captured source relocation was not acknowledged"));
+        }
+    }
+
+    RecoveryDeathOutcome commitCapturedRecovery(
+            MountRecord record,
+            UUID physicalEntityId,
+            LastKnownEvidence evidence,
+            ProviderPayload payload,
+            long recoveryDurationTicks) {
+        ActiveTimeResult deadline = clock.deadlineAfter(recoveryDurationTicks);
+        if (!deadline.isValid()) {
+            return normalDeath(record, RecoveryDeathOutcome.Status.NORMAL_DEATH_CLOCK_FAILURE);
+        }
+        RecoveryState state = new RecoveryState(
+                physicalEntityId, evidence, payload,
+                deadline.getValue(), recoveryDurationTicks);
+        MountRepository.RecoveryStatus status = repository.enterRecovery(
+                record.getOwnerId(), record.getMountId(), physicalEntityId, state);
+        if (status != MountRepository.RecoveryStatus.SUCCESS) {
+            repository.removeForNormalDeath(physicalEntityId);
+            return recoveryDeathFinish(RecoveryDeathOutcome.tracked(
+                    RecoveryDeathOutcome.Status.PERSISTENCE_FAILURE,
+                    record.getOwnerId(), record.getMountId()), record);
+        }
+        MountRecord recovering = repository.find(record.getMountId()).get();
+        recoveryDeadlines.schedule(recovering);
+        return recoveryDeathFinish(RecoveryDeathOutcome.tracked(
+                RecoveryDeathOutcome.Status.PROTECTED,
+                record.getOwnerId(), record.getMountId()), recovering);
+    }
+
+    RecoveryDeathOutcome normalDeath(
+            MountRecord record, RecoveryDeathOutcome.Status status) {
+        repository.removeForNormalDeath(
+                record.getPhysicalEntityId(), normalDeathNotification(status));
+        return recoveryDeathFinish(RecoveryDeathOutcome.tracked(
+                status, record.getOwnerId(), record.getMountId()), record);
+    }
+
+    private static String normalDeathNotification(RecoveryDeathOutcome.Status status) {
+        if (status == RecoveryDeathOutcome.Status.NORMAL_DEATH_RECOVERY_DISABLED) {
+            return "mountcollection.message.recovery_disabled_death";
+        }
+        if (status == RecoveryDeathOutcome.Status.NORMAL_DEATH_PROVIDER_UNAVAILABLE) {
+            return "mountcollection.message.recovery_provider_unavailable_death";
+        }
+        return "mountcollection.message.recovery_unavailable";
+    }
+
+    /** Advances only deadlines already present in the derived priority index. */
+    public java.util.List<UUID> advanceRecoveryDeadlines() {
+        java.util.LinkedHashSet<UUID> newlyReady = new java.util.LinkedHashSet<>();
+        long now = clock.now();
+        java.util.Optional<MountId> due;
+        while ((due = recoveryDeadlines.peekDue(now)).isPresent()) {
+            MountId mountId = due.get();
+            MountRecord recovering = repository.find(mountId).orElse(null);
+            MountRepository.RecoveryStatus status = repository.markRecoveryReady(mountId, now);
+            if (status == MountRepository.RecoveryStatus.PERSISTENCE_FAILURE) {
+                break;
+            }
+            recoveryDeadlines.remove(mountId);
+            if (status == MountRepository.RecoveryStatus.SUCCESS && recovering != null) {
+                newlyReady.add(recovering.getOwnerId());
+            }
+        }
+        return new java.util.ArrayList<>(newlyReady);
+    }
+
+    public void rebuildRecoveryDeadlines() {
+        recoveryDeadlines.rebuild(repository.getRecoveringRecords());
+    }
+
+    private RecoveryDeathOutcome recoveryDeathFinish(
+            RecoveryDeathOutcome outcome, MountRecord record) {
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("correlation", UUID.randomUUID().toString());
+        fields.put("mount", record.getMountId().toString());
+        fields.put("provider", record.getProviderId().toString());
+        fields.put("outcome", outcome.getStatus().name());
+        if (record.getRecoveryState() != null) {
+            fields.put("deadline", Long.toString(record.getRecoveryState().getDeadline()));
+        }
+        diagnostics.detail(DiagnosticCategory.LIFECYCLE, "recovery_death", fields);
+        return outcome;
     }
 
     public ContextualOutcome handleContextualIntent(EntityPlayerMP player) {
@@ -171,6 +324,18 @@ public final class MountLifecycleService {
         if (record.getCondition() == MountCondition.OPERATION_IN_PROGRESS) {
             return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
                     ContextualOutcome.failure(ContextualOutcome.Status.OPERATION_IN_PROGRESS));
+        }
+        if (record.getCondition() == MountCondition.RECOVERING) {
+            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                    ContextualOutcome.failure(ContextualOutcome.Status.RECOVERING));
+        }
+        if (record.getCondition() == MountCondition.READY_FOR_RECALL) {
+            if (recoveryProviderUnavailable.getAsBoolean()) {
+                provider = null;
+            }
+            return restoreRecovery(
+                    correlationId, player, ownerId, destinationDimension,
+                    inhibited, config, record, provider);
         }
         if (record.getCondition() != MountCondition.LIVING
                 || provider == null) {
@@ -297,6 +462,456 @@ public final class MountLifecycleService {
             }
         } finally {
             reconcilingTransfers = false;
+        }
+    }
+
+    public void reconcilePendingRestorations() {
+        if (worldGateway == null) {
+            return;
+        }
+        for (RestorationOperation operation : repository.getPendingRestorations()) {
+            if (operation.getPhase() != RestorationPhase.INTEGRITY_BLOCKED) {
+                advanceRestoration(operation.getOperationId());
+            }
+        }
+    }
+
+    public void reconcilePendingRestoration(UUID operationId) {
+        if (worldGateway != null && operationId != null) {
+            advanceRestoration(operationId);
+        }
+    }
+
+    /**
+     * Claims pending candidates before ordinary entity reconciliation can change their identity
+     * or location. Stable observations acknowledge journal and record location together; physical
+     * work remains queued at tick END. An absent marker is valid only after association.
+     */
+    public java.util.Optional<UUID> observeRestorationCandidate(Entity entity) {
+        EntityMountEvidence.ReadResult identity = EntityMountEvidence.read(entity);
+        if (!identity.getMountId().isPresent()) {
+            return java.util.Optional.empty();
+        }
+        RestorationOperation operation = repository.findRestorationByMount(identity.getMountId().get()).orElse(null);
+        if (operation == null || !operation.getCandidateEntityId().equals(entity.getUniqueID())) {
+            return java.util.Optional.empty();
+        }
+        UUID operationId = operation.getOperationId();
+        if (operation.getPhase() == RestorationPhase.INTEGRITY_BLOCKED || entity.isDead) {
+            return java.util.Optional.of(operationId);
+        }
+        MountRecord record = repository.find(operation.getMountId()).orElse(null);
+        EntityMountEvidence.TransferReadResult marker = EntityMountEvidence.readTransfer(entity);
+        boolean exactMarker = marker.getOperationId().map(operationId::equals).orElse(false);
+        boolean clearedAssociated = operation.getPhase() == RestorationPhase.ASSOCIATED
+                && marker.getStatus() == EntityMountEvidence.Status.NONE;
+        if (record == null || !record.getEntityTypeId().equals(net.minecraft.entity.EntityList.getKey(entity))
+                || (!exactMarker && !clearedAssociated)) {
+            blockRestoration(operationId, "restoration candidate event identity conflicts");
+            return java.util.Optional.of(operationId);
+        }
+        if (operation.getPhase() == RestorationPhase.CANDIDATE_SPAWNED
+                || operation.getPhase() == RestorationPhase.ASSOCIATED) {
+            LastKnownEvidence actual = new LastKnownEvidence(entity.dimension, entity.posX, entity.posY, entity.posZ);
+            if (!actual.equals(operation.getDestinationEvidence())
+                    && repository.relocateRestorationEvidence(operationId, actual, false)
+                            != MountRepository.TransferStatus.SUCCESS) {
+                diagnostics.essentialLifecycleWarning("restoration_relocation_not_saved",
+                        "candidate event retained pending journal evidence");
+            }
+        }
+        return java.util.Optional.of(operationId);
+    }
+
+    private ContextualOutcome restoreRecovery(
+            UUID correlationId,
+            EntityPlayerMP player,
+            UUID ownerId,
+            int destinationDimension,
+            InhibitedStatus inhibited,
+            ValidatedMountConfig config,
+            MountRecord record,
+            MountProvider provider) {
+        if (!(provider instanceof RecoverySupport) || worldGateway == null) {
+            return contextualFinish(correlationId, "recovery_recall",
+                    record.getProviderId().toString(),
+                    ContextualOutcome.failure(ContextualOutcome.Status.PROVIDER_UNAVAILABLE));
+        }
+        MountRepository.CooldownState cooldown = repository.getRecallCooldown(ownerId);
+        long cooldownBound = cooldown.getDuration() > 0L
+                ? cooldown.getDuration() : config.getSummonCooldownTicks();
+        ActiveTimeResult remaining = clock.remainingUntil(cooldown.getDeadline(), cooldownBound);
+        if (remaining.getStatus() != ActiveTimeResult.Status.VALID) {
+            Map<String, String> clockFields = new LinkedHashMap<>();
+            clockFields.put("correlation", correlationId.toString());
+            clockFields.put("status", remaining.getStatus().name());
+            clockFields.put("bounded_remaining", Long.toString(remaining.getValue()));
+            diagnostics.detail(DiagnosticCategory.LIFECYCLE, "active_time_anomaly", clockFields);
+            if (remaining.getStatus() == ActiveTimeResult.Status.BOUNDED_CLAMP
+                    && repository.normalizeRecallCooldown(
+                            ownerId, clock.now(), config.getSummonCooldownTicks())) {
+                cooldown = repository.getRecallCooldown(ownerId);
+                remaining = clock.remainingUntil(cooldown.getDeadline(), cooldown.getDuration());
+            }
+        }
+        ContextualOutcome.Status denial = recallPolicy.evaluateRecovery(
+                record, true, destinationDimension, inhibited, remaining.getValue(), config);
+        if (denial != null) {
+            return contextualFinish(correlationId, "recovery_recall",
+                    record.getProviderId().toString(), ContextualOutcome.failure(denial));
+        }
+        java.util.Optional<RecallWorldGateway.RecoveryPlan> plan = worldGateway.planRecovery(
+                player, record, provider, config.getNormalPlacementRadius(),
+                config.getFallbackPlacementRadius());
+        if (!plan.isPresent()) {
+            return contextualFinish(correlationId, "recovery_recall",
+                    record.getProviderId().toString(),
+                    ContextualOutcome.failure(ContextualOutcome.Status.NO_SAFE_DESTINATION));
+        }
+        ActiveTimeResult deadline = clock.deadlineAfter(config.getSummonCooldownTicks());
+        if (!deadline.isValid()) {
+            return contextualFinish(correlationId, "recovery_recall",
+                    record.getProviderId().toString(),
+                    ContextualOutcome.failure(ContextualOutcome.Status.INTERNAL_FAILURE));
+        }
+        RecallWorldGateway.RecoveryPlan recoveryPlan = plan.get();
+        RestorationOperation operation = new RestorationOperation(
+                correlationId, record.getMountId(), ownerId,
+                recoveryPlan.getCandidateEntityId(),
+                recoveryPlan.getDestination().getEvidence(),
+                deadline.getValue(), config.getSummonCooldownTicks(),
+                RestorationPhase.PREPARED, null);
+        MountRepository.TransferStatus began = repository.beginRestoration(operation);
+        if (began != MountRepository.TransferStatus.SUCCESS) {
+            return contextualFinish(correlationId, "recovery_recall",
+                    record.getProviderId().toString(),
+                    ContextualOutcome.failure(fromTransferStatus(began)));
+        }
+        TransferAdvanceOutcome advanced = advanceRestoration(operation.getOperationId());
+        if (advanced == TransferAdvanceOutcome.COMPLETE) {
+            return contextualFinish(correlationId, "recovery_recall",
+                    record.getProviderId().toString(),
+                    ContextualOutcome.success(ContextualOutcome.Status.RECALLED, record.getMountId()));
+        }
+        return contextualFinish(correlationId, "recovery_recall",
+                record.getProviderId().toString(),
+                ContextualOutcome.failure(fromTransferOutcome(advanced)));
+    }
+
+    private TransferAdvanceOutcome advanceRestoration(UUID operationId) {
+        try {
+            return advanceRestorationUnchecked(operationId);
+        } catch (FatalTransferSafetyException fatal) {
+            throw fatal;
+        } catch (RuntimeException unexpected) {
+            throw unexpectedRestorationFailure(operationId, unexpected);
+        }
+    }
+
+    private TransferAdvanceOutcome advanceRestorationUnchecked(UUID operationId) {
+        for (int step = 0; step < 8; step++) {
+            RestorationOperation operation = repository.findRestoration(operationId).orElse(null);
+            if (operation == null) {
+                return TransferAdvanceOutcome.COMPLETE;
+            }
+            if (operation.getPhase() == RestorationPhase.INTEGRITY_BLOCKED) {
+                return TransferAdvanceOutcome.INTEGRITY_CONFLICT;
+            }
+            // Stable-phase pauses must also hold when background reconciliation re-enters.
+            // Never yield an action intent to ordinary ticking.
+            if (operation.getPhase() != RestorationPhase.CANDIDATE_SPAWN_INTENT
+                    && worldGateway.pauseAfterRestorationPhase(operation.getPhase())) {
+                return TransferAdvanceOutcome.PENDING;
+            }
+            MountRecord record = repository.find(operation.getMountId()).orElse(null);
+            if (record == null || record.getRecoveryState() == null) {
+                return blockRestoration(operationId, "Recovery snapshot is unavailable");
+            }
+            MountProvider provider = providers.find(record.getProviderId()).orElse(null);
+            if (!(provider instanceof RecoverySupport)) {
+                return TransferAdvanceOutcome.TEMPORARILY_UNAVAILABLE;
+            }
+            if (operation.getPhase() == RestorationPhase.PREPARED
+                    || operation.getPhase() == RestorationPhase.CANDIDATE_SPAWNED
+                    || operation.getPhase() == RestorationPhase.ASSOCIATED) {
+                boolean source = operation.getPhase() == RestorationPhase.PREPARED;
+                RecallWorldGateway.RecoveryEvidence observed = source
+                        ? worldGateway.recoverySourceEvidence(record)
+                        : worldGateway.recoveryCandidateEvidence(operation, record);
+                RecallWorldGateway.TransferEvidence.Presence observedPresence = observed.getPresence();
+                // Chunk loading can suppress and acknowledge a captured source reentrantly.
+                record = repository.find(operation.getMountId()).orElse(null);
+                if (record == null || record.getRecoveryState() == null) {
+                    return blockRestoration(operationId, "Recovery authority changed during evidence lookup");
+                }
+                if (observedPresence == RecallWorldGateway.TransferEvidence.Presence.CONFLICT) {
+                    return blockRestoration(operationId, "restoration evidence conflicts");
+                }
+                if (observedPresence == RecallWorldGateway.TransferEvidence.Presence.UNAVAILABLE
+                        || (!source && observedPresence == RecallWorldGateway.TransferEvidence.Presence.MISSING)) {
+                    return TransferAdvanceOutcome.TEMPORARILY_UNAVAILABLE;
+                }
+                LastKnownEvidence recorded = source ? record.getRecoveryState().getSourceEvidence()
+                        : operation.getDestinationEvidence();
+                if (observed.getLocation() != null && !observed.getLocation().equals(recorded)) {
+                    if (repository.relocateRestorationEvidence(operationId, observed.getLocation(), source)
+                            != MountRepository.TransferStatus.SUCCESS) {
+                        return TransferAdvanceOutcome.PERSISTENCE_FAILURE;
+                    }
+                    operation = repository.findRestoration(operationId).get();
+                    record = repository.find(operation.getMountId()).get();
+                }
+            }
+            switch (operation.getPhase()) {
+                case PREPARED:
+                    TransferAdvanceOutcome sourceFence = fromRecoveryCheckpoint(operation,
+                            worldGateway.retireRecoverySource(record),
+                            "captured source absence could not be verified");
+                    if (sourceFence != TransferAdvanceOutcome.PENDING) {
+                        return sourceFence;
+                    }
+                    if (repository.markRestorationSpawnIntent(operationId)
+                            != MountRepository.TransferStatus.SUCCESS) {
+                        return TransferAdvanceOutcome.PERSISTENCE_FAILURE;
+                    }
+                    worldGateway.restorationPhaseAcknowledged(
+                            RestorationPhase.CANDIDATE_SPAWN_INTENT);
+                    break;
+                case CANDIDATE_SPAWN_INTENT:
+                    RecallWorldGateway.TransferEvidence.Presence presence =
+                            worldGateway.inspectRecoveryCandidate(operation, record);
+                    if (presence == RecallWorldGateway.TransferEvidence.Presence.MISSING) {
+                        RecallWorldGateway.CandidateAction spawned =
+                                worldGateway.spawnRecoveryCandidate(operation, record, provider);
+                        if (spawned == RecallWorldGateway.CandidateAction.UNAVAILABLE) {
+                            return rollbackUnavailableRestorationIntent(operation);
+                        }
+                        if (spawned != RecallWorldGateway.CandidateAction.SUCCESS) {
+                            return spawned == RecallWorldGateway.CandidateAction.CONFLICT
+                                    ? blockRestoration(operationId,
+                                            "restoration candidate identity conflicts")
+                                    : containRestorationIntentFailure(
+                                            operation,
+                                            TransferAdvanceOutcome.PERSISTENCE_FAILURE);
+                        }
+                    } else if (presence == RecallWorldGateway.TransferEvidence.Presence.UNAVAILABLE) {
+                        return rollbackUnavailableRestorationIntent(operation);
+                    } else if (presence != RecallWorldGateway.TransferEvidence.Presence.EXACT) {
+                        return blockRestoration(operationId,
+                                "restoration spawn intent has conflicting evidence");
+                    }
+                    RecallWorldGateway.CheckpointStatus spawnCheckpoint =
+                            worldGateway.checkpointRecoveryCandidate(operation, record, true);
+                    if (spawnCheckpoint == RecallWorldGateway.CheckpointStatus.INTEGRITY_CONFLICT) {
+                        return blockRestoration(operationId,
+                                "restoration candidate checkpoint contradicted identity");
+                    }
+                    if (spawnCheckpoint != RecallWorldGateway.CheckpointStatus.VERIFIED) {
+                        TransferAdvanceOutcome failed = fromRecoveryCheckpoint(
+                                operation, spawnCheckpoint,
+                                "restoration candidate checkpoint could not be verified");
+                        return containRestorationIntentFailure(operation, failed);
+                    }
+                    if (repository.markRestorationCandidateSpawned(operationId)
+                            != MountRepository.TransferStatus.SUCCESS) {
+                        return containRestorationIntentFailure(
+                                operation, TransferAdvanceOutcome.PERSISTENCE_FAILURE);
+                    }
+                    break;
+                case CANDIDATE_SPAWNED:
+                    RecallWorldGateway.TransferEvidence.Presence spawned =
+                            worldGateway.inspectRecoveryCandidate(operation, record);
+                    if (spawned != RecallWorldGateway.TransferEvidence.Presence.EXACT) {
+                        return (spawned == RecallWorldGateway.TransferEvidence.Presence.UNAVAILABLE
+                                || spawned == RecallWorldGateway.TransferEvidence.Presence.MISSING)
+                                ? TransferAdvanceOutcome.TEMPORARILY_UNAVAILABLE
+                                : blockRestoration(operationId,
+                                        "spawned restoration candidate conflicts");
+                    }
+                    if (repository.associateRestorationCandidate(operationId)
+                            != MountRepository.TransferStatus.SUCCESS) {
+                        return TransferAdvanceOutcome.PERSISTENCE_FAILURE;
+                    }
+                    break;
+                case ASSOCIATED:
+                    RecallWorldGateway.TransferEvidence.Presence associated =
+                            worldGateway.inspectRecoveryCandidate(operation, record);
+                    if (associated == RecallWorldGateway.TransferEvidence.Presence.EXACT) {
+                        TransferAdvanceOutcome markerClear = fromRecoveryPhysicalAction(
+                                operation,
+                                worldGateway.clearRecoveryOperationMarker(operation),
+                                "restoration marker cleanup contradicted identity");
+                        if (markerClear != TransferAdvanceOutcome.PENDING) {
+                            return markerClear;
+                        }
+                    } else if (associated != RecallWorldGateway.TransferEvidence.Presence.FINALIZED) {
+                        return (associated == RecallWorldGateway.TransferEvidence.Presence.UNAVAILABLE
+                                || associated == RecallWorldGateway.TransferEvidence.Presence.MISSING)
+                                ? TransferAdvanceOutcome.TEMPORARILY_UNAVAILABLE
+                                : blockRestoration(operationId,
+                                        "associated restoration candidate conflicts");
+                    }
+                    TransferAdvanceOutcome finalCheckpoint = fromRecoveryCheckpoint(
+                            operation,
+                            worldGateway.checkpointRecoveryCandidate(operation, record, false),
+                            "final restoration checkpoint contradicted identity");
+                    if (finalCheckpoint != TransferAdvanceOutcome.PENDING) {
+                        return finalCheckpoint;
+                    }
+                    MountRepository.TransferStatus finished =
+                            repository.finishRestoration(operationId);
+                    return finished == MountRepository.TransferStatus.SUCCESS
+                            ? TransferAdvanceOutcome.COMPLETE
+                            : finished == MountRepository.TransferStatus.INTEGRITY_CONFLICT
+                                    ? TransferAdvanceOutcome.INTEGRITY_CONFLICT
+                                    : TransferAdvanceOutcome.PERSISTENCE_FAILURE;
+                default:
+                    return TransferAdvanceOutcome.INTEGRITY_CONFLICT;
+            }
+        }
+        return TransferAdvanceOutcome.PENDING;
+    }
+
+    private TransferAdvanceOutcome rollbackUnavailableRestorationIntent(
+            RestorationOperation operation) {
+        MountRepository.TransferStatus rolledBack =
+                repository.rollbackRestorationSpawnIntent(operation.getOperationId());
+        if (rolledBack == MountRepository.TransferStatus.SUCCESS) {
+            return TransferAdvanceOutcome.TEMPORARILY_UNAVAILABLE;
+        }
+        return blockRestoration(
+                operation.getOperationId(), "restoration spawn intent could not be rolled back");
+    }
+
+    private TransferAdvanceOutcome containRestorationIntentFailure(
+            RestorationOperation operation, TransferAdvanceOutcome failure) {
+        TransferAdvanceOutcome containment = containRestorationCandidateIntent(operation);
+        return containment == TransferAdvanceOutcome.COMPLETE ? failure : containment;
+    }
+
+    private TransferAdvanceOutcome containRestorationCandidateIntent(
+            RestorationOperation operation) {
+        MountRecord record = repository.find(operation.getMountId()).orElse(null);
+        if (record == null || record.getRecoveryState() == null) {
+            return blockRestoration(
+                    operation.getOperationId(), "restoration intent lost its Recovery snapshot");
+        }
+        RecallWorldGateway.TransferEvidence.Presence presence =
+                worldGateway.inspectRecoveryCandidate(operation, record);
+        if (presence == RecallWorldGateway.TransferEvidence.Presence.EXACT) {
+            if (worldGateway.removeRecoveryCandidate(operation, record)
+                    != RecallWorldGateway.PhysicalAction.SUCCESS) {
+                return blockRestoration(
+                        operation.getOperationId(), "restoration candidate cleanup did not complete");
+            }
+        } else if (presence != RecallWorldGateway.TransferEvidence.Presence.MISSING) {
+            return blockRestoration(
+                    operation.getOperationId(), "restoration intent could not be contained safely");
+        }
+        if (worldGateway.checkpointRecoveryCandidateAbsent(operation, record)
+                != RecallWorldGateway.CheckpointStatus.VERIFIED) {
+            return blockRestoration(
+                    operation.getOperationId(), "restoration candidate absence could not be fenced");
+        }
+        if (repository.cancelContainedRestoration(operation.getOperationId())
+                == MountRepository.TransferStatus.SUCCESS) {
+            return TransferAdvanceOutcome.COMPLETE;
+        }
+        return blockRestoration(
+                operation.getOperationId(), "restoration candidate cancellation was not acknowledged");
+    }
+
+    private RuntimeException unexpectedRestorationFailure(
+            UUID operationId, RuntimeException unexpected) {
+        RestorationOperation operation = repository.findRestoration(operationId).orElse(null);
+        if (operation != null
+                && operation.getPhase() == RestorationPhase.CANDIDATE_SPAWN_INTENT) {
+            try {
+                containRestorationCandidateIntent(operation);
+            } catch (FatalTransferSafetyException fatal) {
+                fatal.addSuppressed(unexpected);
+                return fatal;
+            } catch (RuntimeException containmentFailure) {
+                unexpected.addSuppressed(containmentFailure);
+                return new FatalTransferSafetyException(
+                        operationId,
+                        RestorationPhase.CANDIDATE_SPAWN_INTENT,
+                        "unexpected exception left restoration intent unresolved",
+                        unexpected);
+            }
+            RestorationOperation remaining = repository.findRestoration(operationId).orElse(null);
+            if (remaining != null
+                    && remaining.getPhase() == RestorationPhase.CANDIDATE_SPAWN_INTENT) {
+                return new FatalTransferSafetyException(
+                        operationId,
+                        RestorationPhase.CANDIDATE_SPAWN_INTENT,
+                        "unexpected exception left restoration intent unresolved",
+                        unexpected);
+            }
+        }
+        return unexpected;
+    }
+
+    private TransferAdvanceOutcome blockRestoration(UUID operationId, String reason) {
+        RestorationOperation unresolved = repository.findRestoration(operationId).orElse(null);
+        MountRepository.TransferStatus status = repository.blockRestoration(operationId, reason);
+        if (status == MountRepository.TransferStatus.PERSISTENCE_FAILURE
+                && unresolved != null
+                && unresolved.getPhase() == RestorationPhase.CANDIDATE_SPAWN_INTENT) {
+            throw new FatalTransferSafetyException(
+                    operationId, unresolved.getPhase(), reason);
+        }
+        return status == MountRepository.TransferStatus.PERSISTENCE_FAILURE
+                ? TransferAdvanceOutcome.PERSISTENCE_FAILURE
+                : TransferAdvanceOutcome.INTEGRITY_CONFLICT;
+    }
+
+    private TransferAdvanceOutcome fromRecoveryCheckpoint(
+            RestorationOperation operation,
+            RecallWorldGateway.CheckpointStatus status,
+            String conflictReason) {
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("correlation", operation.getOperationId().toString());
+        fields.put("mount", operation.getMountId().toString());
+        fields.put("phase", operation.getPhase().name());
+        fields.put("checkpoint", conflictReason);
+        fields.put("result", status.name());
+        fields.put("store_revision", Long.toString(repository.getStoreRevision()));
+        diagnostics.detail(DiagnosticCategory.LIFECYCLE, "restoration_checkpoint", fields);
+        switch (status) {
+            case VERIFIED:
+                return TransferAdvanceOutcome.PENDING;
+            case UNAVAILABLE:
+                diagnostics.essentialLifecycleWarning(
+                        "restoration_evidence_unavailable", conflictReason);
+                return TransferAdvanceOutcome.TEMPORARILY_UNAVAILABLE;
+            case INTEGRITY_CONFLICT:
+                return blockRestoration(operation.getOperationId(), conflictReason);
+            case FAILED:
+            default:
+                diagnostics.essentialLifecycleWarning(
+                        "restoration_physical_fence_failed", conflictReason);
+                return TransferAdvanceOutcome.PERSISTENCE_FAILURE;
+        }
+    }
+
+    private TransferAdvanceOutcome fromRecoveryPhysicalAction(
+            RestorationOperation operation,
+            RecallWorldGateway.PhysicalAction action,
+            String conflictReason) {
+        switch (action) {
+            case SUCCESS:
+                return TransferAdvanceOutcome.PENDING;
+            case UNAVAILABLE:
+                return TransferAdvanceOutcome.TEMPORARILY_UNAVAILABLE;
+            case CONFLICT:
+                return blockRestoration(operation.getOperationId(), conflictReason);
+            case FAILED_RESTORED:
+            case FAILED:
+            default:
+                diagnostics.essentialLifecycleWarning(
+                        "restoration_physical_action_failed", conflictReason);
+                return TransferAdvanceOutcome.PERSISTENCE_FAILURE;
         }
     }
 

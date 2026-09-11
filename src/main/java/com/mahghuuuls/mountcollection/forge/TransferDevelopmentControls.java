@@ -1,6 +1,7 @@
 package com.mahghuuuls.mountcollection.forge;
 
 import com.mahghuuuls.mountcollection.persistence.TransferPhase;
+import com.mahghuuuls.mountcollection.persistence.RestorationPhase;
 import java.util.Objects;
 import java.util.function.BooleanSupplier;
 
@@ -19,6 +20,9 @@ final class TransferDevelopmentControls {
     private int faultUsesRemaining;
     private TransferPhase fatalAfterIntent;
     private TransferPhase pausePhase;
+    private RestorationPhase restorationFatalAfterIntent;
+    private RestorationPhase restorationPausePhase;
+    private boolean recoveryProviderUnavailable;
 
     TransferDevelopmentControls() {
         this(net.minecraftforge.fml.relauncher.FMLLaunchHandler::isDeobfuscatedEnvironment);
@@ -53,6 +57,15 @@ final class TransferDevelopmentControls {
         return true;
     }
 
+    synchronized boolean armRestorationFatalAfterIntent(RestorationPhase requested) {
+        if (!isAvailable()
+                || requested != RestorationPhase.CANDIDATE_SPAWN_INTENT) {
+            return false;
+        }
+        restorationFatalAfterIntent = requested;
+        return true;
+    }
+
     synchronized void phaseAcknowledged(TransferPhase phase) {
         if (!isAvailable() || phase != fatalAfterIntent) {
             return;
@@ -60,6 +73,15 @@ final class TransferDevelopmentControls {
         fatalAfterIntent = null;
         fault = Fault.JOURNAL_FATAL_SEQUENCE;
         faultUsesRemaining = phase == TransferPhase.CANDIDATE_SPAWN_INTENT ? 3 : 2;
+    }
+
+    synchronized void restorationPhaseAcknowledged(RestorationPhase phase) {
+        if (!isAvailable() || phase != restorationFatalAfterIntent) {
+            return;
+        }
+        restorationFatalAfterIntent = null;
+        fault = Fault.JOURNAL_FATAL_SEQUENCE;
+        faultUsesRemaining = 3;
     }
 
     synchronized boolean armPause(TransferPhase requested) {
@@ -70,6 +92,33 @@ final class TransferDevelopmentControls {
             return false;
         }
         pausePhase = requested;
+        return true;
+    }
+
+    synchronized boolean armRestorationPause(RestorationPhase requested) {
+        if (!isAvailable()
+                || requested == null
+                || requested == RestorationPhase.CANDIDATE_SPAWN_INTENT
+                || requested == RestorationPhase.INTEGRITY_BLOCKED) {
+            return false;
+        }
+        restorationPausePhase = requested;
+        return true;
+    }
+
+    synchronized boolean armRecoveryProviderUnavailable() {
+        if (!isAvailable()) {
+            return false;
+        }
+        recoveryProviderUnavailable = true;
+        return true;
+    }
+
+    synchronized boolean consumeRecoveryProviderUnavailable() {
+        if (!isAvailable() || !recoveryProviderUnavailable) {
+            return false;
+        }
+        recoveryProviderUnavailable = false;
         return true;
     }
 
@@ -88,11 +137,18 @@ final class TransferDevelopmentControls {
         return isAvailable() && pausePhase == phase;
     }
 
+    synchronized boolean shouldPauseRestoration(RestorationPhase phase) {
+        return isAvailable() && restorationPausePhase == phase;
+    }
+
     synchronized void clear() {
         fault = Fault.NONE;
         faultUsesRemaining = 0;
         pausePhase = null;
         fatalAfterIntent = null;
+        restorationPausePhase = null;
+        restorationFatalAfterIntent = null;
+        recoveryProviderUnavailable = false;
     }
 
     synchronized String describe() {
@@ -102,7 +158,13 @@ final class TransferDevelopmentControls {
         return "fault=" + fault.name()
                 + (faultUsesRemaining > 1 ? " remaining=" + faultUsesRemaining : "")
                 + " fatalAfter=" + (fatalAfterIntent == null ? "NONE" : fatalAfterIntent.name())
-                + " pause=" + (pausePhase == null ? "NONE" : pausePhase.name());
+                + " pause=" + (pausePhase == null ? "NONE" : pausePhase.name())
+                + " recoveryFatalAfter="
+                + (restorationFatalAfterIntent == null
+                        ? "NONE" : restorationFatalAfterIntent.name())
+                + " recoveryPause="
+                + (restorationPausePhase == null ? "NONE" : restorationPausePhase.name())
+                + " recoveryProviderUnavailable=" + recoveryProviderUnavailable;
     }
 
     private boolean consumeFault(Fault expected) {

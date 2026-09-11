@@ -5,6 +5,8 @@ import com.mahghuuuls.mountcollection.api.MountCharacteristics;
 import com.mahghuuuls.mountcollection.persistence.LastKnownEvidence;
 import com.mahghuuuls.mountcollection.persistence.MountRecord;
 import com.mahghuuuls.mountcollection.persistence.TransferOperation;
+import com.mahghuuuls.mountcollection.persistence.RestorationOperation;
+import com.mahghuuuls.mountcollection.persistence.RestorationPhase;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -81,6 +83,76 @@ public interface RecallWorldGateway {
         return false;
     }
 
+    default Optional<RecoveryPlan> planRecovery(
+            EntityPlayerMP player,
+            MountRecord record,
+            MountProvider provider,
+            int normalRadius,
+            int fallbackRadius) {
+        return Optional.empty();
+    }
+
+    default CandidateAction spawnRecoveryCandidate(
+            RestorationOperation operation, MountRecord record, MountProvider provider) {
+        return CandidateAction.FAILED;
+    }
+
+    default TransferEvidence.Presence inspectRecoveryCandidate(
+            RestorationOperation operation, MountRecord record) {
+        return TransferEvidence.Presence.UNAVAILABLE;
+    }
+
+    /** Exact live evidence carries its actual location; missing stable evidence is not absence. */
+    default RecoveryEvidence recoveryCandidateEvidence(RestorationOperation operation, MountRecord record) {
+        return new RecoveryEvidence(inspectRecoveryCandidate(operation, record),
+                operation.getDestinationEvidence());
+    }
+
+    default RecoveryEvidence recoverySourceEvidence(MountRecord record) {
+        return new RecoveryEvidence(TransferEvidence.Presence.UNAVAILABLE, null);
+    }
+
+    /** Removes only the acknowledged captured source, then verifies its saved absence. */
+    default CheckpointStatus retireRecoverySource(MountRecord record) {
+        return CheckpointStatus.UNAVAILABLE;
+    }
+
+    final class RecoveryEvidence {
+        private final TransferEvidence.Presence presence;
+        private final LastKnownEvidence location;
+        public RecoveryEvidence(TransferEvidence.Presence presence, LastKnownEvidence location) {
+            this.presence = java.util.Objects.requireNonNull(presence, "presence");
+            this.location = location;
+        }
+        public TransferEvidence.Presence getPresence() { return presence; }
+        public LastKnownEvidence getLocation() { return location; }
+    }
+
+    default CheckpointStatus checkpointRecoveryCandidate(
+            RestorationOperation operation, MountRecord record, boolean operationMarkerExpected) {
+        return CheckpointStatus.FAILED;
+    }
+
+    default PhysicalAction removeRecoveryCandidate(
+            RestorationOperation operation, MountRecord record) {
+        return PhysicalAction.FAILED;
+    }
+
+    default CheckpointStatus checkpointRecoveryCandidateAbsent(
+            RestorationOperation operation, MountRecord record) {
+        return CheckpointStatus.FAILED;
+    }
+
+    default PhysicalAction clearRecoveryOperationMarker(RestorationOperation operation) {
+        return PhysicalAction.FAILED;
+    }
+
+    default boolean pauseAfterRestorationPhase(RestorationPhase phase) {
+        return false;
+    }
+
+    default void restorationPhaseAcknowledged(RestorationPhase phase) {}
+
     default void transferPhaseAcknowledged(
             com.mahghuuuls.mountcollection.persistence.TransferPhase phase) {}
 
@@ -123,6 +195,19 @@ public interface RecallWorldGateway {
         public UUID getCandidateEntityId() { return candidateEntityId; }
         public LastKnownEvidence getSourceEvidence() { return sourceEvidence; }
         public NBTTagCompound copySourceSnapshot() { return sourceSnapshot.copy(); }
+    }
+
+    final class RecoveryPlan {
+        private final UUID candidateEntityId;
+        private final Destination destination;
+
+        public RecoveryPlan(UUID candidateEntityId, Destination destination) {
+            this.candidateEntityId = Objects.requireNonNull(candidateEntityId, "candidateEntityId");
+            this.destination = Objects.requireNonNull(destination, "destination");
+        }
+
+        public UUID getCandidateEntityId() { return candidateEntityId; }
+        public Destination getDestination() { return destination; }
     }
 
     final class TransferEvidence {

@@ -11,6 +11,7 @@ import com.mahghuuuls.mountcollection.persistence.MountRepository;
 import com.mahghuuuls.mountcollection.persistence.MountSavedData;
 import com.mahghuuuls.mountcollection.persistence.TransferOperation;
 import com.mahghuuuls.mountcollection.persistence.TransferPhase;
+import com.mahghuuuls.mountcollection.lifecycle.RecoveryDeathOutcome;
 import com.mahghuuuls.mountcollection.policy.ActiveServerClock;
 import com.mahghuuuls.mountcollection.policy.ActiveTimeResult;
 import com.mahghuuuls.mountcollection.policy.ValidatedMountConfig;
@@ -22,14 +23,19 @@ import java.util.Map;
 import java.util.UUID;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.EntityPlayerMP;
+import net.minecraft.entity.EntityLiving;
+import net.minecraft.entity.EntityList;
+import net.minecraft.util.text.TextComponentTranslation;
 import net.minecraft.util.ClassInheritanceMultiMap;
 import net.minecraft.world.WorldServer;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.entity.EntityJoinWorldEvent;
+import net.minecraftforge.event.entity.living.LivingDeathEvent;
 import net.minecraftforge.event.world.ChunkEvent;
 import net.minecraftforge.event.world.WorldEvent;
 import net.minecraftforge.fml.common.event.FMLServerStartingEvent;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
+import net.minecraftforge.fml.common.eventhandler.EventPriority;
 import net.minecraftforge.fml.common.gameevent.PlayerEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
 import org.apache.logging.log4j.Logger;
@@ -121,6 +127,17 @@ public final class CommonBootstrap {
             java.util.Optional<com.mahghuuuls.mountcollection.lifecycle.MountLifecycleService>
                     lifecycle = services.getLifecycleService();
             java.util.Optional<MountRepository> activeRepository = services.getActiveRepository();
+            if (lifecycle.isPresent()) {
+                if (advanced.getStatus() == ActiveTimeResult.Status.OVERFLOW_REBASED) {
+                    lifecycle.get().rebuildRecoveryDeadlines();
+                    activeRepository.ifPresent(repository ->
+                            repository.getPendingNotificationOwners()
+                                    .forEach(this::deliverPendingNotification));
+                } else {
+                    lifecycle.get().advanceRecoveryDeadlines()
+                            .forEach(this::deliverPendingNotification);
+                }
+            }
             PendingTransferRecoveryScheduler.Request request;
             while (lifecycle.isPresent()
                     && activeRepository.isPresent()
@@ -174,11 +191,21 @@ public final class CommonBootstrap {
                     restored.getStatus());
         }
         transferRecovery.worldLoaded();
+        services.getLifecycleService().ifPresent(lifecycle ->
+                services.submitLifecycleMutation(lifecycle::reconcilePendingRestorations));
     }
 
     @SubscribeEvent
     public void onEntityJoin(EntityJoinWorldEvent event) {
         if (!event.getWorld().isRemote) {
+            if (discardControlledRecoverySource(event.getEntity())) {
+                event.setCanceled(true);
+                event.getEntity().setDead();
+                return;
+            }
+            if (routeRestorationCandidate(event.getEntity(), true)) {
+                return;
+            }
             TransferOperation controlled = reconcileEntity(event.getEntity());
             if (controlled != null) {
                 transferRecovery.controlledEntityJoined(
@@ -188,6 +215,122 @@ public final class CommonBootstrap {
         }
     }
 
+    private boolean discardControlledRecoverySource(Entity entity) {
+        java.util.Optional<MountRepository> activeRepository = services.getActiveRepository();
+        if (!activeRepository.isPresent()) {
+            return false;
+        }
+        EntityMountEvidence.ReadResult evidence = EntityMountEvidence.read(entity);
+        if (!evidence.getMountId().isPresent()
+                || !activeRepository.get().isControlledRecoverySource(
+                        evidence.getMountId().get(), entity.getUniqueID())) {
+            return false;
+        }
+        com.mahghuuuls.mountcollection.persistence.MountRecord record =
+                activeRepository.get().find(evidence.getMountId().get()).orElse(null);
+        if (record == null || !record.getEntityTypeId().equals(EntityList.getKey(entity))
+                || EntityMountEvidence.readTransfer(entity).getStatus() != EntityMountEvidence.Status.NONE) {
+            return false;
+        }
+        try {
+            services.getLifecycleService().get().acknowledgeCapturedSourceLocation(record, entity);
+            completeProtectedDeath(entity);
+        } catch (com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException fatal) {
+            services.getLifecycleMutationExecutor().latchCallbackFailure(fatal);
+            throw fatal;
+        }
+        return true;
+    }
+
+    private boolean routeRestorationCandidate(Entity entity, boolean joined) {
+        java.util.Optional<com.mahghuuuls.mountcollection.lifecycle.MountLifecycleService> lifecycle =
+                services.getLifecycleService();
+        if (!lifecycle.isPresent()) { return false; }
+        java.util.Optional<UUID> operationId = lifecycle.get().observeRestorationCandidate(entity);
+        if (!operationId.isPresent()) { return false; }
+        if (joined) {
+            // Retain only operation identity, never an entity/world reference across ticks.
+            services.submitLifecycleMutation(() -> lifecycle.get().reconcilePendingRestoration(operationId.get()));
+        }
+        return true;
+    }
+
+    @SubscribeEvent(priority = EventPriority.LOWEST)
+    public void onLivingDeath(LivingDeathEvent event) {
+        if (event.getEntityLiving().world.isRemote || event.isCanceled()) {
+            return;
+        }
+        java.util.Optional<com.mahghuuuls.mountcollection.lifecycle.MountLifecycleService>
+                lifecycle = services.getLifecycleService();
+        if (!lifecycle.isPresent()) {
+            return;
+        }
+        Entity mount = event.getEntityLiving();
+        RecoveryDeathOutcome outcome;
+        try {
+            outcome = lifecycle.get().handleLethalDamage(mount);
+        } catch (RuntimeException failure) {
+            EntityMountEvidence.ReadResult identity = EntityMountEvidence.read(mount);
+            MountRepository repository = services.getActiveRepository().orElse(null);
+            if (repository != null && identity.getMountId().isPresent()
+                    && repository.isControlledRecoverySource(identity.getMountId().get(), mount.getUniqueID())) {
+                event.setCanceled(true);
+                mount.captureDrops = true;
+                mount.isDead = true;
+                com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException fatal =
+                        com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException
+                                .capturedSourceFailure(mount.getUniqueID(), failure);
+                services.getLifecycleMutationExecutor().latchCallbackFailure(fatal);
+                throw fatal;
+            }
+            throw failure;
+        }
+        if (outcome.shouldSuppressDeath()) {
+            event.setCanceled(true);
+            try {
+                completeProtectedDeath(mount);
+            } catch (com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException fatal) {
+                services.getLifecycleMutationExecutor().latchCallbackFailure(fatal);
+                throw fatal;
+            }
+        }
+        if (outcome.getOwnerId().isPresent()) {
+            deliverPendingNotification(outcome.getOwnerId().get());
+        }
+    }
+
+    static void completeProtectedDeath(Entity mount) {
+        try {
+            containProtectedSource(mount);
+            if (!mount.isDead) {
+                throw new IllegalStateException("captured source remains alive");
+            }
+        } catch (RuntimeException failure) {
+            throw com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException
+                    .capturedSourceFailure(mount.getUniqueID(), failure);
+        }
+    }
+
+    private static void containProtectedSource(Entity mount) {
+        // LivingDeathEvent is fired from EntityLivingBase.onDeath. Some 1.12.2
+        // subclasses, notably AbstractHorse, keep executing after super.onDeath
+        // returns and emit inventory through Entity.entityDropItem. Keep Forge's
+        // per-entity capture active while that subclass frame unwinds so the
+        // captured Recovery state cannot also escape as physical drops.
+        mount.captureDrops = true;
+        // Contain the physical source even if a subclass relationship callback throws.
+        mount.isDead = true;
+        mount.capturedDrops.clear();
+        mount.removePassengers();
+        if (mount.isRiding()) {
+            mount.dismountRidingEntity();
+        }
+        if (mount instanceof EntityLiving && ((EntityLiving) mount).getLeashed()) {
+            ((EntityLiving) mount).clearLeashed(false, false);
+        }
+        mount.setDead();
+    }
+
     @SubscribeEvent
     public void onChunkUnload(ChunkEvent.Unload event) {
         if (event.getWorld().isRemote) {
@@ -195,7 +338,9 @@ public final class CommonBootstrap {
         }
         for (ClassInheritanceMultiMap<Entity> entities : event.getChunk().getEntityLists()) {
             for (Entity entity : entities) {
-                reconcileEntity(entity);
+                if (!entity.isDead && !routeRestorationCandidate(entity, false)) {
+                    reconcileEntity(entity);
+                }
             }
         }
     }
@@ -204,7 +349,22 @@ public final class CommonBootstrap {
     public void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
         if (event.player instanceof EntityPlayerMP) {
             transferRecovery.playerJoined();
+            deliverPendingNotification(event.player.getUniqueID());
         }
+    }
+
+    private void deliverPendingNotification(UUID ownerId) {
+        java.util.Optional<MountRepository> activeRepository = services.getActiveRepository();
+        if (!activeRepository.isPresent()) {
+            return;
+        }
+        EntityPlayerMP owner = net.minecraftforge.fml.common.FMLCommonHandler.instance()
+                .getMinecraftServerInstance().getPlayerList().getPlayerByUUID(ownerId);
+        if (owner == null) {
+            return;
+        }
+        activeRepository.get().consumePendingNotification(ownerId)
+                .ifPresent(key -> owner.sendMessage(new TextComponentTranslation(key)));
     }
 
     @SubscribeEvent

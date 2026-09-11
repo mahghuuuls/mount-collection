@@ -31,8 +31,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongSupplier;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.item.EntityBoat;
+import net.minecraft.entity.passive.EntityPig;
 import net.minecraft.init.Bootstrap;
+import net.minecraft.init.MobEffects;
 import net.minecraft.nbt.NBTTagCompound;
+import net.minecraft.potion.PotionEffect;
 import net.minecraft.util.ResourceLocation;
 import net.minecraft.world.WorldServer;
 import net.minecraft.world.chunk.Chunk;
@@ -40,6 +43,46 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 final class ForgeRecallWorldGatewayTest {
+
+    @Test
+    void recoveryFenceRejectsOldChunkUntilActualLocationIsAcknowledged() {
+        EntityBoat candidate = new EntityBoat(null);
+        candidate.setPosition(80.5D, 64.0D, -33.5D);
+        com.mahghuuuls.mountcollection.persistence.MountId mountId =
+                com.mahghuuuls.mountcollection.persistence.MountId.parse(UUID.randomUUID().toString());
+        com.mahghuuuls.mountcollection.persistence.RestorationOperation old =
+                new com.mahghuuuls.mountcollection.persistence.RestorationOperation(
+                        UUID.randomUUID(), mountId, UUID.randomUUID(), candidate.getUniqueID(),
+                        new LastKnownEvidence(0, 0, 64, 0), 0, 0,
+                        com.mahghuuuls.mountcollection.persistence.RestorationPhase.ASSOCIATED, null);
+        assertNull(ForgeRecallWorldGateway.recoveryCheckpointLocation(old, candidate));
+        LastKnownEvidence actual = ForgeRecallWorldGateway.recoveryEntityLocation(candidate);
+        com.mahghuuuls.mountcollection.persistence.RestorationOperation relocated =
+                new com.mahghuuuls.mountcollection.persistence.RestorationOperation(
+                        old.getOperationId(), mountId, old.getOwnerId(), candidate.getUniqueID(),
+                        actual, 0, 0, old.getPhase(), null);
+        assertEquals(actual, ForgeRecallWorldGateway.recoveryCheckpointLocation(relocated, candidate));
+        candidate.setDead();
+        assertNull(ForgeRecallWorldGateway.recoveryCheckpointLocation(relocated, candidate));
+    }
+
+    @Test
+    void recoverySourceAbsenceIncludesSourcesSavedAsPassengers() {
+        UUID source = UUID.randomUUID();
+        net.minecraft.nbt.NBTTagList entities = new net.minecraft.nbt.NBTTagList();
+        NBTTagCompound vehicle = new NBTTagCompound();
+        vehicle.setUniqueId("UUID", UUID.randomUUID());
+        NBTTagCompound mount = new NBTTagCompound();
+        mount.setUniqueId("UUID", source);
+        net.minecraft.nbt.NBTTagList passengers = new net.minecraft.nbt.NBTTagList();
+        passengers.appendTag(mount);
+        vehicle.setTag("Passengers", passengers);
+        entities.appendTag(vehicle);
+        assertTrue(ForgeRecallWorldGateway.containsRecoverySource(entities, source));
+        assertFalse(ForgeRecallWorldGateway.containsRecoverySource(entities, UUID.randomUUID()));
+        mount.removeTag("UUIDMost");
+        assertTrue(ForgeRecallWorldGateway.containsRecoverySource(entities, source));
+    }
 
     @BeforeAll
     static void initializeMinecraftRegistries() {
@@ -80,6 +123,52 @@ final class ForgeRecallWorldGatewayTest {
 
         assertTrue(provider.called);
         assertEquals("prepared-candidate", candidate.getCustomNameTag());
+    }
+
+    @Test
+    void recoveredLivingEntityTransientStateIsNormalizedBeforeAdmission() throws Exception {
+        EntityPig candidate = new TestPig();
+        EntityBoat passenger = new EntityBoat(null);
+        java.lang.reflect.Field passengers = Entity.class.getDeclaredField("riddenByEntities");
+        passengers.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        List<Entity> passengerList = (List<Entity>) passengers.get(candidate);
+        passengerList.add(passenger);
+        java.lang.reflect.Field ridingEntity = Entity.class.getDeclaredField("ridingEntity");
+        ridingEntity.setAccessible(true);
+        ridingEntity.set(passenger, candidate);
+        candidate.dimension = -1;
+        candidate.timeUntilPortal = 40;
+        candidate.motionX = 1.0D;
+        candidate.motionY = -2.0D;
+        candidate.motionZ = 3.0D;
+        candidate.fallDistance = 8.0F;
+        candidate.setFire(10);
+        candidate.setAir(12);
+        candidate.setHealth(1.0F);
+        candidate.deathTime = 10;
+        candidate.hurtTime = 9;
+        candidate.hurtResistantTime = 8;
+        candidate.getActivePotionMap().put(
+                MobEffects.POISON, new PotionEffect(MobEffects.POISON, 200));
+
+        ForgeRecallWorldGateway.normalizeRecoveredEntity(candidate, 7);
+
+        assertEquals(7, candidate.dimension);
+        assertEquals(0, candidate.timeUntilPortal);
+        assertFalse(candidate.isBeingRidden());
+        assertFalse(passenger.isRiding());
+        assertEquals(0.0D, candidate.motionX);
+        assertEquals(0.0D, candidate.motionY);
+        assertEquals(0.0D, candidate.motionZ);
+        assertEquals(0.0F, candidate.fallDistance);
+        assertFalse(candidate.isBurning());
+        assertEquals(300, candidate.getAir());
+        assertEquals(candidate.getMaxHealth(), candidate.getHealth());
+        assertEquals(0, candidate.deathTime);
+        assertEquals(0, candidate.hurtTime);
+        assertEquals(0, candidate.hurtResistantTime);
+        assertTrue(candidate.getActivePotionEffects().isEmpty());
     }
 
     @Test
@@ -677,6 +766,18 @@ final class ForgeRecallWorldGatewayTest {
         @Override
         public boolean containsLiquid() {
             return liquid;
+        }
+    }
+
+    private static final class TestPig extends EntityPig {
+        private TestPig() {
+            super(null);
+        }
+
+        @Override
+        public void clearActivePotions() {
+            // The fixture has no world; retain the observable vanilla state transition.
+            getActivePotionMap().clear();
         }
     }
 }

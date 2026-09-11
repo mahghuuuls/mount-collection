@@ -5,6 +5,7 @@ import com.mahghuuuls.mountcollection.api.MountCharacteristics;
 import com.mahghuuuls.mountcollection.api.PlacementProfile;
 import com.mahghuuuls.mountcollection.api.PreparationSupport;
 import com.mahghuuuls.mountcollection.api.ProviderResult;
+import com.mahghuuuls.mountcollection.api.RecoverySupport;
 import com.mahghuuuls.mountcollection.diagnostics.DiagnosticCategory;
 import com.mahghuuuls.mountcollection.diagnostics.DiagnosticSink;
 import com.mahghuuuls.mountcollection.lifecycle.RecallWorldGateway;
@@ -14,6 +15,8 @@ import com.mahghuuuls.mountcollection.persistence.MountRecord;
 import com.mahghuuuls.mountcollection.persistence.MountId;
 import com.mahghuuuls.mountcollection.persistence.TransferOperation;
 import com.mahghuuuls.mountcollection.persistence.TransferPhase;
+import com.mahghuuuls.mountcollection.persistence.RestorationPhase;
+import com.mahghuuuls.mountcollection.persistence.RestorationOperation;
 import com.mahghuuuls.mountcollection.policy.PlacementSearch;
 import java.io.IOException;
 import java.util.LinkedHashMap;
@@ -31,6 +34,7 @@ import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityList;
 import net.minecraft.entity.EntityCreature;
 import net.minecraft.entity.EntityLiving;
+import net.minecraft.entity.EntityLivingBase;
 import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraft.init.Blocks;
 import net.minecraft.init.Items;
@@ -97,9 +101,12 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
     private final BooleanSupplier physicalFencePostDrainFault;
     private final Predicate<TransferPhase> pauseControl;
     private final Consumer<TransferPhase> acknowledgedPhaseControl;
+    private final Predicate<RestorationPhase> restorationPauseControl;
+    private final Consumer<RestorationPhase> acknowledgedRestorationPhaseControl;
 
     public ForgeRecallWorldGateway(DiagnosticSink diagnostics) {
-        this(diagnostics, () -> false, ignored -> false, ignored -> {});
+        this(diagnostics, () -> false, ignored -> false, ignored -> {},
+                ignored -> false, ignored -> {});
     }
 
     public ForgeRecallWorldGateway(
@@ -107,24 +114,39 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
             BooleanSupplier physicalFencePostDrainFault,
             Predicate<TransferPhase> pauseControl,
             Consumer<TransferPhase> acknowledgedPhaseControl) {
+        this(diagnostics, physicalFencePostDrainFault, pauseControl,
+                acknowledgedPhaseControl, ignored -> false, ignored -> {});
+    }
+
+    public ForgeRecallWorldGateway(
+            DiagnosticSink diagnostics,
+            BooleanSupplier physicalFencePostDrainFault,
+            Predicate<TransferPhase> pauseControl,
+            Consumer<TransferPhase> acknowledgedPhaseControl,
+            Predicate<RestorationPhase> restorationPauseControl,
+            Consumer<RestorationPhase> acknowledgedRestorationPhaseControl) {
         this(
                 new AnvilChunkPersistence(),
                 diagnostics,
                 System::nanoTime,
                 physicalFencePostDrainFault,
                 pauseControl,
-                acknowledgedPhaseControl);
+                acknowledgedPhaseControl,
+                restorationPauseControl,
+                acknowledgedRestorationPhaseControl);
     }
 
     ForgeRecallWorldGateway(ChunkPersistence chunkPersistence) {
-        this(chunkPersistence, null, System::nanoTime, () -> false, ignored -> false, ignored -> {});
+        this(chunkPersistence, null, System::nanoTime, () -> false,
+                ignored -> false, ignored -> {}, ignored -> false, ignored -> {});
     }
 
     ForgeRecallWorldGateway(
             ChunkPersistence chunkPersistence,
             DiagnosticSink diagnostics,
             LongSupplier nanoTime) {
-        this(chunkPersistence, diagnostics, nanoTime, () -> false, ignored -> false, ignored -> {});
+        this(chunkPersistence, diagnostics, nanoTime, () -> false,
+                ignored -> false, ignored -> {}, ignored -> false, ignored -> {});
     }
 
     ForgeRecallWorldGateway(
@@ -139,6 +161,8 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
                 nanoTime,
                 physicalFencePostDrainFault,
                 pauseControl,
+                ignored -> {},
+                ignored -> false,
                 ignored -> {});
     }
 
@@ -149,6 +173,19 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
             BooleanSupplier physicalFencePostDrainFault,
             Predicate<TransferPhase> pauseControl,
             Consumer<TransferPhase> acknowledgedPhaseControl) {
+        this(chunkPersistence, diagnostics, nanoTime, physicalFencePostDrainFault,
+                pauseControl, acknowledgedPhaseControl, ignored -> false, ignored -> {});
+    }
+
+    ForgeRecallWorldGateway(
+            ChunkPersistence chunkPersistence,
+            DiagnosticSink diagnostics,
+            LongSupplier nanoTime,
+            BooleanSupplier physicalFencePostDrainFault,
+            Predicate<TransferPhase> pauseControl,
+            Consumer<TransferPhase> acknowledgedPhaseControl,
+            Predicate<RestorationPhase> restorationPauseControl,
+            Consumer<RestorationPhase> acknowledgedRestorationPhaseControl) {
         this.chunkPersistence = java.util.Objects.requireNonNull(
                 chunkPersistence, "chunkPersistence");
         this.diagnostics = diagnostics;
@@ -158,6 +195,10 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         this.pauseControl = java.util.Objects.requireNonNull(pauseControl, "pauseControl");
         this.acknowledgedPhaseControl = java.util.Objects.requireNonNull(
                 acknowledgedPhaseControl, "acknowledgedPhaseControl");
+        this.restorationPauseControl = java.util.Objects.requireNonNull(
+                restorationPauseControl, "restorationPauseControl");
+        this.acknowledgedRestorationPhaseControl = java.util.Objects.requireNonNull(
+                acknowledgedRestorationPhaseControl, "acknowledgedRestorationPhaseControl");
     }
 
     private final PlacementSearch placementSearch = new PlacementSearch();
@@ -380,6 +421,465 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         return indexed == candidate && isExactCandidate(indexed, operation)
                 ? CandidateAction.SUCCESS
                 : CandidateAction.CONFLICT;
+    }
+
+    @Override
+    public Optional<RecoveryPlan> planRecovery(
+            EntityPlayerMP player,
+            MountRecord record,
+            MountProvider provider,
+            int normalRadius,
+            int fallbackRadius) {
+        if (!(provider instanceof RecoverySupport) || record.getRecoveryState() == null) {
+            return Optional.empty();
+        }
+        UUID candidateId = UUID.randomUUID();
+        Entity candidate = createRecoveryEntity(
+                player.getServerWorld(), record, provider, candidateId);
+        if (candidate == null) {
+            return Optional.empty();
+        }
+        BlockPos origin = player.getPosition();
+        PlacementProfile profile = record.getCharacteristics().getPlacementProfile();
+        Optional<Destination> destination = placementSearch.find(
+                normalRadius, fallbackRadius, (dx, dy, dz) -> safe(
+                        player.getServerWorld(), candidate, profile,
+                        origin.getX() + dx + 0.5D,
+                        origin.getY() + dy,
+                        origin.getZ() + dz + 0.5D))
+                .map(offset -> new Destination(new LastKnownEvidence(
+                        player.dimension,
+                        origin.getX() + offset.getX() + 0.5D,
+                        origin.getY() + offset.getY(),
+                        origin.getZ() + offset.getZ() + 0.5D)));
+        return destination.map(value -> new RecoveryPlan(candidateId, value));
+    }
+
+    @Override
+    public CandidateAction spawnRecoveryCandidate(
+            RestorationOperation operation, MountRecord record, MountProvider provider) {
+        WorldServer world = resolveWorld(operation.getDestinationEvidence().getDimensionId());
+        if (world == null) {
+            return CandidateAction.UNAVAILABLE;
+        }
+        Entity existing = world.getEntityFromUuid(operation.getCandidateEntityId());
+        if (existing != null) {
+            return isExactRecoveryCandidate(existing, operation, record)
+                    ? CandidateAction.SUCCESS : CandidateAction.CONFLICT;
+        }
+        Entity candidate = createRecoveryEntity(
+                world, record, provider, operation.getCandidateEntityId());
+        if (candidate == null) {
+            return CandidateAction.FAILED;
+        }
+        LastKnownEvidence target = operation.getDestinationEvidence();
+        candidate.setLocationAndAngles(target.getX(), target.getY(), target.getZ(),
+                candidate.rotationYaw, candidate.rotationPitch);
+        candidate.motionX = candidate.motionY = candidate.motionZ = 0.0D;
+        candidate.fallDistance = 0.0F;
+        EntityMountEvidence.attachTransferCandidate(
+                candidate, operation.getMountId(), operation.getOperationId());
+        if (!world.spawnEntity(candidate)) {
+            return CandidateAction.FAILED;
+        }
+        Entity indexed = world.getEntityFromUuid(operation.getCandidateEntityId());
+        return indexed == candidate && isExactRecoveryCandidate(indexed, operation, record)
+                ? CandidateAction.SUCCESS : CandidateAction.CONFLICT;
+    }
+
+    @Override
+    public TransferEvidence.Presence inspectRecoveryCandidate(
+            RestorationOperation operation, MountRecord record) {
+        WorldServer world = resolveWorld(operation.getDestinationEvidence().getDimensionId());
+        if (world == null) {
+            return TransferEvidence.Presence.UNAVAILABLE;
+        }
+        Entity candidate = world.getEntityFromUuid(operation.getCandidateEntityId());
+        if (candidate != null && !candidate.isDead) {
+            if (isExactRecoveryCandidate(candidate, operation, record)) {
+                return TransferEvidence.Presence.EXACT;
+            }
+            if (isFinalRecoveryCandidate(candidate, operation, record)) {
+                return TransferEvidence.Presence.FINALIZED;
+            }
+            return TransferEvidence.Presence.CONFLICT;
+        }
+        ChunkAccess access = loadExistingChunk(world, operation.getDestinationEvidence());
+        if (access.status != TransferEvidence.Presence.EXACT) {
+            return access.status;
+        }
+        try {
+            candidate = world.getEntityFromUuid(operation.getCandidateEntityId());
+            if (candidate == null || candidate.isDead) {
+                return TransferEvidence.Presence.MISSING;
+            }
+            return isExactRecoveryCandidate(candidate, operation, record)
+                    ? TransferEvidence.Presence.EXACT
+                    : isFinalRecoveryCandidate(candidate, operation, record)
+                            ? TransferEvidence.Presence.FINALIZED
+                            : TransferEvidence.Presence.CONFLICT;
+        } finally {
+            access.release(world);
+        }
+    }
+
+    private static Entity indexedRecoveryEntity(UUID entityId) {
+        for (WorldServer world : DimensionManager.getWorlds()) {
+            Entity entity = world.getEntityFromUuid(entityId);
+            if (entity != null && !entity.isDead) {
+                return entity;
+            }
+        }
+        return null;
+    }
+
+    static LastKnownEvidence recoveryEntityLocation(Entity entity) {
+        return new LastKnownEvidence(entity.dimension, entity.posX, entity.posY, entity.posZ);
+    }
+
+    @Override
+    public RecoveryEvidence recoveryCandidateEvidence(RestorationOperation operation, MountRecord record) {
+        Entity entity = indexedRecoveryEntity(operation.getCandidateEntityId());
+        if (entity == null) {
+            TransferEvidence.Presence presence = inspectRecoveryCandidate(operation, record);
+            entity = indexedRecoveryEntity(operation.getCandidateEntityId());
+            if (entity == null) {
+                return new RecoveryEvidence(presence, null);
+            }
+        }
+        TransferEvidence.Presence presence = isExactRecoveryCandidate(entity, operation, record)
+                ? TransferEvidence.Presence.EXACT : isFinalRecoveryCandidate(entity, operation, record)
+                        ? TransferEvidence.Presence.FINALIZED : TransferEvidence.Presence.CONFLICT;
+        return new RecoveryEvidence(presence, recoveryEntityLocation(entity));
+    }
+
+    @Override
+    public RecoveryEvidence recoverySourceEvidence(MountRecord record) {
+        UUID sourceId = record.getRecoveryState().getSourceEntityId();
+        Entity source = indexedRecoveryEntity(sourceId);
+        if (source == null) {
+            WorldServer world = resolveWorld(record.getRecoveryState().getSourceEvidence().getDimensionId());
+            if (world == null) {
+                return new RecoveryEvidence(TransferEvidence.Presence.UNAVAILABLE, null);
+            }
+            ChunkAccess access = loadExistingChunk(world, record.getRecoveryState().getSourceEvidence());
+            try {
+                if (access.status != TransferEvidence.Presence.EXACT) {
+                    return new RecoveryEvidence(TransferEvidence.Presence.UNAVAILABLE, null);
+                }
+                source = indexedRecoveryEntity(sourceId);
+            } finally {
+                access.release(world);
+            }
+        }
+        if (source == null) {
+            return new RecoveryEvidence(TransferEvidence.Presence.MISSING, null);
+        }
+        boolean exact = matchesMount(source, record.getMountId(), sourceId)
+                && record.getEntityTypeId().equals(EntityList.getKey(source))
+                && EntityMountEvidence.readTransfer(source).getStatus() == EntityMountEvidence.Status.NONE;
+        return new RecoveryEvidence(exact ? TransferEvidence.Presence.EXACT
+                : TransferEvidence.Presence.CONFLICT, recoveryEntityLocation(source));
+    }
+
+    @Override
+    public CheckpointStatus retireRecoverySource(MountRecord record) {
+        LastKnownEvidence evidence = record.getRecoveryState().getSourceEvidence();
+        RecoveryEvidence observed = recoverySourceEvidence(record);
+        if (observed.getPresence() == TransferEvidence.Presence.CONFLICT) {
+            return CheckpointStatus.INTEGRITY_CONFLICT;
+        }
+        if (observed.getPresence() == TransferEvidence.Presence.UNAVAILABLE
+                || observed.getLocation() != null && !observed.getLocation().equals(evidence)) {
+            return CheckpointStatus.UNAVAILABLE;
+        }
+        WorldServer world = resolveWorld(evidence.getDimensionId());
+        if (world == null) { return CheckpointStatus.UNAVAILABLE; }
+        ChunkAccess access = loadExistingChunk(world, evidence);
+        if (access.status != TransferEvidence.Presence.EXACT) {
+            access.release(world);
+            return CheckpointStatus.UNAVAILABLE;
+        }
+        return retireLoadedRecoverySource(record, new RecoverySourceAccess() {
+            @Override public Entity source() {
+                return indexedRecoveryEntity(record.getRecoveryState().getSourceEntityId());
+            }
+            @Override public void remove(Entity source) { world.removeEntityDangerously(source); }
+            @Override public NBTTagCompound saveAndRead() {
+                return attemptSaveDrainAndRead(world, access.chunk).diskChunk;
+            }
+            @Override public void release() { access.release(world); }
+        });
+    }
+
+    /** Loaded-chunk lifetime and source identity checks belong to the same retirement boundary. */
+    interface RecoverySourceAccess {
+        Entity source();
+        void remove(Entity source);
+        NBTTagCompound saveAndRead();
+        void release();
+    }
+
+    static CheckpointStatus retireLoadedRecoverySource(MountRecord record, RecoverySourceAccess access) {
+        try {
+            Entity source = access.source();
+            if (source != null) {
+                if (!matchesMount(source, record.getMountId(), record.getRecoveryState().getSourceEntityId())
+                        || !record.getEntityTypeId().equals(EntityList.getKey(source))
+                        || EntityMountEvidence.readTransfer(source).getStatus() != EntityMountEvidence.Status.NONE
+                        || !recoveryEntityLocation(source).equals(record.getRecoveryState().getSourceEvidence())) {
+                    return CheckpointStatus.INTEGRITY_CONFLICT;
+                }
+                CommonBootstrap.completeProtectedDeath(source);
+                access.remove(source);
+            }
+            NBTTagCompound diskChunk = access.saveAndRead();
+            return diskChunk != null && diskChunk.hasKey("Entities", 9)
+                    && !containsRecoverySource(
+                    (NBTTagList) diskChunk.getTag("Entities"), record.getRecoveryState().getSourceEntityId())
+                    ? CheckpointStatus.VERIFIED : CheckpointStatus.FAILED;
+        } finally {
+            access.release();
+        }
+    }
+
+    static boolean containsRecoverySource(NBTTagList entities, UUID sourceId) {
+        if (entities.tagCount() != 0 && entities.getTagType() != 10) { return true; }
+        for (int index = 0; index < entities.tagCount(); index++) {
+            NBTTagCompound entity = entities.getCompoundTagAt(index);
+            if (!entity.hasUniqueId("UUID") || sourceId.equals(entity.getUniqueId("UUID"))) {
+                return true;
+            }
+            if (entity.hasKey("Passengers") && !entity.hasKey("Passengers", 9)) { return true; }
+            if (entity.hasKey("Passengers")
+                    && containsRecoverySource((NBTTagList) entity.getTag("Passengers"), sourceId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public PhysicalAction clearRecoveryOperationMarker(RestorationOperation operation) {
+        WorldServer world = resolveWorld(operation.getDestinationEvidence().getDimensionId());
+        Entity candidate = world == null ? null
+                : world.getEntityFromUuid(operation.getCandidateEntityId());
+        if (candidate == null || !matchesMount(
+                candidate, operation.getMountId(), operation.getCandidateEntityId())) {
+            return world == null ? PhysicalAction.UNAVAILABLE : PhysicalAction.CONFLICT;
+        }
+        EntityMountEvidence.TransferReadResult marker = EntityMountEvidence.readTransfer(candidate);
+        if (!marker.getOperationId().map(operation.getOperationId()::equals).orElse(false)) {
+            return PhysicalAction.CONFLICT;
+        }
+        EntityMountEvidence.clearTransferOperation(candidate);
+        return EntityMountEvidence.readTransfer(candidate).getStatus()
+                == EntityMountEvidence.Status.NONE ? PhysicalAction.SUCCESS : PhysicalAction.FAILED;
+    }
+
+    @Override
+    public CheckpointStatus checkpointRecoveryCandidate(
+            RestorationOperation operation, MountRecord record, boolean operationMarkerExpected) {
+        LastKnownEvidence checkpointLocation = recoveryCheckpointLocation(
+                operation, indexedRecoveryEntity(operation.getCandidateEntityId()));
+        if (checkpointLocation == null) { return CheckpointStatus.UNAVAILABLE; }
+        WorldServer world = resolveWorld(checkpointLocation.getDimensionId());
+        if (world == null) {
+            return CheckpointStatus.UNAVAILABLE;
+        }
+        ChunkAccess access = loadExistingChunk(world, checkpointLocation);
+        if (access.status != TransferEvidence.Presence.EXACT) {
+            return access.status == TransferEvidence.Presence.MISSING
+                    ? CheckpointStatus.FAILED : CheckpointStatus.UNAVAILABLE;
+        }
+        try {
+            PhysicalFenceAttempt attempt = attemptSaveDrainAndRead(world, access.chunk);
+            CheckpointStatus result = CheckpointStatus.FAILED;
+            if (attempt.diskChunk != null) {
+                DiskEntityStatus status = inspectSavedRecoveryEntity(
+                        attempt.diskChunk, operation, record);
+                if (status == DiskEntityStatus.CONFLICT) {
+                    result = CheckpointStatus.INTEGRITY_CONFLICT;
+                } else if ((operationMarkerExpected && status == DiskEntityStatus.EXACT)
+                        || (!operationMarkerExpected
+                                && status == DiskEntityStatus.FINALIZED)) {
+                    result = CheckpointStatus.VERIFIED;
+                }
+            }
+            recordRecoveryFenceDiagnostic(
+                    FenceDiagnosticContext.from(
+                            operation,
+                            operationMarkerExpected
+                                    ? "candidate_present" : "candidate_finalized",
+                            world.provider.getDimension(),
+                            access.chunk.x,
+                            access.chunk.z),
+                    attempt,
+                    result);
+            return result;
+        } finally {
+            access.release(world);
+        }
+    }
+
+    /** Never fence stale coordinates; lifecycle must acknowledge relocated exact evidence first. */
+    static LastKnownEvidence recoveryCheckpointLocation(RestorationOperation operation, Entity candidate) {
+        if (candidate == null || candidate.isDead
+                || !operation.getCandidateEntityId().equals(candidate.getUniqueID())) {
+            return null;
+        }
+        LastKnownEvidence actual = recoveryEntityLocation(candidate);
+        return actual.equals(operation.getDestinationEvidence()) ? actual : null;
+    }
+
+    @Override
+    public PhysicalAction removeRecoveryCandidate(
+            RestorationOperation operation, MountRecord record) {
+        WorldServer world = resolveWorld(operation.getDestinationEvidence().getDimensionId());
+        if (world == null) {
+            return PhysicalAction.UNAVAILABLE;
+        }
+        ChunkAccess access = loadExistingChunk(world, operation.getDestinationEvidence());
+        if (access.status != TransferEvidence.Presence.EXACT) {
+            return access.status == TransferEvidence.Presence.MISSING
+                    ? PhysicalAction.SUCCESS : PhysicalAction.UNAVAILABLE;
+        }
+        Entity candidate = world.getEntityFromUuid(operation.getCandidateEntityId());
+        return removeCandidateWithRelease(
+                candidate == null ? null : new CandidateRemovalAccess() {
+                    @Override
+                    public boolean isExact() {
+                        return isExactRecoveryCandidate(candidate, operation, record);
+                    }
+
+                    @Override
+                    public void remove() {
+                        world.removeEntityDangerously(candidate);
+                    }
+
+                    @Override
+                    public boolean isRemoved() {
+                        return world.getEntityFromUuid(operation.getCandidateEntityId()) == null
+                                || candidate.isDead;
+                    }
+                },
+                () -> access.release(world));
+    }
+
+    @Override
+    public CheckpointStatus checkpointRecoveryCandidateAbsent(
+            RestorationOperation operation, MountRecord record) {
+        WorldServer world = resolveWorld(operation.getDestinationEvidence().getDimensionId());
+        if (world == null) {
+            return CheckpointStatus.UNAVAILABLE;
+        }
+        ChunkAccess access = loadExistingChunk(world, operation.getDestinationEvidence());
+        if (access.status == TransferEvidence.Presence.MISSING) {
+            return CheckpointStatus.INTEGRITY_CONFLICT;
+        }
+        if (access.status != TransferEvidence.Presence.EXACT) {
+            return CheckpointStatus.UNAVAILABLE;
+        }
+        try {
+            PhysicalFenceAttempt attempt = attemptSaveDrainAndRead(world, access.chunk);
+            CheckpointStatus result = CheckpointStatus.FAILED;
+            if (attempt.diskChunk != null) {
+                DiskEntityStatus status = inspectSavedRecoveryEntity(
+                        attempt.diskChunk, operation, record);
+                if (status == DiskEntityStatus.MISSING) {
+                    result = CheckpointStatus.VERIFIED;
+                } else if (status == DiskEntityStatus.CONFLICT) {
+                    result = CheckpointStatus.INTEGRITY_CONFLICT;
+                }
+            }
+            recordRecoveryFenceDiagnostic(
+                    FenceDiagnosticContext.from(
+                            operation,
+                            "candidate_absent",
+                            world.provider.getDimension(),
+                            access.chunk.x,
+                            access.chunk.z),
+                    attempt,
+                    result);
+            return result;
+        } finally {
+            access.release(world);
+        }
+    }
+
+    private static Entity createRecoveryEntity(
+            WorldServer world, MountRecord record, MountProvider provider, UUID candidateId) {
+        if (!(provider instanceof RecoverySupport) || record.getRecoveryState() == null) {
+            return null;
+        }
+        Entity candidate;
+        try {
+            candidate = EntityList.createEntityByIDFromName(record.getEntityTypeId(), world);
+            if (candidate == null) {
+                return null;
+            }
+            ProviderResult<Void> applied = ((RecoverySupport) provider).applyPersistentState(
+                    candidate, record.getRecoveryState().getProviderPayload());
+            if (applied == null || !applied.isSuccess() || !provider.supports(candidate)) {
+                return null;
+            }
+            candidate.setUniqueId(candidateId);
+            normalizeRecoveredEntity(candidate, world.provider.getDimension());
+            return candidate;
+        } catch (RuntimeException exception) {
+            return null;
+        }
+    }
+
+    static void normalizeRecoveredEntity(Entity candidate, int targetDimension) {
+        candidate.dimension = targetDimension;
+        candidate.timeUntilPortal = 0;
+        candidate.removePassengers();
+        if (candidate.isRiding()) {
+            candidate.dismountRidingEntity();
+        }
+        candidate.motionX = candidate.motionY = candidate.motionZ = 0.0D;
+        candidate.fallDistance = 0.0F;
+        candidate.extinguish();
+        candidate.setAir(300);
+        if (candidate instanceof EntityLivingBase) {
+            EntityLivingBase living = (EntityLivingBase) candidate;
+            living.setHealth(living.getMaxHealth());
+            living.deathTime = 0;
+            living.hurtTime = 0;
+            living.hurtResistantTime = 0;
+            living.clearActivePotions();
+        }
+        if (candidate instanceof EntityLiving) {
+            EntityLiving living = (EntityLiving) candidate;
+            if (living.getLeashed()) {
+                living.clearLeashed(false, false);
+            }
+            living.getNavigator().clearPath();
+        }
+    }
+
+    private static boolean isExactRecoveryCandidate(
+            Entity entity, RestorationOperation operation, MountRecord record) {
+        return matchesRecoveryCandidate(entity, operation, record)
+                && EntityMountEvidence.readTransfer(entity).getOperationId()
+                        .map(operation.getOperationId()::equals).orElse(false);
+    }
+
+    private static boolean isFinalRecoveryCandidate(
+            Entity entity, RestorationOperation operation, MountRecord record) {
+        return matchesRecoveryCandidate(entity, operation, record)
+                && EntityMountEvidence.readTransfer(entity).getStatus()
+                        == EntityMountEvidence.Status.NONE;
+    }
+
+    private static boolean matchesRecoveryCandidate(
+            Entity entity, RestorationOperation operation, MountRecord record) {
+        if (!matchesMount(entity, operation.getMountId(), operation.getCandidateEntityId())) {
+            return false;
+        }
+        ResourceLocation actual = EntityList.getKey(entity);
+        return actual != null && actual.equals(record.getEntityTypeId());
     }
 
     @Override
@@ -720,6 +1220,20 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
     @Override
     public void transferPhaseAcknowledged(TransferPhase phase) {
         acknowledgedPhaseControl.accept(phase);
+    }
+
+    @Override
+    public boolean pauseAfterRestorationPhase(RestorationPhase phase) {
+        return phase != RestorationPhase.CANDIDATE_SPAWN_INTENT
+                && (restorationPauseControl.test(phase)
+                || net.minecraftforge.fml.relauncher.FMLLaunchHandler.isDeobfuscatedEnvironment()
+                && phase.name().equalsIgnoreCase(
+                        System.getProperty("mountcollection.dev.restorationPauseAfter", "")));
+    }
+
+    @Override
+    public void restorationPhaseAcknowledged(RestorationPhase phase) {
+        acknowledgedRestorationPhaseControl.accept(phase);
     }
 
     private static boolean safe(
@@ -1179,6 +1693,28 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         diagnostics.detail(DiagnosticCategory.LIFECYCLE, "transfer_physical_fence", fields);
     }
 
+    private void recordRecoveryFenceDiagnostic(
+            FenceDiagnosticContext context,
+            PhysicalFenceAttempt attempt,
+            CheckpointStatus result) {
+        if (diagnostics == null) {
+            return;
+        }
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("correlation", context.correlation);
+        fields.put("mount", context.mount);
+        fields.put("phase", context.phase);
+        fields.put("fence", context.fence);
+        fields.put("dimension", Integer.toString(context.dimension));
+        fields.put("chunk_x", Integer.toString(context.chunkX));
+        fields.put("chunk_z", Integer.toString(context.chunkZ));
+        fields.put("pre_drain_nanos", durationValue(attempt.preDrainNanos));
+        fields.put("post_drain_nanos", durationValue(attempt.postDrainNanos));
+        fields.put("persistence_stage", attempt.failureStage);
+        fields.put("result", result.name());
+        diagnostics.detail(DiagnosticCategory.LIFECYCLE, "restoration_physical_fence", fields);
+    }
+
     private static String durationValue(Long duration) {
         return duration == null ? "not_completed" : Long.toString(duration);
     }
@@ -1251,6 +1787,22 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
 
         private static FenceDiagnosticContext from(
                 TransferOperation operation,
+                String fence,
+                int dimension,
+                int chunkX,
+                int chunkZ) {
+            return new FenceDiagnosticContext(
+                    operation.getOperationId().toString(),
+                    operation.getMountId().toString(),
+                    operation.getPhase().name(),
+                    fence,
+                    dimension,
+                    chunkX,
+                    chunkZ);
+        }
+
+        private static FenceDiagnosticContext from(
+                RestorationOperation operation,
                 String fence,
                 int dimension,
                 int chunkX,
@@ -1355,6 +1907,50 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
                         .orElse(false)
                 ? DiskEntityStatus.EXACT
                 : DiskEntityStatus.CONFLICT;
+    }
+
+    private static DiskEntityStatus inspectSavedRecoveryEntity(
+            NBTTagCompound chunkRoot,
+            RestorationOperation operation,
+            MountRecord record) {
+        if (!chunkRoot.hasKey("Level", 10)
+                || !chunkRoot.getCompoundTag("Level").hasKey("Entities", 9)) {
+            return DiskEntityStatus.CONFLICT;
+        }
+        NBTTagList entities = chunkRoot.getCompoundTag("Level").getTagList("Entities", 10);
+        NBTTagCompound matched = null;
+        for (int index = 0; index < entities.tagCount(); index++) {
+            NBTTagCompound raw = entities.getCompoundTagAt(index);
+            if (raw.hasUniqueId("UUID")
+                    && operation.getCandidateEntityId().equals(raw.getUniqueId("UUID"))) {
+                if (matched != null) {
+                    return DiskEntityStatus.CONFLICT;
+                }
+                matched = raw;
+            }
+        }
+        if (matched == null) {
+            return DiskEntityStatus.MISSING;
+        }
+        if (!matched.hasKey("id", 8)
+                || !record.getEntityTypeId().toString().equals(matched.getString("id"))) {
+            return DiskEntityStatus.CONFLICT;
+        }
+        EntityMountEvidence.ReadResult mount = EntityMountEvidence.readSavedEntity(matched);
+        if (mount.getStatus() != EntityMountEvidence.Status.VALID
+                || !mount.getMountId().map(operation.getMountId()::equals).orElse(false)) {
+            return DiskEntityStatus.CONFLICT;
+        }
+        EntityMountEvidence.TransferReadResult marker =
+                EntityMountEvidence.readSavedTransfer(matched);
+        if (marker.getStatus() == EntityMountEvidence.Status.NONE) {
+            return DiskEntityStatus.FINALIZED;
+        }
+        if (marker.getStatus() == EntityMountEvidence.Status.MALFORMED) {
+            return DiskEntityStatus.CONFLICT;
+        }
+        return marker.getOperationId().map(operation.getOperationId()::equals).orElse(false)
+                ? DiskEntityStatus.EXACT : DiskEntityStatus.CONFLICT;
     }
 
     private enum DiskEntityStatus {

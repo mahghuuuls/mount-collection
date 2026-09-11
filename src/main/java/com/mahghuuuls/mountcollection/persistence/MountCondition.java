@@ -2,6 +2,8 @@ package com.mahghuuuls.mountcollection.persistence;
 
 public enum MountCondition {
     LIVING,
+    RECOVERING,
+    READY_FOR_RECALL,
     OPERATION_IN_PROGRESS,
     PROVIDER_UNAVAILABLE,
     INTEGRITY_BLOCKED;

@@ -77,6 +77,35 @@ final class RecallPolicyTest {
                 InhibitedStatus.UNAFFECTED, 0L, denied));
     }
 
+    @Test
+    void existingRecoveryIgnoresRecoveryEnablementButHonorsCurrentRecallPolicy() {
+        RecallPolicy policy = new RecallPolicy();
+        MountRecord ready = recoveryRecord(MountCharacteristics.solidGround());
+        ValidatedMountConfig recoveryDisabled = new ValidatedMountConfig(
+                new ConfiguredFilter<>(FilterMode.BLACKLIST, Collections.emptySet()),
+                new ConfiguredFilter<>(FilterMode.BLACKLIST, Collections.emptySet()),
+                new ConfiguredFilter<>(FilterMode.BLACKLIST, Collections.emptySet()),
+                200L, 4, 16, false, false, 0L, true, false);
+
+        assertNull(policy.evaluateRecovery(
+                ready, true, 0, InhibitedStatus.UNAFFECTED, 0L, recoveryDisabled));
+        assertEquals(ContextualOutcome.Status.PROVIDER_UNAVAILABLE,
+                policy.evaluateRecovery(
+                        ready, false, 0, InhibitedStatus.UNAFFECTED, 0L,
+                        recoveryDisabled));
+        assertEquals(ContextualOutcome.Status.SUMMON_DISALLOWED,
+                policy.evaluateRecovery(
+                        ready, true, 0, InhibitedStatus.UNAFFECTED, 0L,
+                        config(FilterMode.WHITELIST, FilterMode.BLACKLIST)));
+
+        MountRecord flying = recoveryRecord(new MountCharacteristics(
+                PlacementProfile.SOLID_GROUND, EnumSet.of(MountTrait.FLYING)));
+        assertEquals(ContextualOutcome.Status.SUMMON_DISALLOWED,
+                policy.evaluateRecovery(
+                        flying, true, 0, InhibitedStatus.UNAFFECTED, 0L,
+                        config(FilterMode.BLACKLIST, FilterMode.BLACKLIST, true)));
+    }
+
     private static ValidatedMountConfig config(FilterMode summoning, FilterMode dimensions) {
         return config(summoning, dimensions, false);
     }
@@ -103,5 +132,19 @@ final class RecallPolicyTest {
                 UUID.randomUUID(), new LastKnownEvidence(0, 0.0D, 64.0D, 0.0D),
                 condition, condition == MountCondition.LIVING ? null : "test", characteristics, 0,
                 new NBTTagCompound(), null);
+    }
+
+    private static MountRecord recoveryRecord(MountCharacteristics characteristics) {
+        UUID sourceId = UUID.randomUUID();
+        LastKnownEvidence evidence = new LastKnownEvidence(0, 0.0D, 64.0D, 0.0D);
+        RecoveryState recovery = new RecoveryState(
+                sourceId, evidence, new com.mahghuuuls.mountcollection.api.ProviderPayload(
+                        1, new NBTTagCompound()), 0L, 0L);
+        return new MountRecord(
+                MountId.create(), UUID.randomUUID(),
+                new ResourceLocation("mountcollection:vanilla"),
+                new ResourceLocation("minecraft:horse"), "minecraft:horse", 1, 1L,
+                null, null, MountCondition.READY_FOR_RECALL, null, characteristics, 0,
+                new NBTTagCompound(), recovery, null);
     }
 }

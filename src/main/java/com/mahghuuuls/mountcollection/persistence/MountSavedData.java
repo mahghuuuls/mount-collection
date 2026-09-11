@@ -73,6 +73,8 @@ public final class MountSavedData extends WorldSavedData {
                     java.util.Collections.emptyMap(),
                     java.util.Collections.emptyMap(),
                     java.util.Collections.emptyMap(),
+                    java.util.Collections.emptyMap(),
+                    java.util.Collections.emptyList(),
                     java.util.Collections.emptyList(),
                     java.util.Collections.emptyList(),
                     java.util.Collections.emptyList(),

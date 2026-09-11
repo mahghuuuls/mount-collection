@@ -3,6 +3,7 @@ package com.mahghuuuls.mountcollection.persistence;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import com.mahghuuuls.mountcollection.api.MountCharacteristics;
 import com.mahghuuuls.mountcollection.api.MountTrait;
@@ -19,6 +20,65 @@ import net.minecraft.util.ResourceLocation;
 import org.junit.jupiter.api.Test;
 
 final class MountStoreCodecTest {
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(RestorationPhase.class)
+    void everyRestorationPhaseRoundTripsWithoutLosingAuthority(RestorationPhase phase) {
+        MountSavedData source = new MountSavedData("test");
+        MountRepository repository = source.getRepository();
+        MountRecord record = register(repository, UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        repository.enterRecovery(record.getOwnerId(), record.getMountId(), record.getPhysicalEntityId(),
+                new RecoveryState(record.getPhysicalEntityId(), record.getLastKnown(),
+                        new ProviderPayload(1, new NBTTagCompound()), 0, 0));
+        RestorationOperation operation = new RestorationOperation(UUID.randomUUID(), record.getMountId(),
+                record.getOwnerId(), UUID.randomUUID(), new LastKnownEvidence(0, 4, 64, 4),
+                0, 0, RestorationPhase.PREPARED, null);
+        repository.beginRestoration(operation);
+        if (phase != RestorationPhase.PREPARED && phase != RestorationPhase.INTEGRITY_BLOCKED) {
+            repository.markRestorationSpawnIntent(operation.getOperationId());
+            if (phase != RestorationPhase.CANDIDATE_SPAWN_INTENT) {
+                repository.markRestorationCandidateSpawned(operation.getOperationId());
+                if (phase == RestorationPhase.ASSOCIATED) {
+                    repository.associateRestorationCandidate(operation.getOperationId());
+                }
+            }
+        }
+        if (phase == RestorationPhase.INTEGRITY_BLOCKED) {
+            repository.blockRestoration(operation.getOperationId(), "test conflict");
+        }
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(source.writeToNBT(new NBTTagCompound()));
+        assertEquals(phase, restored.getRepository().findRestoration(operation.getOperationId()).get().getPhase());
+        MountRecord actual = restored.getRepository().find(record.getMountId()).get();
+        assertTrue(actual.getRecoveryState() != null);
+        assertEquals(phase == RestorationPhase.INTEGRITY_BLOCKED ? MountCondition.INTEGRITY_BLOCKED
+                : MountCondition.OPERATION_IN_PROGRESS, actual.getCondition());
+        assertEquals(phase == RestorationPhase.ASSOCIATED ? operation.getCandidateEntityId() : null,
+                actual.getPhysicalEntityId());
+    }
+
+    @Test
+    void priorRestorationSchemaCannotAssertNewSourceRetirementGuarantee() {
+        MountSavedData source = new MountSavedData("test");
+        MountRepository repository = source.getRepository();
+        MountRecord record = register(repository, UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        repository.enterRecovery(record.getOwnerId(), record.getMountId(), record.getPhysicalEntityId(),
+                new RecoveryState(record.getPhysicalEntityId(), record.getLastKnown(),
+                        new ProviderPayload(1, new NBTTagCompound()), 0, 0));
+        RestorationOperation operation = new RestorationOperation(UUID.randomUUID(), record.getMountId(),
+                record.getOwnerId(), UUID.randomUUID(), new LastKnownEvidence(0, 4, 64, 4),
+                0, 0, RestorationPhase.PREPARED, null);
+        repository.beginRestoration(operation);
+        repository.markRestorationSpawnIntent(operation.getOperationId());
+        NBTTagCompound encoded = source.writeToNBT(new NBTTagCompound());
+        encoded.getTagList("Restorations", 10).getCompoundTagAt(0).setInteger("Version", 1);
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(encoded);
+        assertEquals(MountCondition.INTEGRITY_BLOCKED,
+                restored.getRepository().find(record.getMountId()).get().getCondition());
+        assertTrue(restored.getRepository().find(record.getMountId()).get().getRecoveryState() != null);
+        assertEquals(1, restored.writeToNBT(new NBTTagCompound()).getTagList("Restorations", 10).tagCount());
+    }
 
     @Test
     void productionCodecRoundTripPreservesIdentitySelectionOrdinalsAndClock() {
@@ -66,6 +126,237 @@ final class MountStoreCodecTest {
         assertEquals("FLYING", raw.getTagList("MountTraits", 8).getStringTagAt(0));
         assertEquals(characteristics,
                 restored.getRepository().find(record.getMountId()).get().getCharacteristics());
+    }
+
+    @Test
+    void currentRecordRoundTripPreservesRecoverySnapshotAndSelection() {
+        MountSavedData source = new MountSavedData("test");
+        MountRepository repository = source.getRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord record = register(repository, owner, UUID.randomUUID()).getRecord().get();
+        NBTTagCompound payloadData = new NBTTagCompound();
+        payloadData.setString("Saddle", "preserved");
+        RecoveryState recovery = new RecoveryState(
+                record.getPhysicalEntityId(), record.getLastKnown(),
+                new ProviderPayload(3, payloadData), 120L, 120L);
+        assertEquals(MountRepository.RecoveryStatus.SUCCESS,
+                repository.enterRecovery(owner, record.getMountId(),
+                        record.getPhysicalEntityId(), recovery));
+
+        NBTTagCompound encoded = source.writeToNBT(new NBTTagCompound());
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(encoded);
+        MountRecord decoded = restored.getRepository().find(record.getMountId()).get();
+
+        assertEquals(MountCondition.RECOVERING, decoded.getCondition());
+        assertEquals(record.getPhysicalEntityId(), decoded.getRecoveryState().getSourceEntityId());
+        assertEquals(120L, decoded.getRecoveryState().getDeadline());
+        assertEquals(120L, decoded.getRecoveryState().getDuration());
+        assertEquals(3, decoded.getRecoveryState().getProviderPayload().getVersion());
+        assertEquals("preserved",
+                decoded.getRecoveryState().getProviderPayload().copyData().getString("Saddle"));
+        assertEquals(record.getMountId(),
+                restored.getRepository().inspectCollection(owner).getSelectedMountId().get());
+        assertFalse(restored.getRepository().findByPhysicalEntity(
+                record.getPhysicalEntityId()).isPresent());
+    }
+
+    @Test
+    void malformedCurrentRecoveryStateIsRetainedAndBlocked() {
+        MountSavedData source = new MountSavedData("test");
+        MountRepository repository = source.getRepository();
+        MountRecord record = register(
+                repository, UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        assertEquals(MountRepository.RecoveryStatus.SUCCESS,
+                repository.enterRecovery(record.getOwnerId(), record.getMountId(),
+                        record.getPhysicalEntityId(), new RecoveryState(
+                                record.getPhysicalEntityId(), record.getLastKnown(),
+                                new ProviderPayload(1, new NBTTagCompound()), 20L, 20L)));
+        NBTTagCompound root = source.writeToNBT(new NBTTagCompound());
+        root.getTagList("Records", 10).getCompoundTagAt(0)
+                .getCompoundTag("Recovery").removeTag("SourceEvidence");
+
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(root);
+
+        assertEquals(MountCondition.INTEGRITY_BLOCKED,
+                restored.getRepository().find(record.getMountId()).get().getCondition());
+    }
+
+    @Test
+    void restorationJournalRoundTripRetainsRecoveryAuthorityAndPhase() {
+        MountSavedData source = new MountSavedData("test");
+        MountRepository repository = source.getRepository();
+        MountRecord record = register(
+                repository, UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        assertEquals(MountRepository.RecoveryStatus.SUCCESS,
+                repository.enterRecovery(record.getOwnerId(), record.getMountId(),
+                        record.getPhysicalEntityId(), new RecoveryState(
+                                record.getPhysicalEntityId(), record.getLastKnown(),
+                                new ProviderPayload(1, new NBTTagCompound()), 0L, 0L)));
+        RestorationOperation operation = new RestorationOperation(
+                UUID.randomUUID(), record.getMountId(), record.getOwnerId(), UUID.randomUUID(),
+                new LastKnownEvidence(0, 4.0D, 64.0D, 4.0D),
+                40L, 40L, RestorationPhase.PREPARED, null);
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.beginRestoration(operation));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.markRestorationSpawnIntent(operation.getOperationId()));
+
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(source.writeToNBT(new NBTTagCompound()));
+
+        assertEquals(RestorationPhase.CANDIDATE_SPAWN_INTENT,
+                restored.getRepository().findRestoration(operation.getOperationId())
+                        .get().getPhase());
+        assertEquals(MountCondition.OPERATION_IN_PROGRESS,
+                restored.getRepository().find(record.getMountId()).get().getCondition());
+    }
+
+    @Test
+    void duplicateRestorationOperationsAreBothRetainedAndQuarantined() {
+        MountSavedData source = new MountSavedData("test");
+        MountRecord record = register(
+                source.getRepository(), UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        source.getRepository().enterRecovery(
+                record.getOwnerId(), record.getMountId(), record.getPhysicalEntityId(),
+                new RecoveryState(
+                        record.getPhysicalEntityId(), record.getLastKnown(),
+                        new ProviderPayload(1, new NBTTagCompound()), 0L, 0L));
+        RestorationOperation operation = new RestorationOperation(
+                UUID.randomUUID(), record.getMountId(), record.getOwnerId(), UUID.randomUUID(),
+                new LastKnownEvidence(0, 4.0D, 64.0D, 4.0D),
+                0L, 0L, RestorationPhase.PREPARED, null);
+        source.getRepository().beginRestoration(operation);
+        NBTTagCompound root = source.writeToNBT(new NBTTagCompound());
+        NBTTagCompound first = root.getTagList("Restorations", 10)
+                .getCompoundTagAt(0).copy();
+        NBTTagCompound duplicate = first.copy();
+        duplicate.setString("OperationId", UUID.randomUUID().toString());
+        NBTTagList duplicated = new NBTTagList();
+        duplicated.appendTag(first);
+        duplicated.appendTag(duplicate);
+        root.setTag("Restorations", duplicated);
+
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(root);
+
+        assertEquals(MountCondition.INTEGRITY_BLOCKED,
+                restored.getRepository().find(record.getMountId()).get().getCondition());
+        assertTrue(restored.getRepository().getPendingRestorations().isEmpty());
+        assertEquals(2, restored.writeToNBT(new NBTTagCompound())
+                .getTagList("Restorations", 10).tagCount());
+    }
+
+    @Test
+    void transferAndRestorationForSameMountAreBothRetainedAndQuarantined() {
+        MountSavedData recoverySource = new MountSavedData("recovery");
+        MountRecord recoveryRecord = register(
+                recoverySource.getRepository(), UUID.randomUUID(), UUID.randomUUID())
+                        .getRecord().get();
+        recoverySource.getRepository().enterRecovery(
+                recoveryRecord.getOwnerId(), recoveryRecord.getMountId(),
+                recoveryRecord.getPhysicalEntityId(),
+                new RecoveryState(
+                        recoveryRecord.getPhysicalEntityId(), recoveryRecord.getLastKnown(),
+                        new ProviderPayload(1, new NBTTagCompound()), 0L, 0L));
+        RestorationOperation restoration = new RestorationOperation(
+                UUID.randomUUID(), recoveryRecord.getMountId(), recoveryRecord.getOwnerId(),
+                UUID.randomUUID(), new LastKnownEvidence(0, 4.0D, 64.0D, 4.0D),
+                0L, 0L, RestorationPhase.PREPARED, null);
+        recoverySource.getRepository().beginRestoration(restoration);
+        NBTTagCompound root = recoverySource.writeToNBT(new NBTTagCompound());
+
+        MountSavedData transferSource = new MountSavedData("transfer");
+        MountRecord transferRecord = register(
+                transferSource.getRepository(), UUID.randomUUID(), UUID.randomUUID())
+                        .getRecord().get();
+        transferSource.getRepository().beginTransfer(operation(transferRecord));
+        NBTTagCompound transferRaw = transferSource.writeToNBT(new NBTTagCompound())
+                .getTagList("Transfers", 10).getCompoundTagAt(0).copy();
+        transferRaw.setString("MountId", recoveryRecord.getMountId().toString());
+        transferRaw.setString("OwnerId", recoveryRecord.getOwnerId().toString());
+        NBTTagList transfers = new NBTTagList();
+        transfers.appendTag(transferRaw);
+        root.setTag("Transfers", transfers);
+
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(root);
+
+        assertEquals(MountCondition.INTEGRITY_BLOCKED,
+                restored.getRepository().find(recoveryRecord.getMountId()).get().getCondition());
+        assertTrue(restored.getRepository().getPendingRestorations().isEmpty());
+        assertTrue(restored.getRepository().getPendingTransfers().isEmpty());
+        NBTTagCompound retained = restored.writeToNBT(new NBTTagCompound());
+        assertEquals(1, retained.getTagList("Restorations", 10).tagCount());
+        assertEquals(1, retained.getTagList("Transfers", 10).tagCount());
+    }
+
+    @Test
+    void currentPlayerSchemaRequiresItsExactVersion() {
+        MountSavedData source = new MountSavedData("test");
+        UUID owner = UUID.randomUUID();
+        register(source.getRepository(), owner, UUID.randomUUID());
+        NBTTagCompound root = source.writeToNBT(new NBTTagCompound());
+        root.getTagList("Players", 10).getCompoundTagAt(0).removeTag("Version");
+
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(root);
+
+        assertFalse(restored.getRepository().inspectCollection(owner)
+                .getSelectedMountId().isPresent());
+        assertTrue(restored.writeToNBT(new NBTTagCompound())
+                .getTagList("Players", 10).tagCount() >= 1);
+    }
+
+    @Test
+    void restorationIntegrityReasonIsBoundedAtConstruction() {
+        assertThrows(IllegalArgumentException.class, () -> new RestorationOperation(
+                UUID.randomUUID(), MountId.create(), UUID.randomUUID(), UUID.randomUUID(),
+                new LastKnownEvidence(0, 0.0D, 64.0D, 0.0D),
+                0L, 0L, RestorationPhase.INTEGRITY_BLOCKED,
+                new String(new char[161]).replace('\0', 'x')));
+    }
+
+    @Test
+    void everyPersistedRestorationPhaseReloadsThroughTheProductionCodec() {
+        for (RestorationPhase expected : RestorationPhase.values()) {
+            MountSavedData source = new MountSavedData("test");
+            MountRecord record = register(
+                    source.getRepository(), UUID.randomUUID(), UUID.randomUUID())
+                            .getRecord().get();
+            source.getRepository().enterRecovery(
+                    record.getOwnerId(), record.getMountId(), record.getPhysicalEntityId(),
+                    new RecoveryState(
+                            record.getPhysicalEntityId(), record.getLastKnown(),
+                            new ProviderPayload(1, new NBTTagCompound()), 0L, 0L));
+            RestorationOperation operation = new RestorationOperation(
+                    UUID.randomUUID(), record.getMountId(), record.getOwnerId(), UUID.randomUUID(),
+                    new LastKnownEvidence(0, 4.0D, 64.0D, 4.0D),
+                    0L, 0L, RestorationPhase.PREPARED, null);
+            source.getRepository().beginRestoration(operation);
+            if (expected == RestorationPhase.CANDIDATE_SPAWN_INTENT
+                    || expected == RestorationPhase.CANDIDATE_SPAWNED
+                    || expected == RestorationPhase.ASSOCIATED) {
+                source.getRepository().markRestorationSpawnIntent(operation.getOperationId());
+            }
+            if (expected == RestorationPhase.CANDIDATE_SPAWNED
+                    || expected == RestorationPhase.ASSOCIATED) {
+                source.getRepository().markRestorationCandidateSpawned(operation.getOperationId());
+            }
+            if (expected == RestorationPhase.ASSOCIATED) {
+                source.getRepository().associateRestorationCandidate(operation.getOperationId());
+            } else if (expected == RestorationPhase.INTEGRITY_BLOCKED) {
+                source.getRepository().blockRestoration(
+                        operation.getOperationId(), "injected test conflict");
+            }
+
+            MountSavedData restored = new MountSavedData("test");
+            restored.readFromNBT(source.writeToNBT(new NBTTagCompound()));
+
+            assertEquals(expected, restored.getRepository()
+                    .findRestoration(operation.getOperationId()).get().getPhase());
+        }
     }
 
     @Test

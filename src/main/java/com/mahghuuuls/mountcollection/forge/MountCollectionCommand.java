@@ -6,6 +6,7 @@ import com.mahghuuuls.mountcollection.persistence.MountRecord;
 import com.mahghuuuls.mountcollection.persistence.MountRepository;
 import com.mahghuuuls.mountcollection.persistence.TransferOperation;
 import com.mahghuuuls.mountcollection.persistence.TransferPhase;
+import com.mahghuuuls.mountcollection.persistence.RestorationPhase;
 import com.mojang.authlib.GameProfile;
 import java.util.Collections;
 import java.util.List;
@@ -35,7 +36,8 @@ final class MountCollectionCommand extends CommandBase {
     @Override
     public String getUsage(ICommandSender sender) {
         return "/mountcollection inspect <player <name>|mount <mount-id>>"
-                + " | /mountcollection dev <status|clear|fault <journal_ack|candidate_intent_fatal|source_intent_fatal|fence_post_drain>|pause <stable-phase>>";
+                + " | /mountcollection dev <status|clear|fault <journal_ack|candidate_intent_fatal|source_intent_fatal|fence_post_drain>|pause <stable-phase>>"
+                + " | /mountcollection dev <recovery_fault <candidate_intent_fatal|provider_unavailable>|recovery_pause <prepared|candidate_spawned|associated>>";
     }
 
     @Override
@@ -122,6 +124,40 @@ final class MountCollectionCommand extends CommandBase {
             if (phase == com.mahghuuuls.mountcollection.persistence.TransferPhase.INTEGRITY_BLOCKED
                     || !controls.armPause(phase)) {
                 throw new CommandException("Mount Collection transfer phase cannot be paused.");
+            }
+            sendDevelopmentStatus(sender, controls);
+            return;
+        }
+        if (arguments.length == 3 && "recovery_fault".equals(arguments[1])
+                && "candidate_intent_fatal".equals(arguments[2])) {
+            if (!controls.armRestorationFatalAfterIntent(
+                    RestorationPhase.CANDIDATE_SPAWN_INTENT)) {
+                throw new CommandException(
+                        "Mount Collection Recovery fatal boundary was not armed.");
+            }
+            sendDevelopmentStatus(sender, controls);
+            return;
+        }
+        if (arguments.length == 3 && "recovery_fault".equals(arguments[1])
+                && "provider_unavailable".equals(arguments[2])) {
+            if (!controls.armRecoveryProviderUnavailable()) {
+                throw new CommandException(
+                        "Mount Collection Recovery provider fault was not armed.");
+            }
+            sendDevelopmentStatus(sender, controls);
+            return;
+        }
+        if (arguments.length == 3 && "recovery_pause".equals(arguments[1])) {
+            RestorationPhase phase;
+            try {
+                phase = RestorationPhase.valueOf(
+                        arguments[2].toUpperCase(java.util.Locale.ROOT));
+            } catch (IllegalArgumentException exception) {
+                throw new CommandException("Unknown Mount Collection Recovery phase.");
+            }
+            if (!controls.armRestorationPause(phase)) {
+                throw new CommandException(
+                        "Mount Collection Recovery phase cannot be paused.");
             }
             sendDevelopmentStatus(sender, controls);
             return;

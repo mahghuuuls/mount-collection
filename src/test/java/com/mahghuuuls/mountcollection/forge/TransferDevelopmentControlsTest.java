@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.mahghuuuls.mountcollection.persistence.TransferPhase;
+import com.mahghuuuls.mountcollection.persistence.RestorationPhase;
 import org.junit.jupiter.api.Test;
 
 final class TransferDevelopmentControlsTest {
@@ -18,6 +19,8 @@ final class TransferDevelopmentControlsTest {
                 TransferDevelopmentControls.Fault.JOURNAL_ACKNOWLEDGEMENT));
         assertFalse(controls.armPause(TransferPhase.PREPARED));
         assertFalse(controls.consumeJournalAcknowledgementFault());
+        assertFalse(controls.armRecoveryProviderUnavailable());
+        assertFalse(controls.consumeRecoveryProviderUnavailable());
         assertFalse(controls.shouldPause(TransferPhase.PREPARED));
         assertEquals("unavailable", controls.describe());
     }
@@ -39,7 +42,7 @@ final class TransferDevelopmentControlsTest {
         assertTrue(controls.armFault(
                 TransferDevelopmentControls.Fault.JOURNAL_ACKNOWLEDGEMENT));
         controls.clear();
-        assertEquals("fault=NONE fatalAfter=NONE pause=NONE", controls.describe());
+        assertEquals(idleDescription(), controls.describe());
         assertFalse(controls.consumeJournalAcknowledgementFault());
     }
 
@@ -62,7 +65,7 @@ final class TransferDevelopmentControlsTest {
         assertFalse(controls.armPause(TransferPhase.CANDIDATE_SPAWN_INTENT));
         assertFalse(controls.armPause(TransferPhase.SOURCE_REMOVAL_INTENT));
         assertFalse(controls.armPause(TransferPhase.INTEGRITY_BLOCKED));
-        assertEquals("fault=NONE fatalAfter=NONE pause=NONE", controls.describe());
+        assertEquals(idleDescription(), controls.describe());
     }
 
     @Test
@@ -75,13 +78,15 @@ final class TransferDevelopmentControlsTest {
         assertFalse(controls.consumeJournalAcknowledgementFault());
         controls.phaseAcknowledged(TransferPhase.CANDIDATE_SPAWN_INTENT);
         assertEquals(
-                "fault=JOURNAL_FATAL_SEQUENCE remaining=3 fatalAfter=NONE pause=NONE",
+                "fault=JOURNAL_FATAL_SEQUENCE remaining=3 fatalAfter=NONE pause=NONE"
+                        + " recoveryFatalAfter=NONE recoveryPause=NONE"
+                        + " recoveryProviderUnavailable=false",
                 controls.describe());
         assertTrue(controls.consumeJournalAcknowledgementFault());
         assertTrue(controls.consumeJournalAcknowledgementFault());
         assertTrue(controls.consumeJournalAcknowledgementFault());
         assertFalse(controls.consumeJournalAcknowledgementFault());
-        assertEquals("fault=NONE fatalAfter=NONE pause=NONE", controls.describe());
+        assertEquals(idleDescription(), controls.describe());
     }
 
     @Test
@@ -94,5 +99,47 @@ final class TransferDevelopmentControlsTest {
         assertTrue(controls.consumeJournalAcknowledgementFault());
         assertTrue(controls.consumeJournalAcknowledgementFault());
         assertFalse(controls.consumeJournalAcknowledgementFault());
+    }
+
+    @Test
+    void restorationStablePhasesPauseButActionIntentAndBlockedDoNot() {
+        TransferDevelopmentControls controls = new TransferDevelopmentControls(() -> true);
+
+        assertTrue(controls.armRestorationPause(RestorationPhase.PREPARED));
+        assertTrue(controls.shouldPauseRestoration(RestorationPhase.PREPARED));
+        assertFalse(controls.armRestorationPause(RestorationPhase.CANDIDATE_SPAWN_INTENT));
+        assertFalse(controls.armRestorationPause(RestorationPhase.INTEGRITY_BLOCKED));
+        controls.clear();
+        assertFalse(controls.shouldPauseRestoration(RestorationPhase.PREPARED));
+    }
+
+    @Test
+    void fatalRestorationBoundaryActivatesOnlyAfterIntentAcknowledgement() {
+        TransferDevelopmentControls controls = new TransferDevelopmentControls(() -> true);
+
+        assertTrue(controls.armRestorationFatalAfterIntent(
+                RestorationPhase.CANDIDATE_SPAWN_INTENT));
+        controls.restorationPhaseAcknowledged(RestorationPhase.PREPARED);
+        assertFalse(controls.consumeJournalAcknowledgementFault());
+        controls.restorationPhaseAcknowledged(RestorationPhase.CANDIDATE_SPAWN_INTENT);
+        assertTrue(controls.consumeJournalAcknowledgementFault());
+        assertTrue(controls.consumeJournalAcknowledgementFault());
+        assertTrue(controls.consumeJournalAcknowledgementFault());
+        assertFalse(controls.consumeJournalAcknowledgementFault());
+    }
+
+    @Test
+    void providerUnavailableFaultIsOneShot() {
+        TransferDevelopmentControls controls = new TransferDevelopmentControls(() -> true);
+
+        assertTrue(controls.armRecoveryProviderUnavailable());
+        assertTrue(controls.consumeRecoveryProviderUnavailable());
+        assertFalse(controls.consumeRecoveryProviderUnavailable());
+    }
+
+    private static String idleDescription() {
+        return "fault=NONE fatalAfter=NONE pause=NONE"
+                + " recoveryFatalAfter=NONE recoveryPause=NONE"
+                + " recoveryProviderUnavailable=false";
     }
 }

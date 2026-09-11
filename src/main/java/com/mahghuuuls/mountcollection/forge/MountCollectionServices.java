@@ -96,7 +96,10 @@ public final class MountCollectionServices {
                         diagnostics,
                         developmentControls::consumePhysicalFencePostDrainFault,
                         developmentControls::shouldPause,
-                        developmentControls::phaseAcknowledged));
+                        developmentControls::phaseAcknowledged,
+                        developmentControls::shouldPauseRestoration,
+                        developmentControls::restorationPhaseAcknowledged),
+                developmentControls::consumeRecoveryProviderUnavailable);
     }
 
     synchronized void clearActiveConfig() {

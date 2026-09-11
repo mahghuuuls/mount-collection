@@ -5,6 +5,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.mahghuuuls.mountcollection.api.ProviderPayload;
+import com.mahghuuuls.mountcollection.api.ProviderFailure;
+import com.mahghuuuls.mountcollection.api.ProviderResult;
 import java.util.List;
 import java.util.UUID;
 import net.minecraft.nbt.NBTTagCompound;
@@ -455,6 +458,192 @@ final class MountRepositoryTest {
                 repository.rollbackSourceRemovalIntent(operation.getOperationId()));
         assertEquals(TransferPhase.ASSOCIATED,
                 repository.findTransfer(operation.getOperationId()).get().getPhase());
+    }
+
+    @Test
+    void recoveryEntryRequiresDurableAcknowledgementBeforeRemovingPhysicalAuthority() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord record = register(
+                repository, owner, UUID.randomUUID(), null).getRecord().get();
+        RecoveryState recovery = recovery(record, 200L, 200L);
+
+        repository.setAcknowledgedPersistence(snapshot -> false);
+        assertEquals(MountRepository.RecoveryStatus.PERSISTENCE_FAILURE,
+                repository.enterRecovery(
+                        owner, record.getMountId(), record.getPhysicalEntityId(), recovery));
+        assertEquals(MountCondition.LIVING,
+                repository.find(record.getMountId()).get().getCondition());
+        assertTrue(repository.findByPhysicalEntity(record.getPhysicalEntityId()).isPresent());
+
+        repository.setAcknowledgedPersistence(snapshot -> true);
+        assertEquals(MountRepository.RecoveryStatus.SUCCESS,
+                repository.enterRecovery(
+                        owner, record.getMountId(), record.getPhysicalEntityId(), recovery));
+        MountRecord recovering = repository.find(record.getMountId()).get();
+        assertEquals(MountCondition.RECOVERING, recovering.getCondition());
+        assertEquals(recovery.getSourceEntityId(),
+                recovering.getRecoveryState().getSourceEntityId());
+        assertFalse(repository.findByPhysicalEntity(record.getPhysicalEntityId()).isPresent());
+        assertEquals(record.getMountId(),
+                repository.inspectCollection(owner).getSelectedMountId().get());
+    }
+
+    @Test
+    void zeroDurationRecoveryIsReadyImmediatelyAndNeverAutoCreatesAnEntity() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord record = register(
+                repository, owner, UUID.randomUUID(), null).getRecord().get();
+
+        assertEquals(MountRepository.RecoveryStatus.SUCCESS,
+                repository.enterRecovery(owner, record.getMountId(), record.getPhysicalEntityId(),
+                        recovery(record, 0L, 0L)));
+        MountRecord ready = repository.find(record.getMountId()).get();
+        assertEquals(MountCondition.READY_FOR_RECALL, ready.getCondition());
+        assertFalse(repository.findByPhysicalEntity(record.getPhysicalEntityId()).isPresent());
+    }
+
+    @Test
+    void deadlineTransitionIsAcknowledgedAndRejectsEarlyOrRepeatedAttempts() {
+        MountRepository repository = new MountRepository();
+        MountRecord record = register(
+                repository, UUID.randomUUID(), UUID.randomUUID(), null).getRecord().get();
+        assertEquals(MountRepository.RecoveryStatus.SUCCESS,
+                repository.enterRecovery(record.getOwnerId(), record.getMountId(),
+                        record.getPhysicalEntityId(), recovery(record, 40L, 40L)));
+
+        assertEquals(MountRepository.RecoveryStatus.REJECTED,
+                repository.markRecoveryReady(record.getMountId(), 39L));
+        repository.setAcknowledgedPersistence(snapshot -> false);
+        assertEquals(MountRepository.RecoveryStatus.PERSISTENCE_FAILURE,
+                repository.markRecoveryReady(record.getMountId(), 40L));
+        assertEquals(MountCondition.RECOVERING,
+                repository.find(record.getMountId()).get().getCondition());
+        repository.setAcknowledgedPersistence(snapshot -> true);
+        assertEquals(MountRepository.RecoveryStatus.SUCCESS,
+                repository.markRecoveryReady(record.getMountId(), 40L));
+        assertEquals(MountCondition.READY_FOR_RECALL,
+                repository.find(record.getMountId()).get().getCondition());
+        assertEquals(MountRepository.RecoveryStatus.REJECTED,
+                repository.markRecoveryReady(record.getMountId(), 41L));
+    }
+
+    @Test
+    void normalDeathRemovesOnlyTheExactLivingRecordAndItsSelection() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord record = register(
+                repository, owner, UUID.randomUUID(), null).getRecord().get();
+
+        assertTrue(repository.removeForNormalDeath(record.getPhysicalEntityId()));
+        assertFalse(repository.find(record.getMountId()).isPresent());
+        assertFalse(repository.inspectCollection(owner).getSelectedMountId().isPresent());
+        assertFalse(repository.removeForNormalDeath(record.getPhysicalEntityId()));
+    }
+
+    @Test
+    void normalDeathAlsoRemovesAnExactProviderUnavailableRepresentative() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord record = register(
+                repository, owner, UUID.randomUUID(), null).getRecord().get();
+        repository.reconcileProviderPayloads((provider, payload) ->
+                ProviderResult.failure(ProviderFailure.INVALID_PAYLOAD));
+        assertEquals(MountCondition.PROVIDER_UNAVAILABLE,
+                repository.find(record.getMountId()).get().getCondition());
+
+        assertTrue(repository.removeForNormalDeath(
+                record.getPhysicalEntityId(),
+                "mountcollection.message.recovery_provider_unavailable_death"));
+
+        assertFalse(repository.find(record.getMountId()).isPresent());
+        assertFalse(repository.inspectCollection(owner).getSelectedMountId().isPresent());
+        assertEquals("mountcollection.message.recovery_provider_unavailable_death",
+                repository.consumePendingNotification(owner).get());
+    }
+
+    @Test
+    void pendingRecoveryNotificationKeepsOnlyTheLatestMeaningfulEvent() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord first = register(
+                repository, owner, UUID.randomUUID(), null).getRecord().get();
+        MountRecord second = register(
+                repository, owner, UUID.randomUUID(), null).getRecord().get();
+        assertEquals(MountRepository.RecoveryStatus.SUCCESS,
+                repository.enterRecovery(
+                        owner, first.getMountId(), first.getPhysicalEntityId(),
+                        recovery(first, 0L, 0L)));
+        assertEquals("mountcollection.message.recovery_ready",
+                repository.consumePendingNotification(owner).get());
+        assertFalse(repository.consumePendingNotification(owner).isPresent());
+
+        assertEquals(MountRepository.RecoveryStatus.SUCCESS,
+                repository.enterRecovery(
+                        owner, second.getMountId(), second.getPhysicalEntityId(),
+                        recovery(second, 20L, 20L)));
+        assertEquals(MountRepository.RecoveryStatus.SUCCESS,
+                repository.markRecoveryReady(second.getMountId(), 20L));
+
+        assertEquals(1, repository.getPendingNotificationOwners().size());
+        assertEquals(owner, repository.getPendingNotificationOwners().get(0));
+        assertEquals("mountcollection.message.recovery_ready",
+                repository.consumePendingNotification(owner).get());
+        assertFalse(repository.consumePendingNotification(owner).isPresent());
+    }
+
+    @Test
+    void restorationJournalAssociatesOneCandidateAndFinalizesLivingStateAtomically() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord record = register(
+                repository, owner, UUID.randomUUID(), null).getRecord().get();
+        assertEquals(MountRepository.RecoveryStatus.SUCCESS,
+                repository.enterRecovery(owner, record.getMountId(), record.getPhysicalEntityId(),
+                        recovery(record, 0L, 0L)));
+        RestorationOperation operation = new RestorationOperation(
+                UUID.randomUUID(), record.getMountId(), owner, UUID.randomUUID(),
+                new LastKnownEvidence(0, 8.0D, 64.0D, 8.0D),
+                200L, 200L, RestorationPhase.PREPARED, null);
+
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.beginRestoration(operation));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.markRestorationSpawnIntent(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.markRestorationCandidateSpawned(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.associateRestorationCandidate(operation.getOperationId()));
+        MountRecord associated = repository.find(record.getMountId()).get();
+        assertEquals(MountCondition.OPERATION_IN_PROGRESS, associated.getCondition());
+        assertEquals(operation.getCandidateEntityId(), associated.getPhysicalEntityId());
+        assertTrue(associated.getRecoveryState() != null);
+
+        repository.setAcknowledgedPersistence(snapshot -> false);
+        assertEquals(MountRepository.TransferStatus.PERSISTENCE_FAILURE,
+                repository.finishRestoration(operation.getOperationId()));
+        assertEquals(MountCondition.OPERATION_IN_PROGRESS,
+                repository.find(record.getMountId()).get().getCondition());
+        assertTrue(repository.findRestoration(operation.getOperationId()).isPresent());
+
+        repository.setAcknowledgedPersistence(snapshot -> true);
+        assertEquals(MountRepository.TransferStatus.SUCCESS,
+                repository.finishRestoration(operation.getOperationId()));
+        MountRecord living = repository.find(record.getMountId()).get();
+        assertEquals(MountCondition.LIVING, living.getCondition());
+        assertEquals(operation.getCandidateEntityId(), living.getPhysicalEntityId());
+        assertTrue(living.getRecoveryState() == null);
+        assertTrue(repository.getPendingRestorations().isEmpty());
+        assertEquals(200L, repository.getRecallCooldown(owner).getDeadline());
+    }
+
+    private static RecoveryState recovery(MountRecord record, long deadline, long duration) {
+        NBTTagCompound payload = new NBTTagCompound();
+        payload.setString("name", "kept");
+        return new RecoveryState(
+                record.getPhysicalEntityId(), record.getLastKnown(),
+                new ProviderPayload(1, payload), deadline, duration);
     }
 
     private static TransferOperation operation(MountRecord record) {
