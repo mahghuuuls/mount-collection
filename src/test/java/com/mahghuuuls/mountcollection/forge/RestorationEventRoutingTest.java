@@ -174,7 +174,10 @@ final class RestorationEventRoutingTest {
         assertNotNull(f.repository.find(f.record.getMountId()).get().getRecoveryState());
     }
 
-    private enum SourceFault { NONE, UUID, TYPE, MARKER, LOCATION, STALE_DISK, MISSING_DISK, REMOVE_EXCEPTION, SAVE_EXCEPTION }
+    private enum SourceFault { NONE, UUID, TYPE, MARKER, LOCATION, STALE_DISK, MISSING_DISK,
+        FLAT_ROOT, MISSING_LEVEL, WRONG_LEVEL, MISSING_ENTITIES, WRONG_ENTITIES,
+        WRONG_ENTITY_TYPE, MISSING_UUID, NESTED_SOURCE, MALFORMED_PASSENGERS,
+        UNRELATED_ENTITY, REMOVE_EXCEPTION, SAVE_EXCEPTION }
 
     @ParameterizedTest
     @EnumSource(SourceFault.class)
@@ -208,7 +211,31 @@ final class RestorationEventRoutingTest {
                     stale.setUniqueId("UUID", f.record.getPhysicalEntityId());
                     entities.appendTag(stale);
                 }
-                disk.setTag("Entities", entities);
+                if (fault == SourceFault.WRONG_ENTITY_TYPE) entities.appendTag(new net.minecraft.nbt.NBTTagString("bad"));
+                if (fault == SourceFault.MISSING_UUID) entities.appendTag(new NBTTagCompound());
+                if (fault == SourceFault.NESTED_SOURCE || fault == SourceFault.MALFORMED_PASSENGERS
+                        || fault == SourceFault.UNRELATED_ENTITY) {
+                    NBTTagCompound unrelated = new NBTTagCompound();
+                    unrelated.setUniqueId("UUID", UUID.randomUUID());
+                    if (fault == SourceFault.NESTED_SOURCE) {
+                        NBTTagCompound passenger = new NBTTagCompound();
+                        passenger.setUniqueId("UUID", f.record.getPhysicalEntityId());
+                        net.minecraft.nbt.NBTTagList passengers = new net.minecraft.nbt.NBTTagList();
+                        passengers.appendTag(passenger);
+                        unrelated.setTag("Passengers", passengers);
+                    } else if (fault == SourceFault.MALFORMED_PASSENGERS) {
+                        unrelated.setString("Passengers", "bad");
+                    }
+                    entities.appendTag(unrelated);
+                }
+                NBTTagCompound level = new NBTTagCompound();
+                level.setTag("Entities", entities);
+                disk.setTag("Level", level);
+                if (fault == SourceFault.FLAT_ROOT) { disk.removeTag("Level"); disk.setTag("Entities", entities); }
+                if (fault == SourceFault.MISSING_LEVEL) disk.removeTag("Level");
+                if (fault == SourceFault.WRONG_LEVEL) disk.setString("Level", "bad");
+                if (fault == SourceFault.MISSING_ENTITIES) level.removeTag("Entities");
+                if (fault == SourceFault.WRONG_ENTITIES) level.setString("Entities", "bad");
                 return disk;
             }
             public void release() { calls.add("release"); }
@@ -227,7 +254,7 @@ final class RestorationEventRoutingTest {
             assertFalse(source.isDead);
             assertFalse(source.captureDrops);
         } else {
-            assertEquals(fault == SourceFault.NONE ? RecallWorldGateway.CheckpointStatus.VERIFIED
+            assertEquals(fault == SourceFault.NONE || fault == SourceFault.UNRELATED_ENTITY ? RecallWorldGateway.CheckpointStatus.VERIFIED
                     : RecallWorldGateway.CheckpointStatus.FAILED, ForgeRecallWorldGateway.retireLoadedRecoverySource(captured, access));
             assertEquals(Arrays.asList("lookup", "remove", "save/read", "release"), calls);
         }

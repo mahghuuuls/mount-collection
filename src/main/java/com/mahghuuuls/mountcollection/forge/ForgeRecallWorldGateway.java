@@ -606,7 +606,14 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
             }
             @Override public void remove(Entity source) { world.removeEntityDangerously(source); }
             @Override public NBTTagCompound saveAndRead() {
-                return attemptSaveDrainAndRead(world, access.chunk).diskChunk;
+                PhysicalFenceAttempt attempt = attemptSaveDrainAndRead(world, access.chunk);
+                recordRecoveryFenceDiagnostic(new FenceDiagnosticContext(
+                        "source-retirement", record.getMountId().toString(), "PREPARED",
+                        "captured_source_absent", world.provider.getDimension(),
+                        access.chunk.x, access.chunk.z), attempt,
+                        inspectSavedRecoverySourceAbsence(attempt.diskChunk,
+                                record.getRecoveryState().getSourceEntityId()));
+                return attempt.diskChunk;
             }
             @Override public void release() { access.release(world); }
         });
@@ -634,13 +641,23 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
                 access.remove(source);
             }
             NBTTagCompound diskChunk = access.saveAndRead();
-            return diskChunk != null && diskChunk.hasKey("Entities", 9)
-                    && !containsRecoverySource(
-                    (NBTTagList) diskChunk.getTag("Entities"), record.getRecoveryState().getSourceEntityId())
-                    ? CheckpointStatus.VERIFIED : CheckpointStatus.FAILED;
+            return inspectSavedRecoverySourceAbsence(
+                    diskChunk, record.getRecoveryState().getSourceEntityId());
         } finally {
             access.release();
         }
+    }
+
+    static CheckpointStatus inspectSavedRecoverySourceAbsence(NBTTagCompound chunkRoot, UUID sourceId) {
+        if (chunkRoot == null || !chunkRoot.hasKey("Level", 10)) {
+            return CheckpointStatus.FAILED;
+        }
+        NBTTagCompound level = chunkRoot.getCompoundTag("Level");
+        if (!level.hasKey("Entities", 9)) {
+            return CheckpointStatus.FAILED;
+        }
+        return containsRecoverySource((NBTTagList) level.getTag("Entities"), sourceId)
+                ? CheckpointStatus.FAILED : CheckpointStatus.VERIFIED;
     }
 
     static boolean containsRecoverySource(NBTTagList entities, UUID sourceId) {
