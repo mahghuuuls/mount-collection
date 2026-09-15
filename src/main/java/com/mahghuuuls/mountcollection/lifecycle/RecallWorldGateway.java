@@ -17,6 +17,20 @@ public interface RecallWorldGateway {
 
     LocateResult locate(EntityPlayerMP player, MountRecord record);
 
+    /** Owns any temporary chunk lease only for this call's synchronous lifecycle action. */
+    interface AbandonmentTarget extends AutoCloseable {
+        LastKnownEvidence location();
+        boolean verify();
+        CheckpointStatus clearAndFence(java.util.function.BooleanSupplier authority);
+        @Override void close();
+    }
+
+    default Optional<AbandonmentTarget> locateAbandonment(
+            MountRecord record, MountProvider provider, boolean boundedRetrieval, boolean pending,
+            LastKnownEvidence locationHint) {
+        return Optional.empty();
+    }
+
     boolean providerSupports(Source source, MountProvider provider);
 
     Optional<Destination> plan(

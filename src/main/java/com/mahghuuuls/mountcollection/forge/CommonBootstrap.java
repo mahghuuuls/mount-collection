@@ -48,6 +48,7 @@ public final class CommonBootstrap {
     private final PendingTransferRecoveryScheduler transferRecovery =
             new PendingTransferRecoveryScheduler();
     private ForgeMountConfiguration configuration;
+    private final ForgeMountNaming naming;
 
     public CommonBootstrap(Logger logger, MountNetwork network) {
         this.logger = logger;
@@ -57,12 +58,14 @@ public final class CommonBootstrap {
                 new ActiveServerClock(),
                 new MountCollectionDiagnostics(logger),
                 new InhibitedIntegration());
+        naming = new ForgeMountNaming(services);
     }
 
     public void preInitialize(File configurationFile) {
         configuration = new ForgeMountConfiguration(configurationFile);
         configuration.ensureGenerated();
         MinecraftForge.EVENT_BUS.register(this);
+        MinecraftForge.EVENT_BUS.register(naming);
         network.preInitialize(services);
         logger.info("Prepared {} configuration at {}", Tags.MOD_NAME, configurationFile.getName());
     }
@@ -98,6 +101,8 @@ public final class CommonBootstrap {
     }
 
     public void serverStopped() {
+        network.clearCollectionSessions();
+        naming.reset();
         transferRecovery.reset();
         services.clearActiveConfig();
     }
@@ -109,6 +114,7 @@ public final class CommonBootstrap {
     @SubscribeEvent
     public void onServerTick(TickEvent.ServerTickEvent event) {
         if (event.phase == TickEvent.Phase.END && services.getActiveConfig().isPresent()) {
+            network.collectionTick();
             ActiveTimeResult advanced = services.getActiveServerClock().advance();
             services.getActiveRepository().ifPresent(repository -> {
                 if (advanced.getStatus() == ActiveTimeResult.Status.OVERFLOW_REBASED) {
@@ -162,6 +168,7 @@ public final class CommonBootstrap {
                 }
             }
             services.getLifecycleMutationExecutor().drainAtServerTickEnd();
+            naming.tick();
         }
     }
 
@@ -193,6 +200,8 @@ public final class CommonBootstrap {
         transferRecovery.worldLoaded();
         services.getLifecycleService().ifPresent(lifecycle ->
                 services.submitLifecycleMutation(lifecycle::reconcilePendingRestorations));
+        services.getLifecycleService().ifPresent(lifecycle ->
+                services.submitLifecycleMutation(lifecycle::reconcilePendingAbandonments));
     }
 
     @SubscribeEvent
@@ -380,6 +389,15 @@ public final class CommonBootstrap {
             return null;
         }
         MountRepository repository = activeRepository.get();
+        com.mahghuuuls.mountcollection.persistence.MountRecord abandoning =
+                repository.findByPhysicalEntity(entity.getUniqueID()).orElse(null);
+        if (abandoning != null && repository.findAbandonment(abandoning.getMountId()).isPresent()) {
+            com.mahghuuuls.mountcollection.persistence.MountId id = abandoning.getMountId();
+            LastKnownEvidence location = new LastKnownEvidence(entity.dimension, entity.posX, entity.posY, entity.posZ);
+            services.getLifecycleService().ifPresent(lifecycle ->
+                    services.submitLifecycleMutation(() -> lifecycle.reconcileAbandonment(id, location)));
+            return null;
+        }
         EntityMountEvidence.ReadResult evidence = EntityMountEvidence.read(entity);
         if (evidence.getMountId().isPresent()) {
             java.util.Optional<TransferOperation> pending =
@@ -423,6 +441,7 @@ public final class CommonBootstrap {
             repository.findByPhysicalEntity(entity.getUniqueID())
                     .ifPresent(record -> EntityMountEvidence.attach(entity, record.getMountId()));
         }
+        naming.reconcile(entity);
         if (status == MountRepository.ReconciliationStatus.INTEGRITY_CONFLICT) {
             Map<String, String> fields = new LinkedHashMap<>();
             fields.put("outcome", status.name());

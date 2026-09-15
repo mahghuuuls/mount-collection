@@ -53,6 +53,18 @@ public final class FatalTransferSafetyException extends RuntimeException {
         return operationId;
     }
 
+    public static FatalTransferSafetyException abandonmentFailure(UUID operationId) {
+        return new FatalTransferSafetyException(operationId,
+                "abandonment safe state could not be acknowledged");
+    }
+
+    private FatalTransferSafetyException(UUID operationId, String reason) {
+        super(reason);
+        this.operationId = Objects.requireNonNull(operationId, "operationId");
+        this.phase = null;
+        this.restorationPhase = null;
+    }
+
     /** A captured source is durable authority even before a restoration journal exists. */
     public static FatalTransferSafetyException capturedSourceFailure(UUID sourceId, Throwable cause) {
         return new FatalTransferSafetyException(sourceId, cause);
@@ -75,7 +87,7 @@ public final class FatalTransferSafetyException extends RuntimeException {
 
     public String boundedDiagnosticDetail() {
         Object activePhase = phase == null ? restorationPhase : phase;
-        if (activePhase == null) { activePhase = "CAPTURED_SOURCE"; }
+        if (activePhase == null) { activePhase = getMessage().startsWith("abandonment") ? "ABANDONMENT" : "CAPTURED_SOURCE"; }
         return "operation=" + operationId + " phase=" + activePhase + " reason=" + getMessage();
     }
 }

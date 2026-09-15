@@ -16,6 +16,9 @@ public interface MountProvider {
 
     ProviderResult<RegistrationProfile> validateRegistration(Entity entity, UUID playerId);
 
+    /** Optional type-based presentation. Must not load entities or access authoritative Recovery state. */
+    default MountPreview describePreview(ResourceLocation entityType) { return null; }
+
     default ProviderResult<ProviderPayload> migratePayload(ProviderPayload payload) {
         ProviderPayload checked = Objects.requireNonNull(payload, "payload");
         return checked.getVersion() == 0

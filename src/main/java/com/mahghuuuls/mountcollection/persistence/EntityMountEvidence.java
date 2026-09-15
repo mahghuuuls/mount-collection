@@ -71,9 +71,10 @@ public final class EntityMountEvidence {
     }
 
     static ReadResult readFrom(NBTTagCompound entityData) {
-        if (!entityData.hasKey(ROOT_KEY, 10)) {
+        if (!entityData.hasKey(ROOT_KEY)) {
             return new ReadResult(Status.NONE, null);
         }
+        if (!entityData.hasKey(ROOT_KEY, 10)) { return new ReadResult(Status.MALFORMED, null); }
         NBTTagCompound root = entityData.getCompoundTag(ROOT_KEY);
         if (!root.hasKey(VERSION_KEY, 3)
                 || root.getInteger(VERSION_KEY) != CURRENT_VERSION
@@ -140,6 +141,11 @@ public final class EntityMountEvidence {
         if (entity.getEntityData().hasKey(ROOT_KEY, 10)) {
             entity.getEntityData().getCompoundTag(ROOT_KEY).removeTag(TRANSFER_OPERATION_ID_KEY);
         }
+    }
+
+    /** The caller must first hold acknowledged abandonment authority for this exact entity. */
+    public static void clearForAbandonment(Entity entity) {
+        entity.getEntityData().removeTag(ROOT_KEY);
     }
 
     static void attachTo(NBTTagCompound entityData, MountId mountId) {

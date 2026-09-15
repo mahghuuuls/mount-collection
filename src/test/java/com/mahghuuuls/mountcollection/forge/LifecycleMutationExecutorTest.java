@@ -21,6 +21,16 @@ import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
 
 final class LifecycleMutationExecutorTest {
+    @Test void abandonmentSafetyFailureEscapesEndAndStopsQueuedWork() {
+        LifecycleMutationExecutor executor = new LifecycleMutationExecutor(new CapturingDiagnostics());
+        FatalTransferSafetyException fatal = FatalTransferSafetyException.abandonmentFailure(UUID.randomUUID());
+        executor.enqueue(() -> { throw fatal; });
+        executor.enqueue(() -> failIfCalled());
+        assertEquals(fatal, assertThrows(FatalTransferSafetyException.class, executor::drainAtServerTickEnd));
+        assertTrue(executor.isFatal());
+        assertEquals(0, executor.queuedCount());
+    }
+    private static void failIfCalled() { throw new AssertionError("mutation after fatal abandonment"); }
 
     @Test
     void callbackFailureCannotBeLostIfAnOuterCommandHandlerCatchesIt() {

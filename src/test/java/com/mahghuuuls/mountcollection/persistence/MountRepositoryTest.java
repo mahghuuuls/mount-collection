@@ -646,6 +646,107 @@ final class MountRepositoryTest {
                 new ProviderPayload(1, payload), deadline, duration);
     }
 
+    @Test
+    void explicitSelectionChecksOwnershipFreshnessAndAcknowledgement() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord first = register(repository, owner, UUID.randomUUID(), null).getRecord().get();
+        MountRecord second = register(repository, owner, UUID.randomUUID(), null).getRecord().get();
+        assertEquals(MountRepository.SelectionStatus.NOT_OWNED,
+                repository.select(UUID.randomUUID(), first.getMountId(), 2L));
+        assertEquals(MountRepository.SelectionStatus.STALE,
+                repository.select(owner, first.getMountId(), 1L));
+        repository.setAcknowledgedPersistence(snapshot -> false);
+        assertEquals(MountRepository.SelectionStatus.PERSISTENCE_FAILURE,
+                repository.select(owner, first.getMountId(), 2L));
+        assertEquals(second.getMountId(), repository.inspectCollection(owner).getSelectedMountId().get());
+        assertEquals(2L, repository.inspectCollection(owner).getRevision());
+        repository.setAcknowledgedPersistence(snapshot -> true);
+        assertEquals(MountRepository.SelectionStatus.SUCCESS,
+                repository.select(owner, first.getMountId(), 2L));
+        long committedRevision = repository.getStoreRevision();
+        assertEquals(3L, repository.inspectCollection(owner).getRevision());
+        assertEquals(MountRepository.SelectionStatus.UNCHANGED,
+                repository.select(owner, first.getMountId(), 2L));
+        assertEquals(committedRevision, repository.getStoreRevision());
+        assertEquals(0L, repository.getRecallCooldownDeadline(owner));
+    }
+
+    @Test
+    void selectedUnavailableSurvivesSaveWithoutClearingIntegrity() {
+        MountSavedData saved = new MountSavedData("test");
+        MountRepository repository = saved.getRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord first = register(repository, owner, UUID.randomUUID(), null).getRecord().get();
+        register(repository, owner, UUID.randomUUID(), null);
+        repository.reportMalformedEvidence(first.getPhysicalEntityId());
+        assertEquals(MountRepository.SelectionStatus.SUCCESS,
+                repository.select(owner, first.getMountId(), 2L));
+        MountSavedData restored = new MountSavedData("test");
+        restored.readFromNBT(saved.writeToNBT(new NBTTagCompound()));
+        assertEquals(first.getMountId(), restored.getRepository()
+                .inspectCollection(owner).getSelectedMountId().get());
+        assertEquals(MountCondition.INTEGRITY_BLOCKED, restored.getRepository()
+                .find(first.getMountId()).get().getCondition());
+        assertFalse(restored.getRepository().prepareRecall(
+                owner, first.getMountId(), first.getPhysicalEntityId()).isPresent());
+    }
+
+    @Test
+    void selectingToAndAwayFromBusyTransferCannotRedirectFinalization() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord other = register(repository, owner, UUID.randomUUID(), null).getRecord().get();
+        MountRecord moving = register(repository, owner, UUID.randomUUID(), null).getRecord().get();
+        TransferOperation operation = operation(moving);
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.beginTransfer(operation));
+        assertEquals(MountRepository.SelectionStatus.SUCCESS,
+                repository.select(owner, other.getMountId(), 2L));
+        assertEquals(MountRepository.SelectionStatus.SUCCESS,
+                repository.select(owner, moving.getMountId(), 3L));
+        assertFalse(repository.prepareRecall(owner, moving.getMountId(), moving.getPhysicalEntityId()).isPresent());
+        assertEquals(MountRepository.SelectionStatus.SUCCESS,
+                repository.select(owner, other.getMountId(), 4L));
+        assertEquals(moving.getMountId(), repository.findTransfer(operation.getOperationId()).get().getMountId());
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.markCandidateSpawnIntent(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.markCandidateSpawned(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.associateTransferCandidate(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.markSourceRemovalIntent(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.markTransferSourceRemoved(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.finishTransfer(operation.getOperationId()));
+        assertEquals(other.getMountId(), repository.inspectCollection(owner).getSelectedMountId().get());
+        assertEquals(operation.getCandidateEntityId(), repository.find(moving.getMountId()).get().getPhysicalEntityId());
+        assertEquals(other.getPhysicalEntityId(), repository.find(other.getMountId()).get().getPhysicalEntityId());
+        assertEquals(200L, repository.getRecallCooldownDeadline(owner));
+    }
+
+    @Test
+    void selectionDuringRecoveryAndRestorationDoesNotReselectAtCompletion() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord other = register(repository, owner, UUID.randomUUID(), null).getRecord().get();
+        MountRecord recovering = register(repository, owner, UUID.randomUUID(), null).getRecord().get();
+        assertEquals(MountRepository.RecoveryStatus.SUCCESS, repository.enterRecovery(owner,
+                recovering.getMountId(), recovering.getPhysicalEntityId(), recovery(recovering, 40L, 40L)));
+        assertEquals(MountRepository.SelectionStatus.SUCCESS, repository.select(owner, other.getMountId(), 2L));
+        assertEquals(MountRepository.SelectionStatus.SUCCESS, repository.select(owner, recovering.getMountId(), 3L));
+        assertEquals(MountRepository.RecoveryStatus.SUCCESS, repository.markRecoveryReady(recovering.getMountId(), 40L));
+        RestorationOperation operation = new RestorationOperation(UUID.randomUUID(), recovering.getMountId(),
+                owner, UUID.randomUUID(), new LastKnownEvidence(0, 8D, 64D, 8D),
+                200L, 200L, RestorationPhase.PREPARED, null);
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.beginRestoration(operation));
+        assertEquals(MountRepository.SelectionStatus.SUCCESS, repository.select(owner, other.getMountId(), 4L));
+        assertEquals(MountRepository.SelectionStatus.SUCCESS, repository.select(owner, recovering.getMountId(), 5L));
+        assertEquals(MountRepository.SelectionStatus.SUCCESS, repository.select(owner, other.getMountId(), 6L));
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.markRestorationSpawnIntent(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.markRestorationCandidateSpawned(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.associateRestorationCandidate(operation.getOperationId()));
+        assertEquals(MountRepository.TransferStatus.SUCCESS, repository.finishRestoration(operation.getOperationId()));
+        assertEquals(other.getMountId(), repository.inspectCollection(owner).getSelectedMountId().get());
+        assertEquals(operation.getCandidateEntityId(), repository.find(recovering.getMountId()).get().getPhysicalEntityId());
+        assertEquals(200L, repository.getRecallCooldownDeadline(owner));
+    }
+
     private static TransferOperation operation(MountRecord record) {
         NBTTagCompound snapshot = new NBTTagCompound();
         snapshot.setString("id", HORSE.toString());

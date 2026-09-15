@@ -40,6 +40,7 @@ public final class MountCollectionMod {
     @Mod.EventHandler
     public void init(FMLInitializationEvent event) {
         bootstrap.initialize();
+        PROXY.initialize();
     }
 
     @Mod.EventHandler

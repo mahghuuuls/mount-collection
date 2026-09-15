@@ -204,6 +204,110 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
     private final PlacementSearch placementSearch = new PlacementSearch();
 
     @Override
+    public Optional<AbandonmentTarget> locateAbandonment(
+            MountRecord record, MountProvider provider, boolean boundedRetrieval, boolean pending,
+            LastKnownEvidence locationHint) {
+        if (record.getPhysicalEntityId() == null || record.getLastKnown() == null) { return Optional.empty(); }
+        // Passive continuation never initializes a dimension or loads a chunk.
+        WorldServer world = DimensionManager.getWorld(locationHint.getDimensionId());
+        if (world == null) { return Optional.empty(); }
+        ChunkAccess lease = null;
+        Entity entity = world.getEntityFromUuid(record.getPhysicalEntityId());
+        if (entity == null && boundedRetrieval) {
+            lease = loadExistingChunk(world, locationHint);
+            if (lease.status != TransferEvidence.Presence.EXACT) { return Optional.empty(); }
+            entity = world.getEntityFromUuid(record.getPhysicalEntityId());
+        }
+        if (entity == null) {
+            if (lease != null) { lease.release(world); }
+            return Optional.empty();
+        }
+        final Entity exact = entity;
+        final ChunkAccess acquired = lease;
+        return Optional.of(new AbandonmentTarget() {
+            private boolean clearing = pending;
+            private boolean cleared;
+            @Override public LastKnownEvidence location() {
+                return new LastKnownEvidence(exact.dimension, exact.posX, exact.posY, exact.posZ);
+            }
+            @Override public boolean verify() {
+                // Run untrusted provider code before, not after, the final identity checks.
+                try { if (!provider.supports(exact)) { return false; } }
+                catch (RuntimeException | LinkageError unavailable) { return false; }
+                if (exact.world != world || world.getEntityFromUuid(record.getPhysicalEntityId()) != exact
+                        || !exact.isEntityAlive() || !record.getEntityTypeId().equals(EntityList.getKey(exact))
+                        || !record.getPhysicalEntityId().equals(exact.getUniqueID())
+                        || EntityMountEvidence.readTransfer(exact).getStatus() != EntityMountEvidence.Status.NONE) { return false; }
+                EntityMountEvidence.ReadResult marker = EntityMountEvidence.read(exact);
+                if (cleared && marker.getStatus() != EntityMountEvidence.Status.NONE) { return false; }
+                if (!(clearing && marker.getStatus() == EntityMountEvidence.Status.NONE)
+                        && !(marker.getStatus() == EntityMountEvidence.Status.VALID
+                                && marker.getMountId().map(record.getMountId()::equals).orElse(false))) { return false; }
+                return true;
+            }
+            @Override public CheckpointStatus clearAndFence(BooleanSupplier authority) {
+                if (!authority.getAsBoolean() || !verify()) { return CheckpointStatus.INTEGRITY_CONFLICT; }
+                LastKnownEvidence before = location();
+                Chunk chunk = world.getChunkProvider().getLoadedChunk(
+                        ((int) Math.floor(before.getX())) >> 4, ((int) Math.floor(before.getZ())) >> 4);
+                if (chunk == null) { return CheckpointStatus.UNAVAILABLE; }
+                // Provider callbacks above may reenter the world. Check authority again
+                // immediately before the only physical mutation.
+                if (!authority.getAsBoolean()) { return CheckpointStatus.INTEGRITY_CONFLICT; }
+                EntityMountEvidence.clearForAbandonment(exact);
+                clearing = true;
+                cleared = true;
+                PhysicalFenceAttempt attempt = attemptSaveDrainAndRead(world, chunk);
+                CheckpointStatus result = attempt.diskChunk == null ? CheckpointStatus.FAILED
+                        : inspectSavedAbandonment(attempt.diskChunk, record);
+                if (result == CheckpointStatus.VERIFIED
+                        && (!verify() || !before.equals(location()) || !authority.getAsBoolean()
+                                || EntityMountEvidence.read(exact).getStatus() != EntityMountEvidence.Status.NONE)) {
+                    result = CheckpointStatus.INTEGRITY_CONFLICT;
+                }
+                recordFenceDiagnostic(new FenceDiagnosticContext(
+                        record.getMountId().toString(), record.getMountId().toString(),
+                        "ABANDONMENT", "corroboration_absent", exact.dimension, chunk.x, chunk.z), attempt, result);
+                return result;
+            }
+            @Override public void close() { if (acquired != null) { acquired.release(world); } }
+        });
+    }
+
+    static CheckpointStatus inspectSavedAbandonment(NBTTagCompound root, MountRecord record) {
+        if (!root.hasKey("Level", 10) || !root.getCompoundTag("Level").hasKey("Entities", 9)) {
+            return CheckpointStatus.INTEGRITY_CONFLICT;
+        }
+        NBTTagList entities = root.getCompoundTag("Level").getTagList("Entities", 10);
+        NBTTagCompound match = null;
+        java.util.ArrayDeque<NBTTagCompound> pending = new java.util.ArrayDeque<>();
+        for (int i = 0; i < entities.tagCount(); i++) { pending.add(entities.getCompoundTagAt(i)); }
+        while (!pending.isEmpty()) {
+            NBTTagCompound raw = pending.removeFirst();
+            if (raw.hasUniqueId("UUID") && record.getPhysicalEntityId().equals(raw.getUniqueId("UUID"))) {
+                if (match != null) { return CheckpointStatus.INTEGRITY_CONFLICT; }
+                match = raw;
+            }
+            if (raw.hasKey("Passengers")) {
+                if (!raw.hasKey("Passengers", 9)) { return CheckpointStatus.INTEGRITY_CONFLICT; }
+                NBTTagList passengers = raw.getTagList("Passengers", 10);
+                for (int i = 0; i < passengers.tagCount(); i++) { pending.add(passengers.getCompoundTagAt(i)); }
+            }
+        }
+        if (match == null) { return CheckpointStatus.FAILED; }
+        if (!record.getEntityTypeId().toString().equals(match.getString("id"))
+                || EntityMountEvidence.readSavedEntity(match).getStatus() != EntityMountEvidence.Status.NONE
+                || EntityMountEvidence.readSavedTransfer(match).getStatus() != EntityMountEvidence.Status.NONE) {
+            return CheckpointStatus.INTEGRITY_CONFLICT;
+        }
+        if (match.hasKey("Health") && (!match.hasKey("Health", 99)
+                || !Float.isFinite(match.getFloat("Health")) || match.getFloat("Health") <= 0)) {
+            return CheckpointStatus.INTEGRITY_CONFLICT;
+        }
+        return CheckpointStatus.VERIFIED;
+    }
+
+    @Override
     public LocateResult locate(EntityPlayerMP player, MountRecord record) {
         if (record.getPhysicalEntityId() == null || record.getLastKnown() == null) {
             return LocateResult.missing();

@@ -21,6 +21,76 @@ import org.junit.jupiter.api.Test;
 
 final class MountStoreCodecTest {
 
+    @Test void renameIsOwnerScopedDurableAndDoesNotChangeSelectionOrOrdinals() {
+        MountSavedData data = new MountSavedData("test");
+        MountRepository repository = data.getRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord first = register(repository, owner, UUID.randomUUID()).getRecord().get();
+        MountRecord second = register(repository, owner, UUID.randomUUID()).getRecord().get();
+        long revision = repository.inspectCollection(owner).getRevision();
+        assertEquals(MountRepository.RenameStatus.NOT_OWNED, repository.rename(UUID.randomUUID(), first.getMountId(), revision, "A"));
+        assertEquals(MountRepository.RenameStatus.STALE, repository.rename(owner, first.getMountId(), revision - 1, "A"));
+        assertEquals(MountRepository.RenameStatus.INVALID, repository.rename(owner, first.getMountId(), revision, "\nA"));
+        repository.setAcknowledgedPersistence(ignored -> false);
+        assertEquals(MountRepository.RenameStatus.PERSISTENCE_FAILURE, repository.rename(owner, first.getMountId(), revision, "A"));
+        assertEquals(null, repository.find(first.getMountId()).get().getNaming().getCustomName());
+        assertEquals(revision, repository.inspectCollection(owner).getRevision());
+        repository.setAcknowledgedPersistence(ignored -> true);
+        assertEquals(MountRepository.RenameStatus.SUCCESS, repository.rename(owner, first.getMountId(), revision, " A "));
+        assertEquals(MountRepository.RenameStatus.UNCHANGED, repository.rename(owner, first.getMountId(), revision, "A"));
+        assertEquals(MountRepository.RenameStatus.SUCCESS, repository.rename(owner, second.getMountId(), revision + 1, "A"));
+        MountSavedData loaded = new MountSavedData("test");
+        loaded.readFromNBT(data.writeToNBT(new NBTTagCompound()));
+        for (MountRecord record : loaded.getRepository().getOwnedRecords(owner)) {
+            assertEquals("A", record.getNaming().getCustomName());
+            assertTrue(record.getNaming().isPending());
+            assertEquals(1, record.getNaming().getRevision());
+        }
+        assertEquals(first.getFallbackOrdinal(), loaded.getRepository().find(first.getMountId()).get().getFallbackOrdinal());
+        assertEquals(second.getMountId(), loaded.getRepository().inspectCollection(owner).getSelectedMountId().get());
+        assertEquals(MountRepository.RenameStatus.SUCCESS, loaded.getRepository().rename(owner, first.getMountId(), revision + 2, ""));
+        assertEquals("", loaded.getRepository().find(first.getMountId()).get().getNaming().getCustomName());
+    }
+
+    @Test void namingSurvivesRecoveryCopiesAndBusyRenameIsRejected() {
+        MountRepository repository = new MountRepository();
+        MountRecord original = register(repository, UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        repository.rename(original.getOwnerId(), original.getMountId(), 1, "Before recovery");
+        repository.enterRecovery(original.getOwnerId(), original.getMountId(), original.getPhysicalEntityId(),
+                new RecoveryState(original.getPhysicalEntityId(), original.getLastKnown(),
+                        new ProviderPayload(1, new NBTTagCompound()), 0, 0));
+        long revision = repository.inspectCollection(original.getOwnerId()).getRevision();
+        assertEquals(MountRepository.RenameStatus.SUCCESS, repository.rename(original.getOwnerId(), original.getMountId(), revision, "Recovering"));
+        RestorationOperation operation = new RestorationOperation(UUID.randomUUID(), original.getMountId(),
+                original.getOwnerId(), UUID.randomUUID(), new LastKnownEvidence(0, 4, 64, 4),
+                0, 0, RestorationPhase.PREPARED, null);
+        repository.beginRestoration(operation);
+        assertEquals("Recovering", repository.find(original.getMountId()).get().getNaming().getCustomName());
+        assertEquals(MountRepository.RenameStatus.BUSY, repository.rename(original.getOwnerId(), original.getMountId(),
+                repository.inspectCollection(original.getOwnerId()).getRevision(), "Busy"));
+    }
+
+    @Test void legacyRecoverySchemaMigratesToUnobservedNamingAndMalformedCurrentNameIsRetained() {
+        MountSavedData data = new MountSavedData("test");
+        MountRecord original = register(data.getRepository(), UUID.randomUUID(), UUID.randomUUID()).getRecord().get();
+        NBTTagCompound legacy = data.writeToNBT(new NBTTagCompound());
+        legacy.setInteger("RootVersion", 6);
+        legacy.removeTag("Abandonments");
+        NBTTagCompound record = legacy.getTagList("Records", 10).getCompoundTagAt(0);
+        record.setInteger("Version", 3); record.removeTag("Naming");
+        MountSavedData loaded = new MountSavedData("test");
+        loaded.readFromNBT(legacy);
+        assertEquals(MountCondition.LIVING, loaded.getRepository().find(original.getMountId()).get().getCondition());
+        assertEquals(null, loaded.getRepository().find(original.getMountId()).get().getNaming().getCustomName());
+        NBTTagCompound rewritten = loaded.writeToNBT(new NBTTagCompound());
+        assertEquals(MountStoreCodec.CURRENT_ROOT_VERSION, rewritten.getInteger("RootVersion"));
+        NBTTagCompound raw = rewritten.getTagList("Records", 10).getCompoundTagAt(0);
+        raw.getCompoundTag("Naming").setString("CustomName", "Invalid\n");
+        MountSavedData invalid = new MountSavedData("test");
+        invalid.readFromNBT(rewritten);
+        assertEquals(MountCondition.INTEGRITY_BLOCKED, invalid.getRepository().find(original.getMountId()).get().getCondition());
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.EnumSource(RestorationPhase.class)
     void everyRestorationPhaseRoundTripsWithoutLosingAuthority(RestorationPhase phase) {
@@ -793,7 +863,9 @@ final class MountStoreCodecTest {
 
         assertEquals(MountCondition.INTEGRITY_BLOCKED,
                 restored.getRepository().find(selected.getMountId()).get().getCondition());
-        assertFalse(restored.getRepository().inspectCollection(owner).getSelectedMountId().isPresent());
+        assertEquals(selected.getMountId(), restored.getRepository().inspectCollection(owner).getSelectedMountId().get());
+        assertFalse(restored.getRepository().prepareRecall(owner,
+                selected.getMountId(), selected.getPhysicalEntityId()).isPresent());
     }
 
     @Test
@@ -815,7 +887,9 @@ final class MountStoreCodecTest {
         assertEquals(MountCondition.PROVIDER_UNAVAILABLE,
                 restored.getRepository().find(record.getMountId()).get().getCondition());
         assertTrue(restored.getRepository().findByPhysicalEntity(record.getPhysicalEntityId()).isPresent());
-        assertFalse(restored.getRepository().inspectCollection(owner).getSelectedMountId().isPresent());
+        assertEquals(record.getMountId(), restored.getRepository().inspectCollection(owner).getSelectedMountId().get());
+        assertFalse(restored.getRepository().prepareRecall(owner,
+                record.getMountId(), record.getPhysicalEntityId()).isPresent());
         assertEquals(
                 MountRepository.ReconciliationStatus.VERIFIED,
                 restored.getRepository().reconcile(

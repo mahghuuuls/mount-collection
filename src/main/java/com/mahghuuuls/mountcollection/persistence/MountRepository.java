@@ -49,6 +49,15 @@ public final class MountRepository {
         REJECTED
     }
 
+    public enum SelectionStatus {
+        SUCCESS,
+        UNCHANGED,
+        STALE,
+        NOT_OWNED,
+        READ_ONLY,
+        PERSISTENCE_FAILURE
+    }
+
     public enum TransferStatus {
         SUCCESS,
         REJECTED,
@@ -218,6 +227,7 @@ public final class MountRepository {
     private final Map<UUID, PlayerState> players = new LinkedHashMap<>();
     private final Map<UUID, TransferOperation> transfers = new LinkedHashMap<>();
     private final Map<UUID, RestorationOperation> restorations = new LinkedHashMap<>();
+    private final Map<UUID, AbandonmentOperation> abandonments = new LinkedHashMap<>();
     private final List<NBTTagCompound> retainedMalformedRecords = new ArrayList<>();
     private final List<NBTTagCompound> retainedMalformedPlayers = new ArrayList<>();
     private final List<NBTTagCompound> retainedMalformedTransfers = new ArrayList<>();
@@ -374,11 +384,106 @@ public final class MountRepository {
         return player == null ? 0L : player.recallCooldownDeadline;
     }
 
+    /**
+     * Changes only the owner's future recall target. A selection is not permission
+     * to summon: quarantined and busy records keep all of their lifecycle guards.
+     * Pending operations remain bound to their own persisted identity.
+     */
+    public synchronized SelectionStatus select(
+            UUID ownerId, MountId mountId, long expectedRevision) {
+        Objects.requireNonNull(ownerId, "ownerId");
+        Objects.requireNonNull(mountId, "mountId");
+        if (readOnly) {
+            return SelectionStatus.READ_ONLY;
+        }
+        MountRecord record = records.get(mountId);
+        PlayerState player = players.get(ownerId);
+        if (record == null || player == null || !ownerId.equals(record.getOwnerId())) {
+            return SelectionStatus.NOT_OWNED;
+        }
+        // A repeated Select whose meaning is unchanged is an idempotent no-op,
+        // even if another presentation update has made its revision stale.
+        if (!player.selectionIntegrityBlocked && mountId.equals(player.selectedMountId)) {
+            return SelectionStatus.UNCHANGED;
+        }
+        if (expectedRevision != player.revision || player.revision == Long.MAX_VALUE) {
+            return SelectionStatus.STALE;
+        }
+        RepositorySnapshot before = snapshot();
+        player.selectedMountId = mountId;
+        player.selectionIntegrityBlocked = false;
+        player.revision++;
+        return durableCheckpoint(before)
+                ? SelectionStatus.SUCCESS : SelectionStatus.PERSISTENCE_FAILURE;
+    }
+
+    public enum RenameStatus { SUCCESS, UNCHANGED, STALE, NOT_OWNED, UNAVAILABLE, BUSY, INVALID, READ_ONLY, PERSISTENCE_FAILURE }
+
+    /** Persist naming intent without resolving an entity or loading any world data. */
+    public synchronized RenameStatus rename(UUID ownerId, MountId mountId, long expectedRevision, String input) {
+        if (readOnly) { return RenameStatus.READ_ONLY; }
+        MountRecord record = records.get(mountId);
+        PlayerState player = players.get(ownerId);
+        if (record == null || player == null || !record.getOwnerId().equals(ownerId)) { return RenameStatus.NOT_OWNED; }
+        if (record.getCondition() == MountCondition.OPERATION_IN_PROGRESS) { return RenameStatus.BUSY; }
+        if (record.getCondition() != MountCondition.LIVING && record.getCondition() != MountCondition.RECOVERING
+                && record.getCondition() != MountCondition.READY_FOR_RECALL) { return RenameStatus.UNAVAILABLE; }
+        final String name;
+        try { name = com.mahghuuuls.mountcollection.collection.MountNaming.normalize(input); }
+        catch (IllegalArgumentException | NullPointerException invalid) { return RenameStatus.INVALID; }
+        if (name.equals(record.getNaming().getCustomName())) { return RenameStatus.UNCHANGED; }
+        if (expectedRevision != player.revision || player.revision == Long.MAX_VALUE
+                || record.getNaming().getRevision() == Long.MAX_VALUE) { return RenameStatus.STALE; }
+        RepositorySnapshot before = snapshot();
+        records.put(mountId, record.withNaming(record.getNaming().renamed(name)));
+        player.revision++;
+        return durableCheckpoint(before) ? RenameStatus.SUCCESS : RenameStatus.PERSISTENCE_FAILURE;
+    }
+
     public synchronized CooldownState getRecallCooldown(UUID ownerId) {
         PlayerState player = players.get(ownerId);
         return player == null
                 ? new CooldownState(0L, 0L)
                 : new CooldownState(player.recallCooldownDeadline, player.recallCooldownDuration);
+    }
+
+    public synchronized List<MountRecord> getNamingCandidates() {
+        List<MountRecord> result = new ArrayList<>();
+        if (!readOnly) {
+            for (MountRecord record : records.values()) {
+                if (record.getCondition() == MountCondition.LIVING && (record.getNaming().isPending()
+                        || record.getNaming().getCustomName() == null)) { result.add(record); }
+            }
+        }
+        return Collections.unmodifiableList(result);
+    }
+
+    public synchronized boolean acknowledgeNameApplied(MountId id, UUID physicalId, long nameRevision) {
+        MountRecord record = records.get(id);
+        if (readOnly || record == null || record.getCondition() != MountCondition.LIVING
+                || !physicalId.equals(record.getPhysicalEntityId()) || !record.getNaming().isPending()
+                || nameRevision != record.getNaming().getRevision()) { return false; }
+        RepositorySnapshot before = snapshot();
+        records.put(id, record.withNaming(record.getNaming().applied()));
+        return durableCheckpoint(before);
+    }
+
+    public synchronized RenameStatus observeNativeName(MountId id, UUID physicalId, long nameRevision, String input) {
+        MountRecord record = records.get(id);
+        if (readOnly) { return RenameStatus.READ_ONLY; }
+        if (record == null || record.getCondition() != MountCondition.LIVING
+                || !physicalId.equals(record.getPhysicalEntityId())) { return RenameStatus.UNAVAILABLE; }
+        if (record.getNaming().isPending() || record.getNaming().getRevision() != nameRevision) { return RenameStatus.STALE; }
+        final String name;
+        try { name = com.mahghuuuls.mountcollection.collection.MountNaming.normalize(input); }
+        catch (IllegalArgumentException | NullPointerException invalid) { return RenameStatus.INVALID; }
+        if (name.equals(record.getNaming().getCustomName())) { return RenameStatus.UNCHANGED; }
+        PlayerState player = players.get(record.getOwnerId());
+        if (player == null || player.revision == Long.MAX_VALUE || nameRevision == Long.MAX_VALUE) { return RenameStatus.STALE; }
+        RepositorySnapshot before = snapshot();
+        records.put(id, record.withNaming(record.getNaming().renamed(name).applied()));
+        player.revision++;
+        return durableCheckpoint(before) ? RenameStatus.SUCCESS : RenameStatus.PERSISTENCE_FAILURE;
     }
 
     public synchronized boolean normalizeRecallCooldown(
@@ -1049,6 +1154,76 @@ public final class MountRepository {
                 : TransferStatus.PERSISTENCE_FAILURE;
     }
 
+    public synchronized Optional<AbandonmentOperation> findAbandonment(MountId mountId) {
+        return abandonments.values().stream().filter(op -> op.getMountId().equals(mountId)).findFirst();
+    }
+
+    public synchronized List<AbandonmentOperation> getPendingAbandonments() {
+        return Collections.unmodifiableList(new ArrayList<>(abandonments.values()));
+    }
+
+    public synchronized boolean isCurrentAbandonment(AbandonmentOperation operation) {
+        MountRecord record = records.get(operation.getMountId());
+        return !readOnly && abandonments.get(operation.getOperationId()) == operation
+                && operation.matches(record) && record.getCondition() == MountCondition.OPERATION_IN_PROGRESS
+                && operation.getLocation().equals(record.getLastKnown());
+    }
+
+    public synchronized TransferStatus beginAbandonment(AbandonmentOperation operation, long revision) {
+        MountRecord record = records.get(operation.getMountId());
+        PlayerState player = players.get(operation.getOwnerId());
+        if (readOnly || !operation.matches(record) || record.getCondition() != MountCondition.LIVING
+                || player == null || player.revision != revision || player.revision == Long.MAX_VALUE
+                || abandonments.containsKey(operation.getOperationId())
+                || transfers.containsKey(operation.getOperationId()) || restorations.containsKey(operation.getOperationId())
+                || findAbandonment(operation.getMountId()).isPresent()
+                || findTransferByMount(operation.getMountId()).isPresent()
+                || findRestorationByMount(operation.getMountId()).isPresent()) {
+            return TransferStatus.REJECTED;
+        }
+        RepositorySnapshot before = snapshot();
+        abandonments.put(operation.getOperationId(), operation);
+        records.put(operation.getMountId(), record.withLastKnown(operation.getLocation()).operationInProgress());
+        player.revision++;
+        return abandonmentCheckpoint(before, operation);
+    }
+
+    public synchronized TransferStatus relocateAbandonment(AbandonmentOperation operation, LastKnownEvidence location) {
+        if (!isCurrentAbandonment(operation)) { return TransferStatus.REJECTED; }
+        if (location.equals(operation.getLocation())) { return TransferStatus.SUCCESS; }
+        RepositorySnapshot before = snapshot();
+        abandonments.put(operation.getOperationId(), operation.at(location));
+        records.put(operation.getMountId(), records.get(operation.getMountId()).withLastKnown(location));
+        return abandonmentCheckpoint(before, operation);
+    }
+
+    /** Called only after the gateway has fenced saved absence on the exact living entity. */
+    public synchronized TransferStatus finishAbandonment(AbandonmentOperation operation) {
+        if (!isCurrentAbandonment(operation)) { return TransferStatus.REJECTED; }
+        PlayerState player = players.get(operation.getOwnerId());
+        if (player == null || player.revision == Long.MAX_VALUE) { return TransferStatus.REJECTED; }
+        RepositorySnapshot before = snapshot();
+        records.remove(operation.getMountId());
+        physicalIndex.remove(operation.getPhysicalId());
+        Set<MountId> owned = ownerIndex.get(operation.getOwnerId());
+        if (owned != null) { owned.remove(operation.getMountId()); }
+        abandonments.remove(operation.getOperationId());
+        if (operation.getMountId().equals(player.selectedMountId)) { player.selectedMountId = null; }
+        player.revision++;
+        return abandonmentCheckpoint(before, operation);
+    }
+
+    private TransferStatus abandonmentCheckpoint(RepositorySnapshot before, AbandonmentOperation operation) {
+        if (durableCheckpoint(before)) { return TransferStatus.SUCCESS; }
+        // A failed read-back may follow a successful disk write. Acknowledge the restored
+        // safe state before returning: pre-intent rollback or post-intent pending authority.
+        if (!durableCheckpoint(snapshot())) {
+            throw com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException.abandonmentFailure(
+                    operation.getOperationId());
+        }
+        return TransferStatus.PERSISTENCE_FAILURE;
+    }
+
     private boolean durableCheckpoint(RepositorySnapshot before) {
         if (storeRevision == Long.MAX_VALUE) {
             restoreAfterFailedCommit(before, storeRevision);
@@ -1084,6 +1259,10 @@ public final class MountRepository {
     public synchronized ReconciliationStatus reconcile(
             UUID physicalEntityId, MountId corroboratingMountId, LastKnownEvidence evidence) {
         MountId authoritativeId = physicalIndex.get(physicalEntityId);
+        if (authoritativeId != null && findAbandonment(authoritativeId).isPresent()) {
+            // Only the operation-specific verifier may interpret absent corroboration.
+            return ReconciliationStatus.VERIFIED;
+        }
         if (corroboratingMountId == null) {
             if (authoritativeId == null) {
                 return ReconciliationStatus.UNTRACKED;
@@ -1207,6 +1386,7 @@ public final class MountRepository {
                 players,
                 transfers,
                 restorations,
+                abandonments,
                 retainedMalformedRecords,
                 retainedMalformedPlayers,
                 retainedMalformedTransfers,
@@ -1231,6 +1411,8 @@ public final class MountRepository {
         transfers.putAll(snapshot.transfers);
         restorations.clear();
         restorations.putAll(snapshot.restorations);
+        abandonments.clear();
+        abandonments.putAll(snapshot.abandonments);
         copyRaw(snapshot.retainedMalformedRecords, retainedMalformedRecords);
         copyRaw(snapshot.retainedMalformedPlayers, retainedMalformedPlayers);
         copyRaw(snapshot.retainedMalformedTransfers, retainedMalformedTransfers);
@@ -1370,17 +1552,24 @@ public final class MountRepository {
                 }
             }
         }
+        for (AbandonmentOperation operation : abandonments.values()) {
+            MountRecord record = records.get(operation.getMountId());
+            if (!operation.matches(record) || record.getCondition() != MountCondition.OPERATION_IN_PROGRESS
+                    || !operation.getLocation().equals(record.getLastKnown())
+                    || findTransferByMount(operation.getMountId()).isPresent()
+                    || findRestorationByMount(operation.getMountId()).isPresent()) {
+                readOnly = true;
+            }
+        }
         for (Map.Entry<UUID, PlayerState> entry : players.entrySet()) {
             MountRecord selected = entry.getValue().selectedMountId == null
                     ? null
                     : records.get(entry.getValue().selectedMountId);
+            // Validate the selection reference, not summonability. A retained
+            // unavailable entry is still selectable; its record guards recall.
             entry.getValue().selectionIntegrityBlocked = selected == null
                     ? entry.getValue().selectedMountId != null
-                    : !entry.getKey().equals(selected.getOwnerId())
-                            || (selected.getCondition() != MountCondition.LIVING
-                                    && selected.getCondition() != MountCondition.OPERATION_IN_PROGRESS
-                                    && selected.getCondition() != MountCondition.RECOVERING
-                                    && selected.getCondition() != MountCondition.READY_FOR_RECALL);
+                    : !entry.getKey().equals(selected.getOwnerId());
         }
     }
 
@@ -1462,6 +1651,7 @@ public final class MountRepository {
         final Map<UUID, PlayerState> players;
         final Map<UUID, TransferOperation> transfers;
         final Map<UUID, RestorationOperation> restorations;
+        final Map<UUID, AbandonmentOperation> abandonments;
         final List<NBTTagCompound> retainedMalformedRecords;
         final List<NBTTagCompound> retainedMalformedPlayers;
         final List<NBTTagCompound> retainedMalformedTransfers;
@@ -1484,10 +1674,30 @@ public final class MountRepository {
                 long activeTick,
                 long storeRevision,
                 boolean readOnly) {
+            this(records, players, transfers, restorations, Collections.emptyMap(),
+                    retainedMalformedRecords, retainedMalformedPlayers, retainedMalformedTransfers,
+                    retainedMalformedRestorations, nextRegistrationOrder, activeTick, storeRevision, readOnly);
+        }
+
+        RepositorySnapshot(
+                Map<MountId, MountRecord> records,
+                Map<UUID, PlayerState> players,
+                Map<UUID, TransferOperation> transfers,
+                Map<UUID, RestorationOperation> restorations,
+                Map<UUID, AbandonmentOperation> abandonments,
+                List<NBTTagCompound> retainedMalformedRecords,
+                List<NBTTagCompound> retainedMalformedPlayers,
+                List<NBTTagCompound> retainedMalformedTransfers,
+                List<NBTTagCompound> retainedMalformedRestorations,
+                long nextRegistrationOrder,
+                long activeTick,
+                long storeRevision,
+                boolean readOnly) {
             this.records = new LinkedHashMap<>(records);
             this.players = copyPlayers(players);
             this.transfers = new LinkedHashMap<>(transfers);
             this.restorations = new LinkedHashMap<>(restorations);
+            this.abandonments = new LinkedHashMap<>(abandonments);
             this.retainedMalformedRecords = copyRaw(retainedMalformedRecords);
             this.retainedMalformedPlayers = copyRaw(retainedMalformedPlayers);
             this.retainedMalformedTransfers = copyRaw(retainedMalformedTransfers);

@@ -6,5 +6,6 @@ public enum DiagnosticCategory {
     LIFECYCLE,
     PROVIDER,
     CLOCK,
-    INTEGRATION
+    INTEGRATION,
+    COLLECTION
 }

@@ -2,6 +2,7 @@ package com.mahghuuuls.mountcollection.persistence;
 
 import com.mahghuuuls.mountcollection.api.MountCharacteristics;
 import com.mahghuuuls.mountcollection.api.ProviderPayload;
+import com.mahghuuuls.mountcollection.collection.MountNaming;
 import java.util.Objects;
 import java.util.UUID;
 import net.minecraft.nbt.NBTTagCompound;
@@ -9,7 +10,7 @@ import net.minecraft.util.ResourceLocation;
 
 public final class MountRecord {
 
-    public static final int CURRENT_VERSION = 3;
+    public static final int CURRENT_VERSION = 4;
 
     private final MountId mountId;
     private final UUID ownerId;
@@ -27,6 +28,7 @@ public final class MountRecord {
     private final NBTTagCompound providerPayload;
     private final RecoveryState recoveryState;
     private final NBTTagCompound preservedRaw;
+    private final MountNaming naming;
 
     MountRecord(
             MountId mountId,
@@ -87,6 +89,19 @@ public final class MountRecord {
             NBTTagCompound providerPayload,
             RecoveryState recoveryState,
             NBTTagCompound preservedRaw) {
+        this(mountId, ownerId, providerId, entityTypeId, fallbackTypeKey, fallbackOrdinal,
+                registrationOrder, physicalEntityId, lastKnown, condition, integrityReason,
+                characteristics, providerPayloadVersion, providerPayload, recoveryState,
+                preservedRaw, MountNaming.unobserved());
+    }
+
+    MountRecord(MountId mountId, UUID ownerId, ResourceLocation providerId,
+            ResourceLocation entityTypeId, String fallbackTypeKey, int fallbackOrdinal,
+            long registrationOrder, UUID physicalEntityId, LastKnownEvidence lastKnown,
+            MountCondition condition, String integrityReason, MountCharacteristics characteristics,
+            int providerPayloadVersion, NBTTagCompound providerPayload, RecoveryState recoveryState,
+            NBTTagCompound preservedRaw, MountNaming naming) {
+        this.naming = Objects.requireNonNull(naming, "naming");
         this.mountId = Objects.requireNonNull(mountId, "mountId");
         this.ownerId = Objects.requireNonNull(ownerId, "ownerId");
         this.providerId = Objects.requireNonNull(providerId, "providerId");
@@ -154,6 +169,13 @@ public final class MountRecord {
     }
     public NBTTagCompound copyProviderPayload() { return providerPayload.copy(); }
     public RecoveryState getRecoveryState() { return recoveryState; }
+    public MountNaming getNaming() { return naming; }
+    MountRecord withNaming(MountNaming value) {
+        return new MountRecord(mountId, ownerId, providerId, entityTypeId, fallbackTypeKey,
+                fallbackOrdinal, registrationOrder, physicalEntityId, lastKnown, condition,
+                integrityReason, characteristics, providerPayloadVersion, providerPayload,
+                recoveryState, preservedRaw, value);
+    }
     NBTTagCompound copyPreservedRaw() { return preservedRaw == null ? null : preservedRaw.copy(); }
 
     MountRecord withLastKnown(LastKnownEvidence evidence) {
@@ -191,7 +213,7 @@ public final class MountRecord {
                 mountId, ownerId, providerId, entityTypeId, fallbackTypeKey,
                 fallbackOrdinal, registrationOrder, null, null,
                 ready ? MountCondition.READY_FOR_RECALL : MountCondition.RECOVERING,
-                null, characteristics, providerPayloadVersion, providerPayload, state, preservedRaw);
+                null, characteristics, providerPayloadVersion, providerPayload, state, preservedRaw, naming);
     }
 
     MountRecord recoveryReady() {
@@ -202,7 +224,7 @@ public final class MountRecord {
                 mountId, ownerId, providerId, entityTypeId, fallbackTypeKey,
                 fallbackOrdinal, registrationOrder, null, null,
                 MountCondition.READY_FOR_RECALL, null, characteristics,
-                providerPayloadVersion, providerPayload, recoveryState, preservedRaw);
+                providerPayloadVersion, providerPayload, recoveryState, preservedRaw, naming);
     }
 
     MountRecord restorationInProgress(UUID candidateId, LastKnownEvidence evidence) {
@@ -214,7 +236,7 @@ public final class MountRecord {
                 mountId, ownerId, providerId, entityTypeId, fallbackTypeKey,
                 fallbackOrdinal, registrationOrder, candidateId, evidence,
                 MountCondition.OPERATION_IN_PROGRESS, null, characteristics,
-                providerPayloadVersion, providerPayload, recoveryState, preservedRaw);
+                providerPayloadVersion, providerPayload, recoveryState, preservedRaw, naming);
     }
 
     MountRecord restorationCompleted() {
@@ -226,20 +248,20 @@ public final class MountRecord {
                 mountId, ownerId, providerId, entityTypeId, fallbackTypeKey,
                 fallbackOrdinal, registrationOrder, physicalEntityId, lastKnown,
                 MountCondition.LIVING, null, characteristics,
-                providerPayloadVersion, providerPayload, null, preservedRaw);
+                providerPayloadVersion, providerPayload, null, preservedRaw, naming);
     }
 
     MountRecord restorationCancelled() {
         return new MountRecord(mountId, ownerId, providerId, entityTypeId, fallbackTypeKey,
                 fallbackOrdinal, registrationOrder, null, null, MountCondition.READY_FOR_RECALL,
-                null, characteristics, providerPayloadVersion, providerPayload, recoveryState, preservedRaw);
+                null, characteristics, providerPayloadVersion, providerPayload, recoveryState, preservedRaw, naming);
     }
 
     MountRecord withRecoverySourceEvidence(LastKnownEvidence evidence) {
         return new MountRecord(mountId, ownerId, providerId, entityTypeId, fallbackTypeKey,
                 fallbackOrdinal, registrationOrder, physicalEntityId, lastKnown, condition,
                 integrityReason, characteristics, providerPayloadVersion, providerPayload,
-                recoveryState.withSourceEvidence(evidence), preservedRaw);
+                recoveryState.withSourceEvidence(evidence), preservedRaw, naming);
     }
 
     MountRecord integrityBlocked(String reason) {
@@ -255,7 +277,7 @@ public final class MountRecord {
                 mountId, ownerId, providerId, entityTypeId, fallbackTypeKey,
                 fallbackOrdinal, registrationOrder, physicalEntityId, lastKnown,
                 MountCondition.LIVING, null, characteristics, payload.getVersion(),
-                payload.copyData(), null, preservedRaw);
+                payload.copyData(), null, preservedRaw, naming);
     }
 
     private MountRecord copy(
@@ -267,7 +289,7 @@ public final class MountRecord {
                 mountId, ownerId, providerId, entityTypeId, fallbackTypeKey,
                 fallbackOrdinal, registrationOrder, nextPhysicalId, nextEvidence,
                 nextCondition, nextReason, characteristics, providerPayloadVersion,
-                providerPayload, recoveryState, preservedRaw);
+                providerPayload, recoveryState, preservedRaw, naming);
     }
 
     private static String requireBounded(String value, String name, int maximumLength) {

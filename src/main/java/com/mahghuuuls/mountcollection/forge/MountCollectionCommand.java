@@ -248,7 +248,9 @@ final class MountCollectionCommand extends CommandBase {
                                                 ? ""
                                                 : ":reason=" + bounded(
                                                         transfer.get().getIntegrityReason()))
-                                : " transfer=none")));
+                                : " transfer=none")
+                        + " abandonment=" + repository.findAbandonment(mountId)
+                                .map(operation -> operation.getOperationId().toString()).orElse("none")));
     }
 
     @Override

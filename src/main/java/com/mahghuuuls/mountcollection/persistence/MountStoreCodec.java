@@ -3,6 +3,7 @@ package com.mahghuuuls.mountcollection.persistence;
 import com.mahghuuuls.mountcollection.api.MountCharacteristics;
 import com.mahghuuuls.mountcollection.api.MountTrait;
 import com.mahghuuuls.mountcollection.api.PlacementProfile;
+import com.mahghuuuls.mountcollection.collection.MountNaming;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -20,7 +21,7 @@ import net.minecraft.util.ResourceLocation;
 
 final class MountStoreCodec {
 
-    static final int CURRENT_ROOT_VERSION = 6;
+    static final int CURRENT_ROOT_VERSION = 8;
     private static final int INT_TAG = 3;
     private static final int LONG_TAG = 4;
     private static final int DOUBLE_TAG = 6;
@@ -39,7 +40,7 @@ final class MountStoreCodec {
 
     static boolean hasValidRootShape(NBTTagCompound root) {
         int version = readRootVersion(root);
-        if (version == CURRENT_ROOT_VERSION) {
+        if (version == CURRENT_ROOT_VERSION || version == 7 || version == 6) {
             return root.hasKey("RootVersion", INT_TAG)
                     && root.hasKey("NextRegistrationOrder", LONG_TAG)
                     && root.hasKey("ActiveTick", LONG_TAG)
@@ -47,7 +48,8 @@ final class MountStoreCodec {
                     && hasRequiredCompoundList(root, "Records")
                     && hasRequiredCompoundList(root, "Players")
                     && hasRequiredCompoundList(root, "Transfers")
-                    && hasRequiredCompoundList(root, "Restorations");
+                    && hasRequiredCompoundList(root, "Restorations")
+                    && (version < 8 ? !root.hasKey("Abandonments") : validAbandonments(root));
         }
         return hasNumericIfPresent(root, "RootVersion")
                 && hasNumericIfPresent(root, "NextRegistrationOrder")
@@ -64,6 +66,12 @@ final class MountStoreCodec {
         Map<UUID, MountRepository.PlayerState> players = new LinkedHashMap<>();
         Map<UUID, TransferOperation> transfers = new LinkedHashMap<>();
         Map<UUID, RestorationOperation> restorations = new LinkedHashMap<>();
+        Map<UUID, AbandonmentOperation> abandonments = new LinkedHashMap<>();
+        NBTTagList abandonmentList = root.getTagList("Abandonments", COMPOUND_TAG);
+        for (int i = 0; i < abandonmentList.tagCount(); i++) {
+            AbandonmentOperation operation = decodeAbandonment(abandonmentList.getCompoundTagAt(i));
+            abandonments.put(operation.getOperationId(), operation);
+        }
         List<NBTTagCompound> retainedMalformedRecords = new ArrayList<>();
         List<NBTTagCompound> retainedMalformedPlayers = new ArrayList<>();
         List<NBTTagCompound> retainedMalformedTransfers = new ArrayList<>();
@@ -233,7 +241,7 @@ final class MountStoreCodec {
         for (int index = 0; index < playerList.tagCount(); index++) {
             try {
                 NBTTagCompound raw = playerList.getCompoundTagAt(index);
-                if (rootVersion == CURRENT_ROOT_VERSION) {
+                if (rootVersion >= 6) {
                     requireTag(raw, "Version", INT_TAG);
                     if (raw.getInteger("Version") != 3) {
                         throw new IllegalArgumentException("unsupported current player schema");
@@ -301,6 +309,7 @@ final class MountStoreCodec {
                 players,
                 transfers,
                 restorations,
+                abandonments,
                 retainedMalformedRecords,
                 retainedMalformedPlayers,
                 retainedMalformedTransfers,
@@ -373,7 +382,77 @@ final class MountStoreCodec {
             restorations.appendTag(retained.copy());
         }
         root.setTag("Restorations", restorations);
+        NBTTagList abandonments = new NBTTagList();
+        for (AbandonmentOperation operation : snapshot.abandonments.values()) {
+            abandonments.appendTag(encodeAbandonment(operation));
+        }
+        root.setTag("Abandonments", abandonments);
         return root;
+    }
+
+    // Unknown or ambiguous abandonment authority preserves the whole root read-only.
+    // Unlike a malformed ordinary row, it may authorize a marker already cleared on disk.
+    private static boolean validAbandonments(NBTTagCompound root) {
+        if (!hasRequiredCompoundList(root, "Abandonments")) { return false; }
+        try {
+            Set<UUID> ids = new LinkedHashSet<>();
+            Set<MountId> mounts = new LinkedHashSet<>();
+            NBTTagList list = root.getTagList("Abandonments", COMPOUND_TAG);
+            for (int i = 0; i < list.tagCount(); i++) {
+                AbandonmentOperation operation = decodeAbandonment(list.getCompoundTagAt(i));
+                if (!ids.add(operation.getOperationId()) || !mounts.add(operation.getMountId())) { return false; }
+                int matches = 0;
+                NBTTagList records = root.getTagList("Records", COMPOUND_TAG);
+                for (int j = 0; j < records.tagCount(); j++) {
+                    NBTTagCompound raw = records.getCompoundTagAt(j);
+                    if (operation.getMountId().toString().equals(raw.getString("MountId"))) {
+                        MountRecord record = decodeRecord(raw, CURRENT_ROOT_VERSION);
+                        if (!operation.matches(record) || record.getCondition() != MountCondition.OPERATION_IN_PROGRESS
+                                || !operation.getLocation().equals(record.getLastKnown())) { return false; }
+                        matches++;
+                    }
+                }
+                if (matches != 1) { return false; }
+                for (String key : new String[] {"Transfers", "Restorations"}) {
+                    NBTTagList others = root.getTagList(key, COMPOUND_TAG);
+                    for (int j = 0; j < others.tagCount(); j++) {
+                        NBTTagCompound other = others.getCompoundTagAt(j);
+                        if (operation.getMountId().toString().equals(other.getString("MountId"))
+                                || operation.getOperationId().toString().equals(other.getString("OperationId"))) { return false; }
+                    }
+                }
+            }
+            return true;
+        } catch (RuntimeException malformed) { return false; }
+    }
+
+    private static AbandonmentOperation decodeAbandonment(NBTTagCompound raw) {
+        requireTag(raw, "Version", INT_TAG);
+        if (raw.getInteger("Version") != AbandonmentOperation.VERSION) {
+            throw new IllegalArgumentException("unsupported abandonment schema");
+        }
+        for (String key : new String[] {"OperationId", "MountId", "OwnerId", "PhysicalId", "ProviderId", "EntityType"}) {
+            requireTag(raw, key, STRING_TAG);
+            requireBounded(raw.getString(key), key);
+        }
+        requireTag(raw, "Location", COMPOUND_TAG);
+        return new AbandonmentOperation(UUID.fromString(raw.getString("OperationId")),
+                MountId.parse(raw.getString("MountId")), UUID.fromString(raw.getString("OwnerId")),
+                UUID.fromString(raw.getString("PhysicalId")), new ResourceLocation(raw.getString("ProviderId")),
+                new ResourceLocation(raw.getString("EntityType")), decodeEvidence(raw.getCompoundTag("Location")));
+    }
+
+    private static NBTTagCompound encodeAbandonment(AbandonmentOperation operation) {
+        NBTTagCompound raw = new NBTTagCompound();
+        raw.setInteger("Version", AbandonmentOperation.VERSION);
+        raw.setString("OperationId", operation.getOperationId().toString());
+        raw.setString("MountId", operation.getMountId().toString());
+        raw.setString("OwnerId", operation.getOwnerId().toString());
+        raw.setString("PhysicalId", operation.getPhysicalId().toString());
+        raw.setString("ProviderId", operation.getProviderId().toString());
+        raw.setString("EntityType", operation.getEntityType().toString());
+        raw.setTag("Location", encodeEvidence(operation.getLocation()));
+        return raw;
     }
 
     private static TransferOperation decodeTransfer(NBTTagCompound raw) {
@@ -575,9 +654,10 @@ final class MountStoreCodec {
         }
         boolean legacyCharacteristics = rootVersion == 4 && version == 1;
         boolean characteristicsOnly = rootVersion == 5 && version == 2;
-        boolean current = rootVersion == CURRENT_ROOT_VERSION
+        boolean recoveryOnly = rootVersion == 6 && version == 3;
+        boolean current = (rootVersion == CURRENT_ROOT_VERSION || rootVersion == 7)
                 && version == MountRecord.CURRENT_VERSION;
-        if (!legacyCharacteristics && !characteristicsOnly && !current) {
+        if (!legacyCharacteristics && !characteristicsOnly && !recoveryOnly && !current) {
             throw new IllegalArgumentException("unsupported record schema for root schema");
         }
         ResourceLocation providerId = parseId(raw.getString("ProviderId"));
@@ -610,11 +690,23 @@ final class MountStoreCodec {
         MountCharacteristics characteristics = legacyCharacteristics
                 ? MountCharacteristics.solidGround()
                 : decodeCharacteristics(raw);
-        RecoveryState recoveryState = current ? decodeRecoveryState(raw, condition) : null;
+        RecoveryState recoveryState = current || recoveryOnly ? decodeRecoveryState(raw, condition) : null;
+        MountNaming naming = MountNaming.unobserved();
+        if (current) {
+            requireTag(raw, "Naming", COMPOUND_TAG);
+            NBTTagCompound name = raw.getCompoundTag("Naming");
+            requireTag(name, "Revision", LONG_TAG);
+            requireTag(name, "Pending", 1);
+            byte pending = name.getByte("Pending");
+            if (pending != 0 && pending != 1) { throw new IllegalArgumentException("invalid pending name flag"); }
+            if (name.hasKey("CustomName")) { requireTag(name, "CustomName", STRING_TAG); }
+            naming = new MountNaming(name.hasKey("CustomName") ? name.getString("CustomName") : null,
+                    name.getLong("Revision"), pending == 1);
+        }
         return new MountRecord(
                 mountId, ownerId, providerId, entityTypeId, typeKey, ordinal, order,
                 physicalId, evidence, condition, reason, characteristics,
-                payloadVersion, payload, recoveryState, null);
+                payloadVersion, payload, recoveryState, null, naming);
     }
 
     private static NBTTagCompound encodeRecord(MountRecord record) {
@@ -627,6 +719,11 @@ final class MountStoreCodec {
         raw.setString("FallbackTypeKey", record.getFallbackTypeKey());
         raw.setInteger("FallbackOrdinal", record.getFallbackOrdinal());
         raw.setLong("RegistrationOrder", record.getRegistrationOrder());
+        NBTTagCompound naming = new NBTTagCompound();
+        naming.setLong("Revision", record.getNaming().getRevision());
+        naming.setBoolean("Pending", record.getNaming().isPending());
+        if (record.getNaming().getCustomName() != null) { naming.setString("CustomName", record.getNaming().getCustomName()); }
+        raw.setTag("Naming", naming);
         if (record.getPhysicalEntityId() != null) {
             raw.setString("PhysicalEntityId", record.getPhysicalEntityId().toString());
         }

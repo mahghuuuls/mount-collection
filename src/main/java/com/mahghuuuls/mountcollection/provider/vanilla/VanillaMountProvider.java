@@ -31,6 +31,13 @@ public final class VanillaMountProvider implements MountProvider, RecoverySuppor
         return ID;
     }
 
+    @Override public com.mahghuuuls.mountcollection.api.MountPreview describePreview(ResourceLocation type) {
+        String id = type.toString();
+        if (!java.util.Arrays.asList("minecraft:horse", "minecraft:donkey", "minecraft:mule", "minecraft:llama",
+                "minecraft:skeleton_horse", "minecraft:zombie_horse", "minecraft:pig").contains(id)) { return null; }
+        return new com.mahghuuuls.mountcollection.api.MountPreview(ID, type, 1, new byte[0]);
+    }
+
     @Override
     public boolean supports(Entity entity) {
         return entity != null && kindOfClass(entity.getClass()) != VanillaEligibility.Kind.UNSUPPORTED;

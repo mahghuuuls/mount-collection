@@ -50,6 +50,104 @@ public final class MountLifecycleService {
     private final RecallPolicy recallPolicy = new RecallPolicy();
     private final RecoveryDeadlineIndex recoveryDeadlines = new RecoveryDeadlineIndex();
     private boolean reconcilingTransfers;
+    private boolean abandoning;
+
+    public enum AbandonmentResult { SUCCESS, PENDING, STALE, NOT_OWNED, READ_ONLY, BUSY, UNAVAILABLE, SAVE_FAILED }
+
+    /** Runs synchronously on the lifecycle END executor; never retains the target handle. */
+    public AbandonmentResult abandon(UUID owner, MountId mountId, long revision) {
+        if (repository.isReadOnly()) { return AbandonmentResult.READ_ONLY; }
+        MountRecord record = repository.find(mountId).orElse(null);
+        if (record == null || !owner.equals(record.getOwnerId())) { return AbandonmentResult.NOT_OWNED; }
+        if (repository.inspectCollection(owner).getRevision() != revision) { return AbandonmentResult.STALE; }
+        return abandonExact(record, true, revision, record.getLastKnown());
+    }
+
+    public void reconcilePendingAbandonments() {
+        for (com.mahghuuuls.mountcollection.persistence.AbandonmentOperation operation
+                : repository.getPendingAbandonments()) {
+            reconcileAbandonment(operation.getMountId(), null);
+        }
+    }
+
+    public void reconcileAbandonment(MountId id, LastKnownEvidence observedLocation) {
+        MountRecord record = repository.find(id).orElse(null);
+        if (record == null || !repository.findAbandonment(id).isPresent()) { return; }
+        // An observed location is a lookup hint, not authority. The gateway must still
+        // find the original living entity in the world's loaded UUID index.
+        abandonExact(record, false, -1, observedLocation == null ? record.getLastKnown() : observedLocation);
+    }
+
+    private AbandonmentResult abandonExact(MountRecord lookupRecord, boolean requested, long revision, LastKnownEvidence hint) {
+        if (abandoning) { return AbandonmentResult.PENDING; }
+        abandoning = true;
+        try {
+            return abandonUnchecked(lookupRecord, requested, revision, hint);
+        } finally { abandoning = false; }
+    }
+
+    private AbandonmentResult abandonUnchecked(MountRecord lookupRecord, boolean requested, long revision, LastKnownEvidence hint) {
+        com.mahghuuuls.mountcollection.persistence.AbandonmentOperation operation =
+                repository.findAbandonment(lookupRecord.getMountId()).orElse(null);
+        boolean pending = operation != null;
+        if (repository.isReadOnly()) { return AbandonmentResult.READ_ONLY; }
+        if (!pending && lookupRecord.getCondition() == MountCondition.OPERATION_IN_PROGRESS) { return AbandonmentResult.BUSY; }
+        if ((!pending && lookupRecord.getCondition() != MountCondition.LIVING)
+                || (pending && !repository.isCurrentAbandonment(operation))) { return AbandonmentResult.UNAVAILABLE; }
+        MountProvider provider = providers.find(lookupRecord.getProviderId()).orElse(null);
+        if (provider == null || worldGateway == null) { return pending ? AbandonmentResult.PENDING : AbandonmentResult.UNAVAILABLE; }
+        boolean removalAcknowledged = false;
+        try (RecallWorldGateway.AbandonmentTarget target = worldGateway
+                .locateAbandonment(lookupRecord, provider, requested, pending, hint).orElse(null)) {
+            if (target == null || !target.verify()) { return pending ? AbandonmentResult.PENDING : AbandonmentResult.UNAVAILABLE; }
+            if (!pending) {
+                operation = new com.mahghuuuls.mountcollection.persistence.AbandonmentOperation(
+                        UUID.randomUUID(), lookupRecord.getMountId(), lookupRecord.getOwnerId(),
+                        lookupRecord.getPhysicalEntityId(), lookupRecord.getProviderId(),
+                        lookupRecord.getEntityTypeId(), target.location());
+                MountRepository.TransferStatus started = repository.beginAbandonment(operation, revision);
+                if (started != MountRepository.TransferStatus.SUCCESS) {
+                    return started == MountRepository.TransferStatus.PERSISTENCE_FAILURE
+                            ? AbandonmentResult.SAVE_FAILED : AbandonmentResult.STALE;
+                }
+                abandonmentDiagnostic(operation, "intent_acknowledged");
+            } else if (repository.relocateAbandonment(operation, target.location()) != MountRepository.TransferStatus.SUCCESS) {
+                return AbandonmentResult.PENDING;
+            }
+            operation = repository.findAbandonment(lookupRecord.getMountId()).orElse(null);
+            if (operation == null) { return AbandonmentResult.PENDING; }
+            final com.mahghuuuls.mountcollection.persistence.AbandonmentOperation exactOperation = operation;
+            if (!repository.isCurrentAbandonment(operation) || !target.verify()
+                    || !operation.getLocation().equals(target.location())) { return AbandonmentResult.PENDING; }
+            RecallWorldGateway.CheckpointStatus fenced = target.clearAndFence(
+                    () -> repository.isCurrentAbandonment(exactOperation));
+            if (fenced != RecallWorldGateway.CheckpointStatus.VERIFIED || !target.verify()
+                    || !operation.getLocation().equals(target.location())) {
+                abandonmentDiagnostic(operation, "pending_physical_evidence");
+                return AbandonmentResult.PENDING;
+            }
+            MountRepository.TransferStatus finished = repository.finishAbandonment(operation);
+            removalAcknowledged = finished == MountRepository.TransferStatus.SUCCESS;
+            abandonmentDiagnostic(operation, finished == MountRepository.TransferStatus.SUCCESS
+                    ? "removal_acknowledged" : "pending_repository_acknowledgement");
+            return finished == MountRepository.TransferStatus.SUCCESS ? AbandonmentResult.SUCCESS : AbandonmentResult.PENDING;
+        } catch (FatalTransferSafetyException fatal) { throw fatal; }
+        catch (RuntimeException unavailable) {
+            // Cleanup or diagnostics cannot undo an already acknowledged removal.
+            if (removalAcknowledged) { return AbandonmentResult.SUCCESS; }
+            return repository.findAbandonment(lookupRecord.getMountId()).isPresent()
+                    ? AbandonmentResult.PENDING : AbandonmentResult.UNAVAILABLE;
+        }
+    }
+
+    private void abandonmentDiagnostic(
+            com.mahghuuuls.mountcollection.persistence.AbandonmentOperation operation, String result) {
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("operation", operation.getOperationId().toString());
+        fields.put("mount", operation.getMountId().toString());
+        fields.put("outcome", result);
+        diagnostics.detail(DiagnosticCategory.LIFECYCLE, "abandonment", fields);
+    }
 
     private enum TransferAdvanceOutcome {
         COMPLETE,
@@ -105,6 +203,11 @@ public final class MountLifecycleService {
         Objects.requireNonNull(mount, "mount");
         MountRecord record = repository.findByPhysicalEntity(mount.getUniqueID()).orElse(null);
         if (record == null) {
+            return RecoveryDeathOutcome.untracked();
+        }
+        if (repository.findAbandonment(record.getMountId()).isPresent()) {
+            // Native death may proceed, but cannot destroy pending abandonment authority
+            // or create a competing Recovery operation.
             return RecoveryDeathOutcome.untracked();
         }
         ValidatedMountConfig config = configSupplier.get();
