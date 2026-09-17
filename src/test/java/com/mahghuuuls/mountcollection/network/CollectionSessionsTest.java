@@ -16,6 +16,58 @@ import net.minecraftforge.fml.common.network.simpleimpl.IMessage;
 import org.junit.jupiter.api.Test;
 
 final class CollectionSessionsTest {
+    @Test void suppressedOpenDropsOldStreamThenFreshRetryCompletesWithoutMutation() {
+        UUID owner = UUID.randomUUID();
+        MountRecord record = register(owner);
+        java.util.concurrent.atomic.AtomicBoolean armed = new java.util.concurrent.atomic.AtomicBoolean(false);
+        CollectionSessions controlled = new CollectionSessions(who -> armed.getAndSet(false));
+        UUID first = UUID.randomUUID();
+        controlled.request(owner, new CollectionIntent(CollectionIntent.Action.OPEN, first, 0, null),
+                0, service, output);
+        armed.set(true);
+        // A throttled request must not consume the fault.
+        controlled.request(owner, new CollectionIntent(CollectionIntent.Action.OPEN, UUID.randomUUID(), 0, null),
+                1, service, output);
+        assertTrue(armed.get());
+        sent.clear();
+        UUID dropped = UUID.randomUUID();
+        controlled.request(owner, new CollectionIntent(CollectionIntent.Action.OPEN, dropped, 0, null),
+                20, service, output);
+        controlled.tick(21, output);
+        assertTrue(sent.isEmpty(), "neither new header nor old queued page may escape");
+        assertEquals(0, controlled.activeCount());
+        controlled.request(owner, new CollectionIntent(CollectionIntent.Action.CLOSE, dropped, 0, null),
+                220, service, output);
+        UUID retry = UUID.randomUUID();
+        controlled.request(owner, new CollectionIntent(CollectionIntent.Action.OPEN, retry, 0, null),
+                221, service, output);
+        controlled.tick(222, output);
+        assertEquals(2, sent.size());
+        assertEquals(retry, ((CollectionHeader) sent.get(0)).getSnapshot());
+        assertEquals(record.getMountId(), ((CollectionPage) sent.get(1)).getEntries().get(0).getId());
+        assertEquals(1, repository.inspectCollection(owner).getRevision());
+    }
+
+    @Test void closeAndMutationResponsesNeverConsumeOpenSuppression() {
+        UUID owner = UUID.randomUUID();
+        MountRecord record = register(owner);
+        java.util.concurrent.atomic.AtomicBoolean armed = new java.util.concurrent.atomic.AtomicBoolean(false);
+        CollectionSessions controlled = new CollectionSessions(who -> armed.getAndSet(false));
+        UUID session = UUID.randomUUID();
+        controlled.request(owner, new CollectionIntent(CollectionIntent.Action.OPEN, session, 0, null),
+                0, service, output);
+        controlled.tick(1, output);
+        armed.set(true);
+        sent.clear();
+        controlled.request(owner, new CollectionIntent(CollectionIntent.Action.SELECT, session, 1, record.getMountId()),
+                5, service, output);
+        assertTrue(armed.get());
+        assertEquals(CollectionReply.Result.UNCHANGED, ((CollectionReply) sent.get(0)).getResult());
+        assertTrue(sent.get(1) instanceof CollectionHeader);
+        controlled.request(owner, new CollectionIntent(CollectionIntent.Action.CLOSE, session, 0, null),
+                6, service, output);
+        assertTrue(armed.get());
+    }
     @Test void abandonmentRequiresCompletedMatchingSessionBeforeCallingLifecycle() {
         UUID owner = UUID.randomUUID(); UUID id = UUID.randomUUID();
         MountRecord record = register(owner);

@@ -57,6 +57,20 @@ public final class MountCollectionServices {
         return developmentControls;
     }
 
+    public boolean consumeCollectionTimeout(java.util.UUID owner) {
+        boolean suppressed = developmentControls.consumeCollectionTimeout(owner);
+        if (suppressed) {
+            diagnostics.detail(com.mahghuuuls.mountcollection.diagnostics.DiagnosticCategory.COLLECTION,
+                    "development_collection_snapshot_suppressed",
+                    java.util.Collections.singletonMap("owner", owner.toString()));
+        }
+        return suppressed;
+    }
+
+    public void clearCollectionTimeout(java.util.UUID owner) {
+        developmentControls.clearCollectionTimeout(owner);
+    }
+
     public boolean submitLifecycleMutation(Runnable mutation) {
         return lifecycleMutations.enqueue(mutation);
     }

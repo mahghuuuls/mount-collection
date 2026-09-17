@@ -44,6 +44,17 @@ final class PreviewSessionTest {
         assertNull(new VanillaPreviewProvider().create(data(99), world));
         assertNotNull(new VanillaPreviewProvider().create(data(1), world));
     }
+    @Test void equivalentRefreshedPayloadPreservesRepresentationAndRotation() {
+        ClientPreviewRegistry registry = new ClientPreviewRegistry(); int[] calls = {0};
+        registry.register(ID, (data, world) -> { calls[0]++; return new EntityPig(world); }); registry.freeze();
+        PreviewSession session = new PreviewSession(registry); TestWorld world = new TestWorld(); MountId id = MountId.create();
+        Object original = session.prepare(id, data(1), world);
+        session.rotate(70);
+        assertSame(original, session.prepare(id, data(1), world));
+        assertEquals(95, session.getYaw()); assertEquals(1, calls[0]);
+        session.prepare(MountId.create(), data(1), world);
+        assertEquals(25, session.getYaw()); assertEquals(2, calls[0]);
+    }
     private static final class TestWorld extends World {
         TestWorld() { super(new SaveHandlerMP(), new WorldInfo(new WorldSettings(0, GameType.CREATIVE, false, false, WorldType.DEFAULT), "preview"),
                 new WorldProviderSurface(), new Profiler(), true); }

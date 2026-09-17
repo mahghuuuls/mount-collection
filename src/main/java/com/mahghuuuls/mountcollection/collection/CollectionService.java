@@ -12,13 +12,19 @@ import java.util.UUID;
 public final class CollectionService {
     private final MountRepository repository;
     private final com.mahghuuuls.mountcollection.provider.ProviderRegistry providers;
+    private final com.mahghuuuls.mountcollection.policy.ValidatedMountConfig config;
 
     public CollectionService(MountRepository repository) {
         this(repository, null);
     }
     public CollectionService(MountRepository repository, com.mahghuuuls.mountcollection.provider.ProviderRegistry providers) {
+        this(repository, providers, null);
+    }
+    public CollectionService(MountRepository repository, com.mahghuuuls.mountcollection.provider.ProviderRegistry providers,
+            com.mahghuuuls.mountcollection.policy.ValidatedMountConfig config) {
         this.repository = Objects.requireNonNull(repository, "repository");
         this.providers = providers;
+        this.config = config;
     }
 
     public CollectionView snapshot(UUID owner, long activeTick) {
@@ -43,7 +49,8 @@ public final class CollectionService {
                 entries.add(new CollectionView.Entry(record.getMountId(), record.getFallbackTypeKey(),
                         record.getFallbackOrdinal(), record.getRegistrationOrder(), state,
                         remaining, record.getCharacteristics(), record.getNaming().getCustomName() == null
-                                ? "" : record.getNaming().getCustomName(), preview(record)));
+                                ? "" : record.getNaming().getCustomName(), preview(record),
+                        config != null && !config.allowsSummoning(record.getEntityTypeId(), record.getCharacteristics())));
             }
             return new CollectionView(collection.getRevision(),
                     collection.getSelectedMountId().orElse(null), entries);

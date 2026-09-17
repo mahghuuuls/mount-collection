@@ -36,6 +36,11 @@ public final class PreviewRenderer {
         state.rectangle(rectangle.get(0), rectangle.get(1), rectangle.get(2), rectangle.get(3));
         state.enabled(enabled);
     }
+    static java.nio.IntBuffer scissorQueryBuffer() {
+        // LWJGL 2 validates glGetInteger buffers against its maximum result size,
+        // even though GL_SCISSOR_BOX returns only four rectangle components.
+        return org.lwjgl.BufferUtils.createIntBuffer(16);
+    }
     public static boolean draw(PreviewSession session, EntityLivingBase entity, int left, int top, int width, int height) {
         if (entity == null || width < 24 || height < 24) { return false; }
         Minecraft mc = Minecraft.getMinecraft();
@@ -50,7 +55,7 @@ public final class PreviewRenderer {
         GL11.glGetFloat(GL11.GL_MODELVIEW_MATRIX, modelMatrix);
         GL11.glGetFloat(GL11.GL_PROJECTION_MATRIX, projectionMatrix);
         boolean scissor = GL11.glIsEnabled(GL11.GL_SCISSOR_TEST);
-        java.nio.IntBuffer box = org.lwjgl.BufferUtils.createIntBuffer(4);
+        java.nio.IntBuffer box = scissorQueryBuffer();
         GL11.glGetInteger(GL11.GL_SCISSOR_BOX, box);
         try {
             int factor = new ScaledResolution(mc).getScaleFactor();

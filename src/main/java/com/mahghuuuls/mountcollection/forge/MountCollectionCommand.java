@@ -37,7 +37,8 @@ final class MountCollectionCommand extends CommandBase {
     public String getUsage(ICommandSender sender) {
         return "/mountcollection inspect <player <name>|mount <mount-id>>"
                 + " | /mountcollection dev <status|clear|fault <journal_ack|candidate_intent_fatal|source_intent_fatal|fence_post_drain>|pause <stable-phase>>"
-                + " | /mountcollection dev <recovery_fault <candidate_intent_fatal|provider_unavailable>|recovery_pause <prepared|candidate_spawned|associated>>";
+                + " | /mountcollection dev <recovery_fault <candidate_intent_fatal|provider_unavailable>|recovery_pause <prepared|candidate_spawned|associated>>"
+                + " | /mountcollection dev collection_timeout";
     }
 
     @Override
@@ -80,6 +81,13 @@ final class MountCollectionCommand extends CommandBase {
         TransferDevelopmentControls controls = services.getDevelopmentControls();
         if (!controls.isAvailable()) {
             throw new CommandException("Mount Collection development controls are unavailable.");
+        }
+        if (arguments.length == 2 && "collection_timeout".equals(arguments[1])) {
+            if (!controls.armCollectionTimeout(getCommandSenderAsPlayer(sender).getUniqueID())) {
+                throw new CommandException("Collection timeout was not armed.");
+            }
+            sendDevelopmentStatus(sender, controls);
+            return;
         }
         if (arguments.length == 2 && "status".equals(arguments[1])) {
             sendDevelopmentStatus(sender, controls);

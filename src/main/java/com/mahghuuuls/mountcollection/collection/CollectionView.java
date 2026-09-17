@@ -20,6 +20,7 @@ public final class CollectionView {
         private final long recoveryTicks;
         private final MountCharacteristics characteristics;
         private final String customName;
+        private final boolean summoningDisabled;
         private final com.mahghuuuls.mountcollection.api.MountPreview preview;
 
         public Entry(MountId id, String typeKey, int ordinal, long order,
@@ -33,6 +34,12 @@ public final class CollectionView {
         public Entry(MountId id, String typeKey, int ordinal, long order,
                 State state, long recoveryTicks, MountCharacteristics characteristics, String customName,
                 com.mahghuuuls.mountcollection.api.MountPreview preview) {
+            this(id, typeKey, ordinal, order, state, recoveryTicks, characteristics, customName, preview, false);
+        }
+        public Entry(MountId id, String typeKey, int ordinal, long order,
+                State state, long recoveryTicks, MountCharacteristics characteristics, String customName,
+                com.mahghuuuls.mountcollection.api.MountPreview preview, boolean summoningDisabled) {
+            this.summoningDisabled = summoningDisabled;
             this.preview = preview;
             this.customName = Objects.requireNonNull(customName, "customName");
             if (!MountNaming.normalize(customName).equals(customName)) { throw new IllegalArgumentException("unnormalized name"); }
@@ -50,6 +57,7 @@ public final class CollectionView {
         }
 
         public MountId getId() { return id; }
+        public boolean isSummoningDisabled() { return summoningDisabled; }
         public com.mahghuuuls.mountcollection.api.MountPreview getPreview() { return preview; }
         public String getCustomName() { return customName; }
         public String getTypeKey() { return typeKey; }

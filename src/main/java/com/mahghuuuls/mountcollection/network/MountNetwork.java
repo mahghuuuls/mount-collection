@@ -25,7 +25,8 @@ public final class MountNetwork {
     private final SimpleNetworkWrapper channel = NetworkRegistry.INSTANCE.newSimpleChannel(Tags.MOD_ID);
     private final IntentGate intentGate = new IntentGate();
     private MountCollectionServices services;
-    private final CollectionSessions collections = new CollectionSessions();
+    private final CollectionSessions collections = new CollectionSessions(
+            owner -> services.consumeCollectionTimeout(owner));
     private final CollectionIngress collectionIngress = new CollectionIngress();
     private Consumer<IMessage> clientCollectionReceiver = ignored -> { };
 
@@ -47,7 +48,8 @@ public final class MountNetwork {
                 if (!player.connection.getNetworkManager().isChannelOpen()) { return; }
                 try {
                     CollectionService service = services.getActiveRepository()
-                            .map(repository -> new CollectionService(repository, services.getProviderRegistry())).orElse(null);
+                            .map(repository -> new CollectionService(repository, services.getProviderRegistry(),
+                                    services.getActiveConfig().orElseThrow(() -> new IllegalStateException("server configuration unavailable")))).orElse(null);
                     collections.request(player.getUniqueID(), admitted, services.getActiveServerClock().now(),
                             service, this::sendCollection, confirmed -> abandon(player.getUniqueID(), confirmed));
                 } catch (FatalTransferSafetyException fatal) {
@@ -134,6 +136,7 @@ public final class MountNetwork {
     }
 
     public void playerLoggedOut(EntityPlayerMP player) {
+        services.clearCollectionTimeout(player.getUniqueID());
         intentGate.remove(player.getUniqueID());
         collections.remove(player.getUniqueID());
         collectionIngress.remove(player.getUniqueID());

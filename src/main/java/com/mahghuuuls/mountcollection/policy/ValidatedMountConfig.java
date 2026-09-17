@@ -63,6 +63,12 @@ public final class ValidatedMountConfig {
         return registrationEntities;
     }
 
+    /** Static summoning policy only; excludes temporary lifecycle and player conditions. */
+    public boolean allowsSummoning(ResourceLocation type, com.mahghuuuls.mountcollection.api.MountCharacteristics characteristics) {
+        return summoningEntities.allows(type) && !(flyingMountRecallDisabled
+                && characteristics.hasTrait(com.mahghuuuls.mountcollection.api.MountTrait.FLYING));
+    }
+
     public ConfiguredFilter<ResourceLocation> getSummoningEntities() {
         return summoningEntities;
     }

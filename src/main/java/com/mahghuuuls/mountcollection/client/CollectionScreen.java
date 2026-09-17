@@ -35,17 +35,16 @@ public final class CollectionScreen extends GuiScreen {
     private UUID session;
     private MountId highlighted;
     private int scroll;
-    private boolean loading;
-    private boolean usable;
+    private final CollectionRefresh transfer = new CollectionRefresh();
+    private CollectionLayout layout;
     private boolean detailed;
     private long lastProgress;
     private long refreshAt;
-    private String notice = "";
     private String language = "";
     private GuiButton select;
     private GuiButton refresh;
-    private GuiButton rename;
-    private GuiButton abandon;
+    private CollectionIconButton rename;
+    private CollectionIconButton abandon;
     private GuiButton confirmAbandon;
     private GuiButton cancelAbandon;
     private final AbandonmentConfirmation abandonment = new AbandonmentConfirmation();
@@ -64,33 +63,34 @@ public final class CollectionScreen extends GuiScreen {
         preview = new com.mahghuuuls.mountcollection.client.preview.PreviewSession(previews);
     }
     @Override public void initGui() {
+        layout = new CollectionLayout(width, height);
         buttonList.clear();
-        select = new GuiButton(0, split() + 10, height - 32, Math.max(70, width - split() - 22), 20,
+        select = new GuiButton(0, layout.detailLeft(), layout.bottom() - 30, layout.detailWidth(), 20,
                 I18n.format("mountcollection.gui.select"));
-        refresh = new GuiButton(1, 12, height - 32, 95, 20, I18n.format("mountcollection.gui.refresh"));
+        refresh = new GuiButton(1, layout.listLeft(), layout.bottom() - 30, Math.min(95, layout.listWidth()), 20, I18n.format("mountcollection.gui.retry"));
         buttonList.add(select); buttonList.add(refresh);
-        rename = new GuiButton(2, split() + 10, height - 57, Math.max(70, width - split() - 22), 20,
-                I18n.format("mountcollection.gui.rename"));
-        saveName = new GuiButton(3, width / 2 - 105, height / 2 + 22, 100, 20, I18n.format("mountcollection.gui.save_name"));
-        cancelName = new GuiButton(4, width / 2 + 5, height / 2 + 22, 100, 20, I18n.format("gui.cancel"));
+        rename = new CollectionIconButton(2, layout.detailLeft(), layout.renameTop(),
+                new ResourceLocation("minecraft", "textures/items/name_tag.png"), 16);
+        int dialogButtonWidth = (layout.dialogWidth() - 8) / 2;
+        saveName = new GuiButton(3, layout.dialogLeft(), layout.centerY() + 22, dialogButtonWidth, 20, I18n.format("mountcollection.gui.save_name"));
+        cancelName = new GuiButton(4, layout.dialogLeft() + dialogButtonWidth + 8, layout.centerY() + 22, dialogButtonWidth, 20, I18n.format("gui.cancel"));
         String oldText = nameInput == null ? "" : nameInput.getText();
-        nameInput = new net.minecraft.client.gui.GuiTextField(5, fontRenderer, width / 2 - 105, height / 2 - 4, 210, 20);
+        nameInput = new net.minecraft.client.gui.GuiTextField(5, fontRenderer, layout.dialogLeft(), layout.centerY() - 4, layout.dialogWidth(), 20);
         nameInput.setMaxStringLength(128); nameInput.setText(oldText); nameInput.setFocused(editing != null);
         buttonList.add(rename); buttonList.add(saveName); buttonList.add(cancelName);
-        abandon = new GuiButton(6, split() + 10, height - 82, Math.max(70, width - split() - 22), 20,
-                I18n.format("mountcollection.gui.abandon"));
-        confirmAbandon = new GuiButton(7, width / 2 - 105, height / 2 + 30, 100, 20,
+        abandon = new CollectionIconButton(6, layout.abandonLeft(), layout.abandonTop(), "action_abandon");
+        confirmAbandon = new GuiButton(7, layout.dialogLeft(), layout.centerY() + 30, dialogButtonWidth, 20,
                 I18n.format("mountcollection.gui.confirm_abandon"));
-        cancelAbandon = new GuiButton(8, width / 2 + 5, height / 2 + 30, 100, 20, I18n.format("gui.cancel"));
+        cancelAbandon = new GuiButton(8, layout.dialogLeft() + dialogButtonWidth + 8, layout.centerY() + 30, dialogButtonWidth, 20, I18n.format("gui.cancel"));
         buttonList.add(abandon); buttonList.add(confirmAbandon); buttonList.add(cancelAbandon);
         updateButtons();
-        if (session == null) { request(); }
+        clampScroll();
+        if (session == null) { request(false); }
     }
-    private int split() { return width * 55 / 100; }
-    private int visibleRows() { return Math.max(1, (height - 84) / 28); }
-    private void request() {
-        assembly.clear(); session = UUID.randomUUID(); loading = true; usable = false;
-        lastProgress = System.nanoTime(); notice = "";
+    private int visibleRows() { return layout.visibleRows(); }
+    private void request(boolean background) {
+        assembly.clear(); session = UUID.randomUUID(); transfer.begin(background);
+        lastProgress = System.nanoTime();
         network.sendCollectionIntent(new CollectionIntent(CollectionIntent.Action.OPEN, session, 0, null));
     }
     public void receive(IMessage message) {
@@ -102,19 +102,20 @@ public final class CollectionScreen extends GuiScreen {
         try {
             if (message instanceof CollectionHeader) {
                 detailed = ((CollectionHeader) message).isDetailed();
-                assembly.begin((CollectionHeader) message); loading = true;
+                assembly.begin((CollectionHeader) message);
             } else if (message instanceof CollectionPage) {
                 assembly.accept((CollectionPage) message);
             } else {
                 CollectionReply.Result result = ((CollectionReply) message).getResult();
-                notice = I18n.format("mountcollection.gui.result." + result.name().toLowerCase(Locale.ROOT));
+                transfer.reply(result);
                 if (result == CollectionReply.Result.RATE_LIMITED || result == CollectionReply.Result.UNAVAILABLE
                         || result == CollectionReply.Result.STALE) {
-                    loading = false; assembly.clear(); refreshAt = System.nanoTime() + 2000000000L;
+                    transfer.invalidate(); assembly.clear(); refreshAt = System.nanoTime() + 2000000000L;
                 }
             }
             if (assembly.isComplete()) {
-                view = assembly.finish(); loading = false; usable = true;
+                view = assembly.finish();
+                CollectionIntent deferred = transfer.complete();
                 entries.clear();
                 for (CollectionView.Entry entry : view.getEntries()) { entries.put(entry.getId(), entry); }
                 if (detailed) {
@@ -132,10 +133,14 @@ public final class CollectionScreen extends GuiScreen {
                     }
                 }
                 clampScroll(); refreshAt = System.nanoTime() + 5000000000L;
+                if (deferred != null) {
+                    if (CollectionRefresh.stillCurrent(deferred, view)) { submit(deferred); }
+                    else { transfer.reply(CollectionReply.Result.STALE); }
+                }
             }
         } catch (IllegalArgumentException invalid) {
             abandonStream();
-            notice = I18n.format("mountcollection.gui.invalid"); refreshAt = Long.MAX_VALUE;
+            transfer.notice("mountcollection.gui.invalid"); refreshAt = Long.MAX_VALUE;
         }
     }
     private String localizeName(CollectionView.Entry row) {
@@ -162,7 +167,7 @@ public final class CollectionScreen extends GuiScreen {
         return entries.get(highlighted);
     }
     private void abandonStream() {
-        loading = false; usable = false; assembly.clear();
+        transfer.invalidate(); assembly.clear();
         if (session != null && mc.getConnection() != null) {
             network.sendCollectionIntent(new CollectionIntent(CollectionIntent.Action.CLOSE, session, 0, null));
         }
@@ -170,9 +175,9 @@ public final class CollectionScreen extends GuiScreen {
         session = UUID.randomUUID();
     }
     @Override public void updateScreen() {
-        if (loading && System.nanoTime() - lastProgress > 10000000000L) {
-            abandonStream(); notice = I18n.format("mountcollection.gui.timeout"); refreshAt = Long.MAX_VALUE;
-        } else if (editing == null && !abandonment.isOpen() && !loading && System.nanoTime() >= refreshAt) { request(); }
+        if (transfer.pending() && System.nanoTime() - lastProgress > 10000000000L) {
+            abandonStream(); transfer.notice("mountcollection.gui.timeout"); refreshAt = Long.MAX_VALUE;
+        } else if (editing == null && !abandonment.isOpen() && !transfer.pending() && System.nanoTime() >= refreshAt) { request(true); }
         if (view != null && !language.equals(mc.getLanguageManager().getCurrentLanguage().getLanguageCode())) { sort(); }
         nameInput.updateCursorCounter();
         updateButtons();
@@ -181,45 +186,53 @@ public final class CollectionScreen extends GuiScreen {
         select.visible = refresh.visible = rename.visible = abandon.visible = editing == null && !abandonment.isOpen();
         confirmAbandon.visible = cancelAbandon.visible = abandonment.isOpen();
         saveName.visible = cancelName.visible = editing != null;
-        select.enabled = usable && !loading && highlighted != null;
+        saveName.enabled = confirmAbandon.enabled = transfer.actionable();
+        select.enabled = transfer.actionable() && highlighted != null;
         CollectionView.Entry row = highlightedEntry();
         rename.enabled = select.enabled && row != null && (row.getState() == CollectionView.State.LIVING
                 || row.getState() == CollectionView.State.RECOVERING || row.getState() == CollectionView.State.READY);
         abandon.enabled = select.enabled && row != null
                 && (row.getState() == CollectionView.State.LIVING || row.getState() == CollectionView.State.BUSY);
-        refresh.enabled = !loading;
+        refresh.visible = editing == null && !abandonment.isOpen() && transfer.canRetry();
+        refresh.enabled = refresh.visible;
+    }
+    private void submit(CollectionIntent intent) {
+        if (transfer.submit(intent)) {
+            assembly.clear(); lastProgress = System.nanoTime();
+            network.sendCollectionIntent(intent);
+        }
+        updateButtons();
     }
     @Override protected void actionPerformed(GuiButton button) {
         if (button.id == 8) { abandonment.cancel(); updateButtons(); return; }
-        if (button.id == 7 && abandonment.isOpen()) {
+        if (button.id == 7 && abandonment.isOpen() && confirmAbandon.enabled) {
             CollectionIntent confirmed = abandonment.confirm();
-            loading = true; usable = false; assembly.clear(); lastProgress = System.nanoTime();
-            network.sendCollectionIntent(confirmed);
+            submit(confirmed);
             updateButtons(); return;
         }
         if (button.id == 6 && abandon.enabled) {
             abandonment.open(session, highlighted, view.getSelectionRevision(), names.get(highlighted));
-            draggingPreview = false; notice = ""; updateButtons(); return;
+            draggingPreview = false; transfer.notice(""); updateButtons(); return;
         }
         if (button.id == 4) { editing = null; updateButtons(); return; }
-        if (button.id == 3 && editing != null) {
+        if (button.id == 3 && editing != null && saveName.enabled) {
             String input = nameInput.getText();
             try { input = com.mahghuuuls.mountcollection.collection.MountNaming.normalize(input); }
-            catch (IllegalArgumentException invalid) { notice = I18n.format("mountcollection.gui.result.invalid_name"); return; }
-            loading = true; usable = false; assembly.clear(); lastProgress = System.nanoTime();
-            network.sendCollectionIntent(new CollectionIntent(CollectionIntent.Action.RENAME,
+            catch (IllegalArgumentException invalid) { transfer.notice("mountcollection.gui.result.invalid_name"); return; }
+            submit(new CollectionIntent(CollectionIntent.Action.RENAME,
                     session, editingRevision, editing, input));
             editing = null; updateButtons(); return;
         }
         if (button.id == 2 && rename.enabled) {
             editing = highlighted; editingRevision = view.getSelectionRevision();
             nameInput.setText(highlightedEntry().getCustomName()); nameInput.setFocused(true);
-            notice = ""; updateButtons(); return;
+            transfer.notice(""); updateButtons(); return;
         }
-        if (button.id == 1) { request(); }
+        if (button.id == 1 && transfer.canRetry()) {
+            request(false);
+        }
         else if (button.id == 0 && select.enabled) {
-            loading = true; assembly.clear(); lastProgress = System.nanoTime();
-            network.sendCollectionIntent(new CollectionIntent(CollectionIntent.Action.SELECT,
+            submit(new CollectionIntent(CollectionIntent.Action.SELECT,
                     session, view.getSelectionRevision(), highlighted));
         }
     }
@@ -229,11 +242,11 @@ public final class CollectionScreen extends GuiScreen {
         super.mouseClicked(x, y, button);
         if (wasAbandoning || abandonment.isOpen()) { return; }
         if (wasEditing || editing != null) { nameInput.mouseClicked(x, y, button); return; }
-        if (button == 0 && x >= split() + 10 && x < width - 12 && y >= 120 && y < height - 87) {
+        if (button == 0 && layout.inPreview(x, y)) {
             draggingPreview = true; lastDragX = x;
         }
-        if (button == 0 && x >= 12 && x < split() && y >= 42 && y < 42 + visibleRows() * 28) {
-            int index = scroll + (y - 42) / 28;
+        if (button == 0 && layout.inList(x, y)) {
+            int index = scroll + (y - layout.listTop()) / 28;
             if (index < rows.size()) { highlighted = rows.get(index).getId(); }
         }
     }
@@ -248,7 +261,11 @@ public final class CollectionScreen extends GuiScreen {
     @Override public void handleMouseInput() throws IOException {
         super.handleMouseInput();
         int wheel = Mouse.getEventDWheel();
-        if (editing == null && !abandonment.isOpen() && wheel != 0) { scroll += wheel > 0 ? -3 : 3; clampScroll(); }
+        int x = Mouse.getEventX() * width / mc.displayWidth;
+        int y = height - Mouse.getEventY() * height / mc.displayHeight - 1;
+        if (editing == null && !abandonment.isOpen() && wheel != 0 && layout.inList(x, y)) {
+            scroll += wheel > 0 ? -3 : 3; clampScroll();
+        }
     }
     @Override protected void keyTyped(char character, int key) throws IOException {
         if (abandonment.isOpen()) {
@@ -265,40 +282,56 @@ public final class CollectionScreen extends GuiScreen {
     }
     @Override public void drawScreen(int x, int y, float partial) {
         drawDefaultBackground();
-        drawCenteredString(fontRenderer, "Mount Collection", width / 2, 12, 0xffffff);
-        String status = loading ? I18n.format("mountcollection.gui.loading", assembly.getReceived(), assembly.getTotal()) : notice;
-        drawCenteredString(fontRenderer, fontRenderer.trimStringToWidth(status, width - 20), width / 2, 28, 0xdddddd);
+        drawRect(layout.left, layout.top, layout.right(), layout.bottom(), 0xff777777);
+        drawRect(layout.left + 1, layout.top + 1, layout.right() - 1, layout.bottom() - 1, 0xff202020);
+        drawCenteredString(fontRenderer, "Mount Collection", layout.centerX(), layout.top + 9, 0xffffff);
+        String status = transfer.showLoading() ? I18n.format("mountcollection.gui.loading", assembly.getReceived(), assembly.getTotal())
+                : transfer.notice().isEmpty() ? "" : I18n.format(transfer.notice());
+        drawCenteredString(fontRenderer, fontRenderer.trimStringToWidth(status, layout.width - 20), layout.centerX(), layout.top + 24, 0xdddddd);
         for (int i = 0; i < visibleRows() && scroll + i < rows.size(); i++) {
-            CollectionView.Entry row = rows.get(scroll + i); int top = 42 + i * 28;
+            CollectionView.Entry row = rows.get(scroll + i); int top = layout.listTop() + i * 28;
             boolean high = row.getId().equals(highlighted);
-            drawRect(12, top, split(), top + 26, high ? 0xff6194c5 : 0xff444444);
-            drawRect(13, top + 1, split() - 1, top + 25, high ? 0xff253b51 : 0xcc181818);
+            int listLeft = layout.listLeft(), listRight = listLeft + layout.listWidth();
+            drawRect(listLeft, top, listRight, top + 26, high ? 0xff6194c5 : 0xff444444);
+            drawRect(listLeft + 1, top + 1, listRight - 1, top + 25, high ? 0xff253b51 : 0xcc181818);
             boolean selected = view != null && row.getId().equals(view.getSelected());
-            drawString(fontRenderer, fontRenderer.trimStringToWidth((selected ? "* " : "") + names.get(row.getId()), split() - 32),
-                    18, top + 4, selected ? 0xffdd66 : 0xffffff);
+            drawString(fontRenderer, fontRenderer.trimStringToWidth((selected ? "* " : "") + names.get(row.getId()), layout.listWidth() - 16),
+                    listLeft + 6, top + 4, selected ? 0xffdd66 : 0xffffff);
             drawString(fontRenderer, fontRenderer.trimStringToWidth(I18n.format("mountcollection.gui.state."
-                            + row.getState().name().toLowerCase(Locale.ROOT)), split() - 32),
-                    18, top + 15, 0xbbbbbb);
+                            + row.getState().name().toLowerCase(Locale.ROOT)), layout.listWidth() - 16),
+                    listLeft + 6, top + 15, 0xbbbbbb);
         }
         if (rows.size() > visibleRows()) {
             int track = visibleRows() * 28;
             int thumb = Math.max(8, track * visibleRows() / rows.size());
-            int top = 42 + (track - thumb) * scroll / Math.max(1, rows.size() - visibleRows());
-            drawRect(split() - 4, top, split() - 1, top + thumb, 0xffbbbbbb);
+            int top = layout.listTop() + (track - thumb) * scroll / Math.max(1, rows.size() - visibleRows());
+            int right = layout.listLeft() + layout.listWidth();
+            drawRect(right - 4, top, right - 1, top + thumb, 0xffbbbbbb);
         }
-        if (view != null && rows.isEmpty()) { drawString(fontRenderer, I18n.format("mountcollection.gui.empty"), 16, 48, 0xffffff); }
+        if (view != null && rows.isEmpty()) {
+            fontRenderer.drawSplitString(I18n.format("mountcollection.gui.empty"), layout.listLeft() + 4,
+                    layout.listTop() + 4, layout.listWidth() - 8, 0xffffff);
+        }
         CollectionView.Entry row = highlightedEntry();
         String tooltip = null;
         if (row == null) { preview.clear(); }
         if (row != null) {
-            int left = split() + 10;
-            fontRenderer.drawSplitString(names.get(row.getId()), left, 46, width - left - 12, 0xffffff);
-            fontRenderer.drawSplitString(I18n.format("mountcollection.gui.state." + row.getState().name().toLowerCase(Locale.ROOT)),
-                    left, 70, width - left - 12, 0xdddddd);
+            int left = layout.detailLeft();
+            drawString(fontRenderer, fontRenderer.trimStringToWidth(names.get(row.getId()), layout.nameWidth()),
+                    layout.nameLeft(), layout.top + 38, 0xffffff);
+            String stateText = I18n.format("mountcollection.gui.state." + row.getState().name().toLowerCase(Locale.ROOT));
+            drawString(fontRenderer, fontRenderer.trimStringToWidth(stateText, layout.detailWidth()),
+                    left, layout.top + CollectionLayout.STATUS_OFFSET, 0xdddddd);
+            if (layout.inName(x, y)) {
+                tooltip = names.get(row.getId());
+            }
+            if (layout.inDetailLine(x, y, CollectionLayout.STATUS_OFFSET)) { tooltip = stateText; }
             if (row.getState() == CollectionView.State.RECOVERING) {
-                fontRenderer.drawSplitString(I18n.format("mountcollection.gui.recovery",
-                                row.getRecoveryTicks() / 20 + (row.getRecoveryTicks() % 20 == 0 ? 0 : 1)),
-                        left, 86, width - left - 12, 0xbbbbbb);
+                String recoveryText = I18n.format("mountcollection.gui.recovery",
+                        row.getRecoveryTicks() / 20 + (row.getRecoveryTicks() % 20 == 0 ? 0 : 1));
+                drawString(fontRenderer, fontRenderer.trimStringToWidth(recoveryText, layout.detailWidth()),
+                        left, layout.top + CollectionLayout.RECOVERY_OFFSET, 0xbbbbbb);
+                if (layout.inDetailLine(x, y, CollectionLayout.RECOVERY_OFFSET)) { tooltip = recoveryText; }
             }
             List<String> badges = new ArrayList<>();
             PlacementProfile profile = row.getCharacteristics().getPlacementProfile();
@@ -306,37 +339,44 @@ public final class CollectionScreen extends GuiScreen {
             if (profile == PlacementProfile.LAVA) { badges.add("lava"); }
             if (row.getCharacteristics().hasTrait(MountTrait.FLYING)) { badges.add("flying"); }
             for (int i = 0; i < badges.size(); i++) {
-                int bx = left + i * 15; int by = 105;
+                int bx = layout.badgeLeft(i); int by = layout.badgeTop();
                 GlStateManager.color(1, 1, 1, 1); GlStateManager.enableBlend();
                 mc.getTextureManager().bindTexture(new ResourceLocation("mountcollection", "textures/gui/badge_" + badges.get(i) + ".png"));
-                drawModalRectWithCustomSizedTexture(bx, by, 0, 0, 9, 9, 9, 9);
-                if (x >= bx && x < bx + 9 && y >= by && y < by + 9) { tooltip = I18n.format("mountcollection.gui.badge." + badges.get(i)); }
+                drawScaledCustomSizeModalRect(bx, by, 0, 0, 9, 9,
+                        CollectionLayout.BADGE_SIZE, CollectionLayout.BADGE_SIZE, 9, 9);
+                if (layout.inBadge(x, y, i)) {
+                    tooltip = I18n.format("mountcollection.gui.badge." + badges.get(i)
+                            + ("flying".equals(badges.get(i)) && row.isSummoningDisabled() ? "_disabled" : ""));
+                }
             }
             if (editing == null && !abandonment.isOpen()) {
                 net.minecraft.entity.EntityLivingBase model = preview.prepare(row.getId(), row.getPreview(), mc.world);
                 if (!com.mahghuuuls.mountcollection.client.preview.PreviewRenderer.draw(preview, model,
-                        left, 120, width - left - 12, height - 207) && height >= 231) {
+                        left, layout.previewTop(), layout.detailWidth(), layout.previewHeight()) && layout.previewHeight() >= 24) {
                     if (detailed && row.getPreview() != null && reportedPreviewFailures.size() < 16
                             && reportedPreviewFailures.add(row.getId())) {
                         com.mahghuuuls.mountcollection.MountCollectionMod.LOGGER.info(
                                 "[MountCollection][COLLECTION] event=preview_fallback mount={}", row.getId());
                     }
-                    fontRenderer.drawSplitString(I18n.format("mountcollection.gui.preview_unavailable"), left, 122,
-                            width - left - 12, 0x999999);
+                    fontRenderer.drawSplitString(I18n.format("mountcollection.gui.preview_unavailable"), left, layout.previewTop() + 2,
+                            layout.detailWidth(), 0x999999);
                 }
             }
         }
         if (editing != null) {
-            drawRect(0, 38, width, height, 0xdd101010);
-            drawCenteredString(fontRenderer, I18n.format("mountcollection.gui.rename_hint"), width / 2, height / 2 - 24, 0xffffff);
+            drawRect(layout.left + 1, layout.top + 34, layout.right() - 1, layout.bottom() - 1, 0xee101010);
+            fontRenderer.drawSplitString(I18n.format("mountcollection.gui.rename_hint"), layout.dialogLeft(),
+                    layout.centerY() - 30, layout.dialogWidth(), 0xffffff);
             nameInput.drawTextBox();
         }
         if (abandonment.isOpen()) {
-            drawRect(0, 38, width, height, 0xdd101010);
+            drawRect(layout.left + 1, layout.top + 34, layout.right() - 1, layout.bottom() - 1, 0xee101010);
             fontRenderer.drawSplitString(I18n.format("mountcollection.gui.abandon_hint", abandonment.getName()),
-                    width / 2 - 105, height / 2 - 38, 210, 0xffffff);
+                    layout.dialogLeft(), layout.centerY() - 38, layout.dialogWidth(), 0xffffff);
         }
         super.drawScreen(x, y, partial);
+        if (rename.contains(x, y)) { tooltip = I18n.format("mountcollection.gui.rename"); }
+        if (abandon.contains(x, y)) { tooltip = I18n.format("mountcollection.gui.abandon_tooltip"); }
         if (editing == null && !abandonment.isOpen() && tooltip != null) { drawHoveringText(fontRenderer.listFormattedStringToWidth(tooltip, 180), x, y); }
     }
     @Override public boolean doesGuiPauseGame() { return false; }
@@ -344,6 +384,7 @@ public final class CollectionScreen extends GuiScreen {
         abandonment.cancel();
         preview.clear(); draggingPreview = false;
         reportedPreviewFailures.clear();
+        transfer.invalidate();
         assembly.clear();
         if (session != null && mc.getConnection() != null) {
             network.sendCollectionIntent(new CollectionIntent(CollectionIntent.Action.CLOSE, session, 0, null));

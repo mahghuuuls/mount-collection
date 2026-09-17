@@ -1,6 +1,5 @@
 package com.mahghuuuls.mountcollection.policy;
 
-import com.mahghuuuls.mountcollection.api.MountTrait;
 import com.mahghuuuls.mountcollection.integration.inhibited.InhibitedStatus;
 import com.mahghuuuls.mountcollection.lifecycle.ContextualOutcome;
 import com.mahghuuuls.mountcollection.persistence.MountCondition;
@@ -25,11 +24,7 @@ public final class RecallPolicy {
         if (hasPassengers) {
             return ContextualOutcome.Status.PASSENGER_PRESENT;
         }
-        if (config.isFlyingMountRecallDisabled()
-                && record.getCharacteristics().hasTrait(MountTrait.FLYING)) {
-            return ContextualOutcome.Status.SUMMON_DISALLOWED;
-        }
-        if (!config.getSummoningEntities().allows(record.getEntityTypeId())) {
+        if (!config.allowsSummoning(record.getEntityTypeId(), record.getCharacteristics())) {
             return ContextualOutcome.Status.SUMMON_DISALLOWED;
         }
         if (!config.getDestinationDimensions().allows(destinationDimension)) {
@@ -57,11 +52,7 @@ public final class RecallPolicy {
         if (record.getCondition() != MountCondition.READY_FOR_RECALL || !providerAvailable) {
             return ContextualOutcome.Status.PROVIDER_UNAVAILABLE;
         }
-        if (config.isFlyingMountRecallDisabled()
-                && record.getCharacteristics().hasTrait(MountTrait.FLYING)) {
-            return ContextualOutcome.Status.SUMMON_DISALLOWED;
-        }
-        if (!config.getSummoningEntities().allows(record.getEntityTypeId())) {
+        if (!config.allowsSummoning(record.getEntityTypeId(), record.getCharacteristics())) {
             return ContextualOutcome.Status.SUMMON_DISALLOWED;
         }
         if (!config.getDestinationDimensions().allows(destinationDimension)) {

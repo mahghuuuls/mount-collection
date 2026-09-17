@@ -20,6 +20,13 @@ public final class CollectionSessions {
     private final Map<UUID, Session> sessions = new LinkedHashMap<>();
     private final Map<UUID, Long> requests = new HashMap<>();
     private int cursor;
+    private final java.util.function.Predicate<UUID> suppressOpen;
+
+    public CollectionSessions() { this(owner -> false); }
+
+    public CollectionSessions(java.util.function.Predicate<UUID> suppressOpen) {
+        this.suppressOpen = java.util.Objects.requireNonNull(suppressOpen, "suppressOpen");
+    }
 
     public void request(UUID owner, CollectionIntent intent, long tick,
             CollectionService service, BiConsumer<UUID, IMessage> output) {
@@ -80,6 +87,11 @@ public final class CollectionSessions {
             }
             }
             output.accept(owner, new CollectionReply(intent.getSession(), result));
+        }
+        // A development-only one-shot can omit an OPEN stream, never a mutation response.
+        if (intent.getAction() == CollectionIntent.Action.OPEN && suppressOpen.test(owner)) {
+            sessions.remove(owner);
+            return;
         }
         CollectionView view = service.snapshot(owner, tick);
         List<CollectionPage> pages = CollectionPage.split(intent.getSession(), view);

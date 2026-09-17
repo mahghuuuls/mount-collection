@@ -20,7 +20,7 @@ import net.minecraftforge.fml.common.network.simpleimpl.IMessage;
 
 /** Fixed-version bounded page. Decode validates lengths before allocation. */
 public final class CollectionPage implements IMessage {
-    public static final int VERSION = 4;
+    public static final int VERSION = 5;
     public static final int MAX_ENTRIES = 64;
     public static final int MAX_BYTES = 32768;
     private static final int MAX_TEXT_BYTES = 512;
@@ -109,7 +109,8 @@ public final class CollectionPage implements IMessage {
             out.writeByte(entry.getState().ordinal());
             out.writeLong(entry.getRecoveryTicks());
             out.writeByte(entry.getCharacteristics().getPlacementProfile().ordinal());
-            out.writeByte(entry.getCharacteristics().hasTrait(MountTrait.FLYING) ? 1 : 0);
+            out.writeByte((entry.getCharacteristics().hasTrait(MountTrait.FLYING) ? 1 : 0)
+                    | (entry.isSummoningDisabled() ? 2 : 0));
             byte[] name = encodeText(entry.getCustomName());
             out.writeShort(name.length); out.writeBytes(name);
             PreviewCodec.write(out, entry.getPreview());
@@ -161,13 +162,13 @@ public final class CollectionPage implements IMessage {
                         .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(nameBytes)).toString();
             } catch (CharacterCodingException invalid) { throw new IllegalArgumentException("invalid name Unicode", invalid); }
             if (state >= CollectionView.State.values().length
-                    || profile >= PlacementProfile.values().length || (traits & ~1) != 0) {
+                    || profile >= PlacementProfile.values().length || (traits & ~3) != 0) {
                 throw new IllegalArgumentException("unknown presentation identifier");
             }
             decoded.add(new CollectionView.Entry(mount, key, ordinal, order,
                     CollectionView.State.values()[state], ticks, new MountCharacteristics(
-                            PlacementProfile.values()[profile], traits == 0
-                                    ? Collections.emptySet() : EnumSet.of(MountTrait.FLYING)), name, PreviewCodec.read(in)));
+                            PlacementProfile.values()[profile], (traits & 1) == 0
+                                    ? Collections.emptySet() : EnumSet.of(MountTrait.FLYING)), name, PreviewCodec.read(in), (traits & 2) != 0));
         }
         if (in.isReadable()) { throw new IllegalArgumentException("trailing page bytes"); }
         snapshot = id;

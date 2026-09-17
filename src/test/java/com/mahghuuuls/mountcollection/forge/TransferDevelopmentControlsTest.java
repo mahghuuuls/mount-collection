@@ -9,6 +9,29 @@ import com.mahghuuuls.mountcollection.persistence.RestorationPhase;
 import org.junit.jupiter.api.Test;
 
 final class TransferDevelopmentControlsTest {
+    @Test void collectionTimeoutIsOwnerBoundOneShotAndClearedAtLifecycleBoundaries() {
+        java.util.UUID owner = java.util.UUID.randomUUID();
+        java.util.UUID other = java.util.UUID.randomUUID();
+        TransferDevelopmentControls release = new TransferDevelopmentControls(() -> false);
+        assertFalse(release.armCollectionTimeout(owner));
+        assertFalse(release.consumeCollectionTimeout(owner));
+        java.util.concurrent.atomic.AtomicBoolean development = new java.util.concurrent.atomic.AtomicBoolean(true);
+        TransferDevelopmentControls controls = new TransferDevelopmentControls(development::get);
+        assertTrue(controls.armCollectionTimeout(owner));
+        controls.clearCollectionTimeout(other);
+        assertFalse(controls.consumeCollectionTimeout(other));
+        development.set(false);
+        assertFalse(controls.consumeCollectionTimeout(owner));
+        development.set(true);
+        assertTrue(controls.consumeCollectionTimeout(owner));
+        assertFalse(controls.consumeCollectionTimeout(owner));
+        controls.armCollectionTimeout(owner);
+        controls.clearCollectionTimeout(owner);
+        assertFalse(controls.consumeCollectionTimeout(owner));
+        controls.armCollectionTimeout(owner);
+        controls.clear();
+        assertFalse(controls.consumeCollectionTimeout(owner));
+    }
 
     @Test
     void controlsAreUnavailableAndCannotBeArmedOutsideDevelopment() {

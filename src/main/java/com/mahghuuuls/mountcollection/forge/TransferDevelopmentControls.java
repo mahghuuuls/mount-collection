@@ -5,7 +5,7 @@ import com.mahghuuuls.mountcollection.persistence.RestorationPhase;
 import java.util.Objects;
 import java.util.function.BooleanSupplier;
 
-/** Bounded one-shot transfer controls available only in a deobfuscated development runtime. */
+/** Bounded development faults for transfers and collection loading; unavailable in release runtimes. */
 final class TransferDevelopmentControls {
 
     enum Fault {
@@ -23,6 +23,23 @@ final class TransferDevelopmentControls {
     private RestorationPhase restorationFatalAfterIntent;
     private RestorationPhase restorationPausePhase;
     private boolean recoveryProviderUnavailable;
+    private java.util.UUID suppressedCollectionOwner;
+
+    synchronized boolean armCollectionTimeout(java.util.UUID owner) {
+        if (!isAvailable() || owner == null) { return false; }
+        suppressedCollectionOwner = owner;
+        return true;
+    }
+
+    synchronized boolean consumeCollectionTimeout(java.util.UUID owner) {
+        if (!isAvailable() || !owner.equals(suppressedCollectionOwner)) { return false; }
+        suppressedCollectionOwner = null;
+        return true;
+    }
+
+    synchronized void clearCollectionTimeout(java.util.UUID owner) {
+        if (owner.equals(suppressedCollectionOwner)) { suppressedCollectionOwner = null; }
+    }
 
     TransferDevelopmentControls() {
         this(net.minecraftforge.fml.relauncher.FMLLaunchHandler::isDeobfuscatedEnvironment);
@@ -142,6 +159,7 @@ final class TransferDevelopmentControls {
     }
 
     synchronized void clear() {
+        suppressedCollectionOwner = null;
         fault = Fault.NONE;
         faultUsesRemaining = 0;
         pausePhase = null;
@@ -164,7 +182,8 @@ final class TransferDevelopmentControls {
                         ? "NONE" : restorationFatalAfterIntent.name())
                 + " recoveryPause="
                 + (restorationPausePhase == null ? "NONE" : restorationPausePhase.name())
-                + " recoveryProviderUnavailable=" + recoveryProviderUnavailable;
+                + " recoveryProviderUnavailable=" + recoveryProviderUnavailable
+                + (suppressedCollectionOwner == null ? "" : " collectionTimeoutOwner=" + suppressedCollectionOwner);
     }
 
     private boolean consumeFault(Fault expected) {

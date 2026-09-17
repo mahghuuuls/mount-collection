@@ -37,6 +37,18 @@ final class PreviewRendererTest {
         assertFalse(state.enabled);
         assertArrayEquals(new int[] {7, 11, 20, 30}, state.rectangle);
     }
+    @Test void scissorQueryMeetsLwjgl2BufferContractAndRestoresOnlyRectangle() {
+        IntBuffer saved = PreviewRenderer.scissorQueryBuffer();
+        // Exercise LWJGL's actual pre-native validation without an OpenGL context.
+        assertDoesNotThrow(() -> org.lwjgl.BufferChecks.checkBuffer(saved, 16));
+        saved.put(0, 7).put(1, 11).put(2, 20).put(3, 30);
+        for (int i = 4; i < saved.capacity(); i++) { saved.put(i, -1); }
+        FakeScissor state = new FakeScissor();
+        PreviewRenderer.restoreScissor(state, true, saved);
+        assertTrue(state.enabled);
+        assertArrayEquals(new int[] {7, 11, 20, 30}, state.rectangle);
+        assertEquals(0, saved.position(), "absolute reads must leave the query buffer reusable");
+    }
     private static final class FakeScissor implements PreviewRenderer.ScissorState {
         boolean enabled;
         int[] rectangle;

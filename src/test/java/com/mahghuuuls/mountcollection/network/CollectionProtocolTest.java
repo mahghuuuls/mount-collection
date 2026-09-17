@@ -19,6 +19,25 @@ import java.util.UUID;
 import org.junit.jupiter.api.Test;
 
 final class CollectionProtocolTest {
+    @Test void summoningRestrictionAndFlightAreIndependentWireFlags() {
+        for (boolean flying : new boolean[] {false, true}) {
+            for (boolean disabled : new boolean[] {false, true}) {
+                MountCharacteristics traits = new MountCharacteristics(PlacementProfile.WATER,
+                        flying ? EnumSet.of(MountTrait.FLYING) : Collections.emptySet());
+                CollectionView.Entry row = new CollectionView.Entry(MountId.create(), "horse", 1, 1,
+                        CollectionView.State.LIVING, 0, traits, "", null, disabled);
+                ByteBuf bytes = Unpooled.buffer();
+                try {
+                    new CollectionPage(UUID.randomUUID(), 0, 0, Collections.singletonList(row)).toBytes(bytes);
+                    CollectionPage decoded = new CollectionPage(); decoded.fromBytes(bytes.duplicate());
+                    assertEquals(disabled, decoded.getEntries().get(0).isSummoningDisabled());
+                    assertEquals(flying, decoded.getEntries().get(0).getCharacteristics().hasTrait(MountTrait.FLYING));
+                    bytes.setByte(0, 4);
+                    assertThrows(IllegalArgumentException.class, () -> new CollectionPage().fromBytes(bytes.duplicate()));
+                } finally { bytes.release(); }
+            }
+        }
+    }
     @Test void namedPresentationRoundTripsSupplementaryCharactersAndRejectsInvalidLengths() {
         String name = String.join("", Collections.nCopies(32, "\ud83d\udc0e"));
         CollectionView.Entry row = new CollectionView.Entry(MountId.create(), "horse", 1, 1,
