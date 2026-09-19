@@ -269,6 +269,9 @@ public final class CommonBootstrap {
         if (event.getEntityLiving().world.isRemote || event.isCanceled()) {
             return;
         }
+        if (event.getEntityLiving() instanceof EntityPlayerMP) {
+            network.invalidatePlayerExperience(event.getEntityLiving().getUniqueID());
+        }
         java.util.Optional<com.mahghuuuls.mountcollection.lifecycle.MountLifecycleService>
                 lifecycle = services.getLifecycleService();
         if (!lifecycle.isPresent()) {
@@ -357,6 +360,7 @@ public final class CommonBootstrap {
     @SubscribeEvent
     public void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
         if (event.player instanceof EntityPlayerMP) {
+            network.playerLoggedIn((EntityPlayerMP) event.player);
             transferRecovery.playerJoined();
             deliverPendingNotification(event.player.getUniqueID());
         }
@@ -374,6 +378,11 @@ public final class CommonBootstrap {
         }
         activeRepository.get().consumePendingNotification(ownerId)
                 .ifPresent(key -> owner.sendMessage(new TextComponentTranslation(key)));
+    }
+
+    @SubscribeEvent
+    public void onPlayerChangedDimension(PlayerEvent.PlayerChangedDimensionEvent event) {
+        network.invalidatePlayerExperience(event.player.getUniqueID());
     }
 
     @SubscribeEvent

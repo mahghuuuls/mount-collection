@@ -29,6 +29,10 @@ public final class MountNetwork {
             owner -> services.consumeCollectionTimeout(owner));
     private final CollectionIngress collectionIngress = new CollectionIngress();
     private Consumer<IMessage> clientCollectionReceiver = ignored -> { };
+    private java.util.function.BiConsumer<ExperienceProtocol, Object> clientProtocolReceiver = (message, connection) -> { };
+    private final Map<UUID, ContextualSession> contextualSessions = new java.util.HashMap<>();
+    private UUID clientSession;
+    private long clientSequence;
 
     public void preInitialize(MountCollectionServices services) {
         if (this.services != null) {
@@ -45,7 +49,7 @@ public final class MountNetwork {
                     if (!services.submitLifecycleMutation(task)) { throw new java.util.concurrent.RejectedExecutionException(); }
                 } else { player.getServerWorld().addScheduledTask(task); }
             }, admitted -> {
-                if (!player.connection.getNetworkManager().isChannelOpen()) { return; }
+                if (!currentPlayer(player) || !protocolReady(player)) { return; }
                 try {
                     CollectionService service = services.getActiveRepository()
                             .map(repository -> new CollectionService(repository, services.getProviderRegistry(),
@@ -73,6 +77,42 @@ public final class MountNetwork {
         channel.registerMessage((IMessageHandler<CollectionReply, IMessage>) (message, context) -> {
             clientCollectionReceiver.accept(message); return null;
         }, CollectionReply.class, 4, Side.CLIENT);
+        channel.registerMessage((IMessageHandler<ExperienceProtocol, IMessage>) (message, context) -> {
+            clientProtocolReceiver.accept(message, context.netHandler);
+            return null;
+        }, ExperienceProtocol.class, 5, Side.CLIENT);
+        channel.registerMessage((IMessageHandler<ExperienceProtocolAck, IMessage>) (message, context) -> {
+            EntityPlayerMP player = context.getServerHandler().player;
+            player.getServerWorld().addScheduledTask(() -> {
+                ContextualSession session = contextualSessions.get(player.getUniqueID());
+                if (session != null && currentPlayer(player)) { session.acknowledge(message.getSession()); }
+            });
+            return null;
+        }, ExperienceProtocolAck.class, 6, Side.SERVER);
+    }
+
+    public void setClientProtocolReceiver(java.util.function.BiConsumer<ExperienceProtocol, Object> receiver) {
+        clientProtocolReceiver = Objects.requireNonNull(receiver);
+    }
+    public void acceptClientProtocol(ExperienceProtocol message) {
+        clientSession = message.getSession();
+        clientSequence = 0L;
+        channel.sendToServer(new ExperienceProtocolAck(clientSession));
+    }
+    public void clearClientProtocol() { clientSession = null; clientSequence = 0L; }
+
+    public void playerLoggedIn(EntityPlayerMP player) {
+        ContextualSession session = new ContextualSession();
+        contextualSessions.put(player.getUniqueID(), session);
+        channel.sendTo(new ExperienceProtocol(session.id()), player);
+    }
+    private boolean currentPlayer(EntityPlayerMP player) {
+        return player.isEntityAlive() && player.connection.getNetworkManager().isChannelOpen()
+                && player.getServer().getPlayerList().getPlayerByUUID(player.getUniqueID()) == player;
+    }
+    private boolean protocolReady(EntityPlayerMP player) {
+        ContextualSession session = contextualSessions.get(player.getUniqueID());
+        return session != null && session.isReady();
     }
 
     public void setClientCollectionReceiver(Consumer<IMessage> receiver) {
@@ -95,10 +135,15 @@ public final class MountNetwork {
         }
     }
     public void sendCollectionIntent(CollectionIntent intent) { channel.sendToServer(intent); }
-    public void collectionTick() { collections.tick(services.getActiveServerClock().now(), this::sendCollection); }
+    public void collectionTick() {
+        collections.tick(services.getActiveServerClock().now(), this::sendCollection);
+        services.getExperience().retainPending(request -> services.getActiveRepository().map(repository ->
+                repository.findTransfer(request).isPresent() || repository.findRestoration(request).isPresent()).orElse(false));
+    }
     public void clearCollectionSessions() {
         collections.clear();
         collectionIngress.clear();
+        contextualSessions.clear();
     }
     private void sendCollection(UUID owner, IMessage message) {
         net.minecraft.server.MinecraftServer server = FMLCommonHandler.instance().getMinecraftServerInstance();
@@ -132,14 +177,25 @@ public final class MountNetwork {
     }
 
     public void sendContextualIntent() {
-        channel.sendToServer(new ContextualIntentMessage());
+        if (clientSession != null && clientSequence < Long.MAX_VALUE) {
+            // The preference field is transported now; boarding is introduced separately.
+            channel.sendToServer(new ContextualIntentMessage(clientSession, ++clientSequence, true));
+        }
     }
 
     public void playerLoggedOut(EntityPlayerMP player) {
         services.clearCollectionTimeout(player.getUniqueID());
         intentGate.remove(player.getUniqueID());
+        contextualSessions.remove(player.getUniqueID());
+        services.getExperience().removeOwner(player.getUniqueID());
         collections.remove(player.getUniqueID());
         collectionIngress.remove(player.getUniqueID());
+    }
+
+    public void invalidatePlayerExperience(UUID owner) {
+        ContextualSession session = contextualSessions.get(owner);
+        if (session != null) { session.invalidatePending(); }
+        services.getExperience().removeOwner(owner);
     }
 
     private final class ContextualIntentHandler
@@ -148,27 +204,49 @@ public final class MountNetwork {
         @Override
         public IMessage onMessage(ContextualIntentMessage message, MessageContext context) {
             EntityPlayerMP player = context.getServerHandler().player;
-            player.getServerWorld().addScheduledTask(() -> handleOnServerThread(player));
+            player.getServerWorld().addScheduledTask(() -> handleOnServerThread(player, message));
             return null;
         }
     }
 
-    private void handleOnServerThread(EntityPlayerMP player) {
+    private void handleOnServerThread(EntityPlayerMP player, ContextualIntentMessage message) {
+        ContextualSession session = contextualSessions.get(player.getUniqueID());
+        if (!currentPlayer(player) || session == null || !session.admit(message)) { return; }
         long activeTick = services.getActiveServerClock().now();
         if (!intentGate.acquire(player.getUniqueID(), activeTick)) {
             return;
         }
-        if (!services.submitLifecycleMutation(() -> executeContextualIntent(player))) {
+        int dimension = player.dimension;
+        long generation = session.generation();
+        if (!services.submitLifecycleMutation(() -> {
+            if (currentPlayer(player) && player.dimension == dimension
+                    && session.generation() == generation
+                    && contextualSessions.get(player.getUniqueID()) == session) {
+                executeContextualIntent(player, session, dimension);
+            }
+        })) {
             player.sendMessage(new TextComponentTranslation(
                     ContextualOutcome.Status.INTERNAL_FAILURE.getTranslationKey()));
         }
     }
 
-    private void executeContextualIntent(EntityPlayerMP player) {
+    private void executeContextualIntent(EntityPlayerMP player, ContextualSession session, int dimension) {
+        UUID request = UUID.randomUUID();
+        long generation = session.generation();
+        if (!services.getExperience().admit(request, player.getUniqueID(),
+                () -> currentPlayer(player) && player.dimension == dimension
+                        && session.generation() == generation
+                        && contextualSessions.get(player.getUniqueID()) == session)) {
+            player.sendMessage(new TextComponentTranslation(ContextualOutcome.Status.TEMPORARILY_UNAVAILABLE.getTranslationKey()));
+            return;
+        }
         ContextualOutcome outcome = executeLifecycleIntent(() -> services.getLifecycleService()
-                .map(service -> service.handleContextualIntent(player))
+                .map(service -> service.handleContextualIntent(player, request))
                 .orElseGet(() -> ContextualOutcome.failure(
                         ContextualOutcome.Status.INTERNAL_FAILURE)));
+        boolean pending = services.getActiveRepository().map(repository ->
+                repository.findTransfer(request).isPresent() || repository.findRestoration(request).isPresent()).orElse(false);
+        if (!pending) { services.getExperience().cancel(request); }
         player.sendMessage(new TextComponentTranslation(outcome.getStatus().getTranslationKey()));
     }
 

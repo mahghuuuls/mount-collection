@@ -201,6 +201,12 @@ final class RecoveryLifecycleServiceTest {
         TestProvider provider = new TestProvider(false);
         FakeRecoveryWorld world = new FakeRecoveryWorld();
         MountLifecycleService service = service(repository, clock, provider, world, 0L);
+        java.util.List<ExperienceCompletion> effects = new java.util.ArrayList<>();
+        service.setCompletionSink(event -> {
+            assertTrue(repository.getPendingRestorations().isEmpty());
+            assertEquals(world.candidateId, event.getEntityId());
+            effects.add(event);
+        });
         assertEquals(RecoveryDeathOutcome.Status.PROTECTED,
                 service.commitCapturedRecovery(
                         record, physical, record.getLastKnown(),
@@ -215,6 +221,9 @@ final class RecoveryLifecycleServiceTest {
         assertEquals(MountCondition.LIVING, restored.getCondition());
         assertEquals(world.candidateId, restored.getPhysicalEntityId());
         assertTrue(restored.getRecoveryState() == null);
+        assertEquals(1, effects.size());
+        service.reconcilePendingRestorations();
+        assertEquals(1, effects.size());
         assertTrue(repository.getPendingRestorations().isEmpty());
         assertEquals(1, world.spawnCalls);
     }
@@ -440,6 +449,45 @@ final class RecoveryLifecycleServiceTest {
         assertTrue(world.present);
         assertTrue(world.finalized);
         assertEquals(1, world.spawnCalls);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void pendingRestorationCompletionUsesOriginalLiveEligibility(boolean stillCurrent) {
+        MountRepository repository = new MountRepository();
+        MountRecord record = register(repository, UUID.randomUUID());
+        FakeRecoveryWorld world = new FakeRecoveryWorld();
+        world.pausePhase = RestorationPhase.CANDIDATE_SPAWNED;
+        MountLifecycleService service = service(repository, new ActiveServerClock(),
+                new TestProvider(false), world, 0L);
+        service.commitCapturedRecovery(record, record.getPhysicalEntityId(), record.getLastKnown(),
+                new ProviderPayload(1, new NBTTagCompound()), 0L);
+        UUID request = UUID.randomUUID();
+        boolean[] current = {true};
+        java.util.List<ExperienceCompletion> effects = new java.util.ArrayList<>();
+        ExperienceCoordinator coordinator = new ExperienceCoordinator(effects::add, ignored -> {});
+        coordinator.admit(request, record.getOwnerId(), () -> current[0]);
+        service.setCompletionSink(coordinator::complete);
+        service.recallVerified(request, null, record.getOwnerId(), 0,
+                InhibitedStatus.UNAFFECTED, config(0L));
+        assertTrue(repository.findRestoration(request).isPresent());
+        coordinator.retainPending(id -> repository.findRestoration(id).isPresent());
+        service.reconcilePendingRestorations();
+        assertTrue(effects.isEmpty());
+        current[0] = stillCurrent;
+        world.pausePhase = null;
+        service.reconcilePendingRestorations();
+        service.reconcilePendingRestorations();
+        assertTrue(repository.getPendingRestorations().isEmpty());
+        assertEquals(MountCondition.LIVING, repository.find(record.getMountId()).get().getCondition());
+        assertTrue(world.finalized);
+        assertEquals(1, world.spawnCalls);
+        assertEquals(stillCurrent ? 1 : 0, effects.size());
+        if (stillCurrent) {
+            assertEquals(request, effects.get(0).getRequestId());
+            coordinator.complete(effects.get(0));
+            assertEquals(1, effects.size());
+        }
     }
 
     private static MountLifecycleService service(

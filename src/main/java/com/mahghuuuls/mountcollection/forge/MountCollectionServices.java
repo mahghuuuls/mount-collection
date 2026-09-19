@@ -24,6 +24,7 @@ public final class MountCollectionServices {
     private ValidatedMountConfig activeConfig;
     private MountRepository activeRepository;
     private MountLifecycleService lifecycleService;
+    private final com.mahghuuuls.mountcollection.lifecycle.ExperienceCoordinator experience;
 
     MountCollectionServices(
             ProviderRegistry providerRegistry,
@@ -35,7 +36,14 @@ public final class MountCollectionServices {
         this.diagnostics = diagnostics;
         this.inhibitedIntegration = inhibitedIntegration;
         this.lifecycleMutations = new LifecycleMutationExecutor(diagnostics);
+        experience = new com.mahghuuuls.mountcollection.lifecycle.ExperienceCoordinator(
+                new ForgeExperienceDelivery()::deliver,
+                outcome -> diagnostics.detail(
+                        com.mahghuuuls.mountcollection.diagnostics.DiagnosticCategory.LIFECYCLE,
+                        "experience_completion", java.util.Collections.singletonMap("outcome", outcome)));
     }
+
+    public com.mahghuuuls.mountcollection.lifecycle.ExperienceCoordinator getExperience() { return experience; }
 
     public ProviderRegistry getProviderRegistry() {
         return providerRegistry;
@@ -114,12 +122,14 @@ public final class MountCollectionServices {
                         developmentControls::shouldPauseRestoration,
                         developmentControls::restorationPhaseAcknowledged),
                 developmentControls::consumeRecoveryProviderUnavailable);
+        lifecycleService.setCompletionSink(experience::complete);
     }
 
     synchronized void clearActiveConfig() {
         activeConfig = null;
         activeRepository = null;
         lifecycleService = null;
+        experience.clear();
         lifecycleMutations.reset();
         developmentControls.clear();
         diagnostics.setDetailedEnabled(false);

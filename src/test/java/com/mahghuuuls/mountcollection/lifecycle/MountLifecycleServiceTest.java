@@ -51,6 +51,7 @@ final class MountLifecycleServiceTest {
     void policyDenialOccursBeforeRepositoryMutation() {
         MountRepository repository = new MountRepository();
         MountLifecycleService service = service(repository, FilterMode.WHITELIST);
+        service.setCompletionSink(event -> { throw new AssertionError("denial emitted success"); });
 
         RegistrationOutcome outcome = commit(
                 service, UUID.randomUUID(), UUID.randomUUID(), null);
@@ -82,6 +83,11 @@ final class MountLifecycleServiceTest {
         UUID firstOwner = UUID.randomUUID();
         UUID secondOwner = UUID.randomUUID();
         UUID physical = UUID.randomUUID();
+        List<ExperienceCompletion> effects = new ArrayList<>();
+        service.setCompletionSink(event -> {
+            assertTrue(repository.find(event.getMountId()).isPresent());
+            effects.add(event);
+        });
 
         RegistrationOutcome first = commit(service, firstOwner, physical, null);
         RegistrationOutcome repeat = commit(service, firstOwner, physical, first.getMountId().get());
@@ -94,6 +100,8 @@ final class MountLifecycleServiceTest {
         assertEquals(firstOwner, repository.find(first.getMountId().get()).get().getOwnerId());
         assertEquals(1L, repository.inspectCollection(firstOwner).getRevision());
         assertEquals(0L, repository.inspectCollection(secondOwner).getRevision());
+        assertEquals(1, effects.size());
+        assertEquals(ExperienceCompletion.Kind.REGISTERED, effects.get(0).getKind());
     }
 
     @Test
@@ -106,6 +114,52 @@ final class MountLifecycleServiceTest {
 
         assertEquals(RegistrationOutcome.Status.INTEGRITY_CONFLICT, outcome.getStatus());
         assertEquals(0, repository.getTotalRecordCount());
+    }
+
+    @Test
+    void registrationCompletionFailureCannotUndoAcceptedIdentity() {
+        MountRepository repository = new MountRepository();
+        MountLifecycleService service = service(repository, FilterMode.BLACKLIST);
+        UUID owner = UUID.randomUUID(), physical = UUID.randomUUID();
+        service.setCompletionSink(event -> { throw new IllegalStateException("cosmetic failure"); });
+        RegistrationOutcome result = commit(service, owner, physical, null);
+        assertEquals(RegistrationOutcome.Status.SUCCESS, result.getStatus());
+        MountRecord saved = repository.find(result.getMountId().get()).get();
+        assertEquals(owner, saved.getOwnerId());
+        assertEquals(physical, saved.getPhysicalEntityId());
+        assertEquals(1, repository.getTotalRecordCount());
+    }
+
+    @Test
+    void fatalCompletionEscapesLifecycleUnchangedAfterRegistration() {
+        MountRepository repository = new MountRepository();
+        MountLifecycleService service = service(repository, FilterMode.BLACKLIST);
+        FatalTransferSafetyException fatal = FatalTransferSafetyException.abandonmentFailure(UUID.randomUUID());
+        service.setCompletionSink(event -> { throw fatal; });
+        assertEquals(fatal, org.junit.jupiter.api.Assertions.assertThrows(FatalTransferSafetyException.class,
+                () -> commit(service, UUID.randomUUID(), UUID.randomUUID(), null)));
+        assertEquals(1, repository.getTotalRecordCount());
+    }
+
+    @Test
+    void ordinaryRecallDeliveryFailurePreservesArrivalIdentityAndCooldown() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord record = registered(repository, owner);
+        ActiveServerClock clock = new ActiveServerClock();
+        clock.restore(100L, 0L);
+        FakeRecallWorld gateway = new FakeRecallWorld(record, false, true);
+        MountLifecycleService service = recallService(repository, clock, gateway);
+        service.setCompletionSink(event -> { throw new IllegalStateException("cosmetic failure"); });
+        ContextualOutcome result = service.recallVerified(UUID.randomUUID(), null, owner, 0,
+                InhibitedStatus.UNAFFECTED, config());
+        assertEquals(ContextualOutcome.Status.RECALLED, result.getStatus());
+        MountRecord arrived = repository.find(record.getMountId()).get();
+        assertEquals(record.getPhysicalEntityId(), arrived.getPhysicalEntityId());
+        assertEquals(owner, arrived.getOwnerId());
+        assertEquals(9.0D, arrived.getLastKnown().getX());
+        assertEquals(300L, repository.getRecallCooldownDeadline(owner));
+        assertEquals(1, gateway.commitCalls);
     }
 
     @Test
@@ -162,6 +216,12 @@ final class MountLifecycleServiceTest {
         clock.restore(100L, 0L);
         FakeRecallWorld gateway = new FakeRecallWorld(record, false, true);
         MountLifecycleService service = recallService(repository, clock, gateway);
+        List<ExperienceCompletion> effects = new ArrayList<>();
+        service.setCompletionSink(event -> {
+            assertEquals(300L, repository.getRecallCooldownDeadline(owner));
+            assertEquals(9.0D, repository.find(record.getMountId()).get().getLastKnown().getX());
+            effects.add(event);
+        });
 
         ContextualOutcome outcome = service.recallVerified(
                 UUID.randomUUID(), null, owner, 0, InhibitedStatus.UNAFFECTED, config());
@@ -169,6 +229,8 @@ final class MountLifecycleServiceTest {
         assertEquals(ContextualOutcome.Status.RECALLED, outcome.getStatus());
         assertEquals(300L, repository.getRecallCooldownDeadline(owner));
         assertEquals(9.0D, repository.find(record.getMountId()).get().getLastKnown().getX());
+        assertEquals(1, effects.size());
+        assertEquals(ExperienceCompletion.Kind.ARRIVED, effects.get(0).getKind());
         assertEquals(1, gateway.commitCalls);
         assertEquals(record.getCharacteristics(), gateway.plannedCharacteristics);
         ContextualOutcome repeated = service.recallVerified(
@@ -270,6 +332,12 @@ final class MountLifecycleServiceTest {
         clock.restore(100L, 0L);
         FakeTransferWorld gateway = new FakeTransferWorld(record);
         MountLifecycleService service = recallService(repository, clock, gateway);
+        List<ExperienceCompletion> effects = new ArrayList<>();
+        service.setCompletionSink(event -> {
+            assertTrue(repository.getPendingTransfers().isEmpty());
+            assertEquals(gateway.candidateId, event.getEntityId());
+            effects.add(event);
+        });
 
         ContextualOutcome outcome = service.recallVerified(
                 UUID.randomUUID(), null, owner, 1, InhibitedStatus.UNAFFECTED, config());
@@ -280,6 +348,7 @@ final class MountLifecycleServiceTest {
         assertEquals(1, repository.find(record.getMountId()).get().getLastKnown().getDimensionId());
         assertEquals(characteristics,
                 repository.find(record.getMountId()).get().getCharacteristics());
+        assertEquals(1, effects.size());
         assertEquals(300L, repository.getRecallCooldownDeadline(owner));
         assertTrue(repository.getPendingTransfers().isEmpty());
         assertEquals(1, gateway.spawnCalls);
@@ -517,6 +586,40 @@ final class MountLifecycleServiceTest {
                 repository.find(record.getMountId()).get().getPhysicalEntityId());
         assertEquals(1, gateway.removeSourceCalls);
         assertEquals(1, gateway.finalizeCalls);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void livePendingTransferDeliversOnlyOnceAndSuppressesInvalidatedSession(boolean stillCurrent) {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID(), request = UUID.randomUUID();
+        MountRecord record = registered(repository, owner);
+        FakeTransferWorld gateway = new FakeTransferWorld(record);
+        gateway.pauseAfter = TransferPhase.CANDIDATE_SPAWNED;
+        MountLifecycleService service = recallService(repository, new ActiveServerClock(), gateway);
+        List<ExperienceCompletion> effects = new ArrayList<>();
+        boolean[] current = {true};
+        ExperienceCoordinator coordinator = new ExperienceCoordinator(effects::add, ignored -> {});
+        coordinator.admit(request, owner, () -> current[0]);
+        service.setCompletionSink(coordinator::complete);
+        service.recallVerified(request, null, owner, 1, InhibitedStatus.UNAFFECTED, config());
+        assertTrue(repository.findTransfer(request).isPresent());
+        coordinator.retainPending(id -> repository.findTransfer(id).isPresent());
+        service.reconcilePendingTransfers();
+        assertTrue(effects.isEmpty());
+        current[0] = stillCurrent;
+        gateway.pauseAfter = null;
+        service.reconcilePendingTransfers();
+        service.reconcilePendingTransfers();
+        assertTrue(repository.getPendingTransfers().isEmpty());
+        assertEquals(gateway.candidateId, repository.find(record.getMountId()).get().getPhysicalEntityId());
+        assertEquals(stillCurrent ? 1 : 0, effects.size());
+        if (stillCurrent) {
+            assertEquals(request, effects.get(0).getRequestId());
+            assertEquals(ExperienceCompletion.Kind.ARRIVED, effects.get(0).getKind());
+            coordinator.complete(effects.get(0));
+            assertEquals(1, effects.size());
+        }
     }
 
     @Test

@@ -51,6 +51,22 @@ public final class MountLifecycleService {
     private final RecoveryDeadlineIndex recoveryDeadlines = new RecoveryDeadlineIndex();
     private boolean reconcilingTransfers;
     private boolean abandoning;
+    private java.util.function.Consumer<ExperienceCompletion> completionSink = ignored -> { };
+
+    public void setCompletionSink(java.util.function.Consumer<ExperienceCompletion> sink) {
+        completionSink = Objects.requireNonNull(sink);
+    }
+
+    private void completed(UUID request, UUID owner, MountId mount, UUID entity,
+            LastKnownEvidence location, ExperienceCompletion.Kind kind) {
+        try {
+            completionSink.accept(new ExperienceCompletion(request, owner, mount, entity, location, kind));
+        } catch (FatalTransferSafetyException fatal) {
+            throw fatal;
+        } catch (RuntimeException ignored) {
+            // A presentation consumer cannot turn acknowledged success into transfer failure.
+        }
+    }
 
     public enum AbandonmentResult { SUCCESS, PENDING, STALE, NOT_OWNED, READ_ONLY, BUSY, UNAVAILABLE, SAVE_FAILED }
 
@@ -333,7 +349,11 @@ public final class MountLifecycleService {
     }
 
     public ContextualOutcome handleContextualIntent(EntityPlayerMP player) {
-        UUID correlationId = UUID.randomUUID();
+        return handleContextualIntent(player, UUID.randomUUID());
+    }
+
+    public ContextualOutcome handleContextualIntent(EntityPlayerMP player, UUID correlationId) {
+        Objects.requireNonNull(correlationId, "correlationId");
         Entity ridden = player.getRidingEntity();
         if (ridden == null) {
             return recall(correlationId, player);
@@ -541,6 +561,8 @@ public final class MountLifecycleService {
                 destination.get().getEvidence(),
                 deadline.getValue(),
                 config.getSummonCooldownTicks());
+        completed(correlationId, ownerId, mountId, source.getPhysicalEntityId(),
+                destination.get().getEvidence(), ExperienceCompletion.Kind.ARRIVED);
         Map<String, String> commitFields = new LinkedHashMap<>();
         commitFields.put("correlation", correlationId.toString());
         commitFields.put("mount", mountId.toString());
@@ -863,6 +885,11 @@ public final class MountLifecycleService {
                     }
                     MountRepository.TransferStatus finished =
                             repository.finishRestoration(operationId);
+                    if (finished == MountRepository.TransferStatus.SUCCESS) {
+                        completed(operationId, operation.getOwnerId(), operation.getMountId(),
+                                operation.getCandidateEntityId(), operation.getDestinationEvidence(),
+                                ExperienceCompletion.Kind.ARRIVED);
+                    }
                     return finished == MountRepository.TransferStatus.SUCCESS
                             ? TransferAdvanceOutcome.COMPLETE
                             : finished == MountRepository.TransferStatus.INTEGRITY_CONFLICT
@@ -1420,6 +1447,9 @@ public final class MountLifecycleService {
                         return finished;
                     }
                     recordTransferPhase(operation, null);
+                    completed(operationId, operation.getOwnerId(), operation.getMountId(),
+                            operation.getCandidateEntityId(), operation.getDestinationEvidence(),
+                            ExperienceCompletion.Kind.ARRIVED);
                     return TransferAdvanceOutcome.COMPLETE;
                 case INTEGRITY_BLOCKED:
                 default:
@@ -1641,6 +1671,8 @@ public final class MountLifecycleService {
                     fromRepositoryFailure(result.getStatus()));
         }
         MountRecord record = result.getRecord().get();
+        completed(correlationId, record.getOwnerId(), record.getMountId(), record.getPhysicalEntityId(),
+                record.getLastKnown(), ExperienceCompletion.Kind.REGISTERED);
         recordCharacteristics(correlationId, "registration_characteristics", record);
         return finish(correlationId, providerId.toString(), RegistrationOutcome.success(record.getMountId()));
     }

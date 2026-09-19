@@ -29,6 +29,12 @@ public final class ClientProxy extends CommonProxy {
     @Override
     public void preInitialize(MountNetwork network) {
         this.network = network;
+        network.setClientProtocolReceiver((message, connection) -> {
+            net.minecraft.client.Minecraft client = net.minecraft.client.Minecraft.getMinecraft();
+            client.addScheduledTask(() -> {
+                if (client.getConnection() == connection) { network.acceptClientProtocol(message); }
+            });
+        });
         contextualAction = new KeyBinding(
                 "key.mountcollection.contextual",
                 KeyConflictContext.IN_GAME,
@@ -48,6 +54,11 @@ public final class ClientProxy extends CommonProxy {
             });
         });
         MinecraftForge.EVENT_BUS.register(this);
+    }
+
+    @SubscribeEvent
+    public void onDisconnect(net.minecraftforge.fml.common.network.FMLNetworkEvent.ClientDisconnectionFromServerEvent event) {
+        net.minecraft.client.Minecraft.getMinecraft().addScheduledTask(network::clearClientProtocol);
     }
 
     @SubscribeEvent
