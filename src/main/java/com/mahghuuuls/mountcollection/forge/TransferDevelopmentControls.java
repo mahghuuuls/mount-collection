@@ -54,6 +54,38 @@ final class TransferDevelopmentControls {
         return developmentEnvironment.getAsBoolean();
     }
 
+    enum ResumeResult { QUEUED, UNAVAILABLE, INVALID_ID, MISSING, WRONG_PHASE, QUEUE_REJECTED }
+
+    /** Admission for a single finalization retry; queued work must not cross repository lifetimes. */
+    ResumeResult queueTransferResume(
+            String rawId,
+            java.util.function.Supplier<com.mahghuuuls.mountcollection.persistence.MountRepository> activeRepository,
+            java.util.function.Predicate<Runnable> enqueue,
+            java.util.function.Consumer<com.mahghuuuls.mountcollection.persistence.TransferOperation> resume) {
+        if (!isAvailable()) { return ResumeResult.UNAVAILABLE; }
+        final java.util.UUID id;
+        try {
+            id = java.util.UUID.fromString(rawId);
+            if (!id.toString().equalsIgnoreCase(rawId)) { return ResumeResult.INVALID_ID; }
+        } catch (IllegalArgumentException | NullPointerException invalid) {
+            return ResumeResult.INVALID_ID;
+        }
+        com.mahghuuuls.mountcollection.persistence.MountRepository repository = activeRepository.get();
+        if (repository == null) { return ResumeResult.UNAVAILABLE; }
+        com.mahghuuuls.mountcollection.persistence.TransferOperation operation =
+                repository.findTransfer(id).orElse(null);
+        if (operation == null) { return ResumeResult.MISSING; }
+        // Earlier phases can roll back or require source observation. Do not force them forward.
+        if (operation.getPhase() != TransferPhase.SOURCE_REMOVED) { return ResumeResult.WRONG_PHASE; }
+        boolean accepted = enqueue.test(() -> {
+            if (!isAvailable() || activeRepository.get() != repository) { return; }
+            repository.findTransfer(id)
+                    .filter(current -> current.getPhase() == TransferPhase.SOURCE_REMOVED)
+                    .ifPresent(resume);
+        });
+        return accepted ? ResumeResult.QUEUED : ResumeResult.QUEUE_REJECTED;
+    }
+
     synchronized boolean armFault(Fault requested) {
         if (!isAvailable()
                 || requested == null

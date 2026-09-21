@@ -38,7 +38,8 @@ final class MountCollectionCommand extends CommandBase {
         return "/mountcollection inspect <player <name>|mount <mount-id>>"
                 + " | /mountcollection dev <status|clear|fault <journal_ack|candidate_intent_fatal|source_intent_fatal|fence_post_drain>|pause <stable-phase>>"
                 + " | /mountcollection dev <recovery_fault <candidate_intent_fatal|provider_unavailable>|recovery_pause <prepared|candidate_spawned|associated>>"
-                + " | /mountcollection dev collection_timeout";
+                + " | /mountcollection dev collection_timeout"
+                + " | /mountcollection dev resume_transfer <operation-uuid> (SOURCE_REMOVED only)";
     }
 
     @Override
@@ -96,6 +97,34 @@ final class MountCollectionCommand extends CommandBase {
         if (arguments.length == 2 && "clear".equals(arguments[1])) {
             controls.clear();
             sendDevelopmentStatus(sender, controls);
+            return;
+        }
+        if (arguments.length == 3 && "resume_transfer".equals(arguments[1])) {
+            com.mahghuuuls.mountcollection.lifecycle.MountLifecycleService lifecycle =
+                    services.getLifecycleService().orElseThrow(
+                            () -> new CommandException("Mount Collection lifecycle is unavailable."));
+            TransferDevelopmentControls.ResumeResult result = controls.queueTransferResume(
+                    arguments[2],
+                    () -> services.getActiveRepository().orElse(null),
+                    services::submitLifecycleMutation,
+                    operation -> {
+                        net.minecraft.world.WorldServer world = net.minecraftforge.common.DimensionManager.getWorld(
+                                operation.getDestinationEvidence().getDimensionId());
+                        net.minecraft.entity.Entity candidate = world == null ? null
+                                : world.getEntityFromUuid(operation.getCandidateEntityId());
+                        // Readiness is a real loaded-entity observation, not permission to skip safety fences.
+                        boolean observed = candidate != null && !candidate.isDead;
+                        lifecycle.reconcilePendingTransfer(operation.getOperationId(), false, observed);
+                        sender.sendMessage(new TextComponentString(
+                                "Transfer reconciliation attempted: " + operation.getOperationId()
+                                        + "; candidate loaded=" + observed
+                                        + ". Inspect the mount to verify completion."));
+                    });
+            if (result != TransferDevelopmentControls.ResumeResult.QUEUED) {
+                throw new CommandException("Transfer resume rejected: " + result.name()
+                        + ". Only an existing SOURCE_REMOVED operation can be resumed.");
+            }
+            sender.sendMessage(new TextComponentString("Transfer reconciliation queued; completion is not yet confirmed."));
             return;
         }
         if (arguments.length == 3 && "fault".equals(arguments[1])) {

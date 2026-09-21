@@ -589,13 +589,15 @@ final class MountLifecycleServiceTest {
     }
 
     @org.junit.jupiter.params.ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
-    void livePendingTransferDeliversOnlyOnceAndSuppressesInvalidatedSession(boolean stillCurrent) {
+    @org.junit.jupiter.params.provider.CsvSource({"true,CANDIDATE_SPAWNED", "false,CANDIDATE_SPAWNED",
+            "true,SOURCE_REMOVED", "false,SOURCE_REMOVED"})
+    void livePendingTransferDeliversOnlyOnceAndSuppressesInvalidatedSession(
+            boolean stillCurrent, TransferPhase pausePhase) {
         MountRepository repository = new MountRepository();
         UUID owner = UUID.randomUUID(), request = UUID.randomUUID();
         MountRecord record = registered(repository, owner);
         FakeTransferWorld gateway = new FakeTransferWorld(record);
-        gateway.pauseAfter = TransferPhase.CANDIDATE_SPAWNED;
+        gateway.pauseAfter = pausePhase;
         MountLifecycleService service = recallService(repository, new ActiveServerClock(), gateway);
         List<ExperienceCompletion> effects = new ArrayList<>();
         boolean[] current = {true};
