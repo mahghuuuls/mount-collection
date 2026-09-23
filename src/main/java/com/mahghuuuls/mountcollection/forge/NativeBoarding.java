@@ -26,7 +26,6 @@ final class NativeBoarding {
         } catch (FatalTransferSafetyException fatal) { throw fatal; }
         catch (RuntimeException | LinkageError unavailable) { return false; }
         boolean accepted = false;
-        final double originalX = rider.posX, originalY = rider.posY, originalZ = rider.posZ;
         try {
             if (!rider.startRiding(mount, false)) { return false; }
             if (!links.attached()) { return false; }
@@ -38,8 +37,6 @@ final class NativeBoarding {
         finally {
             if (!accepted) {
                 try {
-                    boolean changed = !links.detached() || rider.posX != originalX
-                            || rider.posY != originalY || rider.posZ != originalZ;
                     if (rider.getRidingEntity() == mount) {
                         try { rider.dismountRidingEntity(); }
                         catch (FatalTransferSafetyException fatal) { throw fatal; }
@@ -50,10 +47,11 @@ final class NativeBoarding {
                     links.removePair();
                     if (!links.detached()) { throw new IllegalStateException("passenger rollback incomplete"); }
                     // A hook may have moved the rider to another vehicle. Never detach or reposition it.
-                    if (changed && !rider.isRiding() && !environment.returnSafely()) {
+                    // Arrival itself may occupy the old pose, even when a native veto changes nothing.
+                    if (!rider.isRiding() && !environment.returnSafely()) {
                         throw new IllegalStateException("no safe unmounted return position");
                     }
-                    if (changed) { environment.synchronize(); }
+                    environment.synchronize();
                 } catch (FatalTransferSafetyException fatal) { throw fatal; }
                 catch (RuntimeException | LinkageError failure) {
                     throw FatalTransferSafetyException.boardingFailure(rider.getUniqueID(), failure);

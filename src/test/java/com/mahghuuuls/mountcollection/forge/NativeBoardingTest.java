@@ -22,7 +22,13 @@ final class NativeBoardingTest {
         Fixture f = new Fixture(); f.rider.mountVeto = true;
         assertFalse(NativeBoarding.board(f.rider, f.mount, f.environment));
         assertNull(f.rider.getRidingEntity()); assertFalse(f.mount.isPassenger(f.rider));
-        assertEquals(0, f.environment.returns); assertEquals(0, f.environment.syncs);
+        assertEquals(1, f.environment.returns); assertEquals(1, f.environment.syncs);
+    }
+
+    @Test void unchangedNativeVetoWithUnsafeReturnIsFatal() {
+        Fixture f = new Fixture(); f.rider.mountVeto = true; f.environment.returnSafe = false;
+        assertThrows(FatalTransferSafetyException.class, () -> NativeBoarding.board(f.rider, f.mount, f.environment));
+        assertEquals(1, f.environment.returns);
     }
 
     @Test void rejectedPoseAndVetoedDismountStillRemoveBothNativeReferences() {

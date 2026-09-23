@@ -377,7 +377,9 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         final double returnX = player.posX, returnY = player.posY, returnZ = player.posZ;
         return NativeBoarding.board(player, mount, new NativeBoarding.Environment() {
             @Override public boolean ready() {
-                return unmountedClear(player, world, returnX, returnY, returnZ);
+                // Arrival may occupy the original pose. Require the same bounded safe-return
+                // search used by rollback, not an empty original pose after the mount arrives.
+                return unmountedReturn(player, world, returnX, returnY, returnZ).isPresent();
             }
             @Override public boolean seatedSafely() {
                 return !(player.world != world || mount.world != world || !isExactLivingEntity(mount, record)
@@ -394,15 +396,11 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
                     return player.world instanceof WorldServer
                             && unmountedClear(player, (WorldServer) player.world, player.posX, player.posY, player.posZ);
                 }
-                double x = returnX, y = returnY, z = returnZ;
-                if (!unmountedClear(player, world, x, y, z)) {
-                    Optional<PlacementSearch.Offset> offset = new PlacementSearch().find(2, 4,
-                            (dx, dy, dz) -> unmountedClear(player, world,
-                                    returnX + dx, returnY + dy, returnZ + dz));
-                    if (!offset.isPresent()) { return false; }
-                    x += offset.get().getX(); y += offset.get().getY(); z += offset.get().getZ();
-                }
-                player.setPosition(x, y, z);
+                Optional<net.minecraft.util.math.Vec3d> destination = unmountedReturn(player, world,
+                        returnX, returnY, returnZ);
+                if (!destination.isPresent()) { return false; }
+                net.minecraft.util.math.Vec3d pose = destination.get();
+                player.setPosition(pose.x, pose.y, pose.z);
                 player.motionX = player.motionY = player.motionZ = 0;
                 player.fallDistance = 0;
                 return unmountedClear(player, world, player.posX, player.posY, player.posZ);
@@ -420,6 +418,16 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
                 }
             }
         });
+    }
+
+    private static Optional<net.minecraft.util.math.Vec3d> unmountedReturn(
+            EntityPlayerMP player, WorldServer world, double x, double y, double z) {
+        if (unmountedClear(player, world, x, y, z)) {
+            return Optional.of(new net.minecraft.util.math.Vec3d(x, y, z));
+        }
+        return new PlacementSearch().find(2, 4,
+                (dx, dy, dz) -> unmountedClear(player, world, x + dx, y + dy, z + dz))
+                .map(offset -> new net.minecraft.util.math.Vec3d(x + offset.getX(), y + offset.getY(), z + offset.getZ()));
     }
 
     private static boolean unmountedClear(EntityPlayerMP player, WorldServer world, double x, double y, double z) {
