@@ -16,6 +16,7 @@ public final class ClientProxy extends CommonProxy {
     private KeyBinding contextualAction;
     private KeyBinding openCollection;
     private MountNetwork network;
+    private ClientRidingPreferences ridingPreferences;
     private final com.mahghuuuls.mountcollection.client.preview.ClientPreviewRegistry previews =
             new com.mahghuuuls.mountcollection.client.preview.ClientPreviewRegistry();
 
@@ -29,6 +30,8 @@ public final class ClientProxy extends CommonProxy {
     @Override
     public void preInitialize(MountNetwork network) {
         this.network = network;
+        ridingPreferences = ClientRidingPreferences.load(new java.io.File(
+                net.minecraft.client.Minecraft.getMinecraft().gameDir, "config/mountcollection-client.cfg"));
         network.setClientProtocolReceiver((message, connection) -> {
             net.minecraft.client.Minecraft client = net.minecraft.client.Minecraft.getMinecraft();
             client.addScheduledTask(() -> {
@@ -70,7 +73,7 @@ public final class ClientProxy extends CommonProxy {
             }
         }
         while (contextualAction.isPressed()) {
-            network.sendContextualIntent();
+            network.sendContextualIntent(ridingPreferences.isAutomaticRiding());
         }
     }
 }

@@ -13,6 +13,18 @@ import org.junit.jupiter.api.Test;
 final class NetworkIntentTest {
 
     @Test
+    void preBoardingBuildIsRejectedEvenThoughItsPacketHasTheSameLength() {
+        ByteBuf intent = Unpooled.buffer();
+        new ContextualIntentMessage(UUID.randomUUID(), 1, true).toBytes(intent);
+        intent.setInt(0, 1);
+        assertThrows(IllegalArgumentException.class, () -> new ContextualIntentMessage().fromBytes(intent));
+        ByteBuf handshake = Unpooled.buffer();
+        new ExperienceProtocol(UUID.randomUUID()).toBytes(handshake);
+        handshake.setInt(0, 1);
+        assertThrows(IllegalArgumentException.class, () -> new ExperienceProtocol().fromBytes(handshake));
+    }
+
+    @Test
     void contextualIntentCarriesOnlyBoundedSessionSequenceAndPreference() {
         UUID session = UUID.randomUUID();
         ContextualIntentMessage message = new ContextualIntentMessage(session, 1, true);

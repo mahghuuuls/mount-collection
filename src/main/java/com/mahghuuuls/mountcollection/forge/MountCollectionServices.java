@@ -24,6 +24,7 @@ public final class MountCollectionServices {
     private ValidatedMountConfig activeConfig;
     private MountRepository activeRepository;
     private MountLifecycleService lifecycleService;
+    private ForgeRecallWorldGateway worldGateway;
     private final com.mahghuuuls.mountcollection.lifecycle.ExperienceCoordinator experience;
 
     MountCollectionServices(
@@ -44,6 +45,34 @@ public final class MountCollectionServices {
     }
 
     public com.mahghuuuls.mountcollection.lifecycle.ExperienceCoordinator getExperience() { return experience; }
+
+    public boolean boardArrived(net.minecraft.entity.player.EntityPlayerMP player,
+            com.mahghuuuls.mountcollection.lifecycle.ExperienceCompletion completion) {
+        boolean boarded = false;
+        try {
+            com.mahghuuuls.mountcollection.persistence.MountRecord record = activeRepository == null ? null
+                    : activeRepository.find(completion.getMountId()).orElse(null);
+            com.mahghuuuls.mountcollection.api.MountProvider provider = record == null ? null
+                    : providerRegistry.find(record.getProviderId()).orElse(null);
+            boarded = record != null && provider != null && worldGateway != null
+                    && record.getCondition() == com.mahghuuuls.mountcollection.persistence.MountCondition.LIVING
+                    && completion.getEntityId().equals(record.getPhysicalEntityId())
+                    && completion.getOwnerId().equals(player.getUniqueID())
+                    && worldGateway.boardArrived(player, record, provider);
+        } catch (com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException fatal) {
+            throw fatal;
+        } catch (RuntimeException | LinkageError rejected) { boarded = false; }
+        try {
+            diagnostics.detail(com.mahghuuuls.mountcollection.diagnostics.DiagnosticCategory.LIFECYCLE,
+                "boarding_outcome", java.util.Collections.singletonMap("outcome",
+                        (boarded ? "BOARDED" : "NOT_BOARDED") + " request=" + completion.getRequestId()));
+        } catch (com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException fatal) {
+            throw fatal;
+        } catch (RuntimeException | LinkageError unavailable) {
+            // Diagnostics must not replace the actual boarding result or suppress player feedback.
+        }
+        return boarded;
+    }
 
     public ProviderRegistry getProviderRegistry() {
         return providerRegistry;
@@ -106,6 +135,11 @@ public final class MountCollectionServices {
 
     synchronized void activateRepository(MountRepository repository) {
         activeRepository = repository;
+        worldGateway = new ForgeRecallWorldGateway(diagnostics,
+                developmentControls::consumePhysicalFencePostDrainFault, developmentControls::shouldPause,
+                developmentControls::phaseAcknowledged, developmentControls::shouldPauseRestoration,
+                developmentControls::restorationPhaseAcknowledged);
+        worldGateway.setRecoveryAdmission(experience::recoveryAdmission);
         lifecycleService = new MountLifecycleService(
                 repository,
                 providerRegistry,
@@ -114,13 +148,7 @@ public final class MountCollectionServices {
                 diagnostics,
                 activeServerClock,
                 inhibitedIntegration,
-                new ForgeRecallWorldGateway(
-                        diagnostics,
-                        developmentControls::consumePhysicalFencePostDrainFault,
-                        developmentControls::shouldPause,
-                        developmentControls::phaseAcknowledged,
-                        developmentControls::shouldPauseRestoration,
-                        developmentControls::restorationPhaseAcknowledged),
+                worldGateway,
                 developmentControls::consumeRecoveryProviderUnavailable);
         lifecycleService.setCompletionSink(experience::complete);
     }
@@ -129,6 +157,7 @@ public final class MountCollectionServices {
         activeConfig = null;
         activeRepository = null;
         lifecycleService = null;
+        worldGateway = null;
         experience.clear();
         lifecycleMutations.reset();
         developmentControls.clear();

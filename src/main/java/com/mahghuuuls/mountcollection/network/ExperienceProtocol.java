@@ -6,7 +6,8 @@ import net.minecraftforge.fml.common.network.simpleimpl.IMessage;
 
 /** Server challenge and client acknowledgement; no gameplay accepted before this exchange. */
 public class ExperienceProtocol implements IMessage {
-    public static final int REVISION = 1;
+    // Revision 1 reserved the preference field but did not implement rider-safe recall.
+    public static final int REVISION = 2;
     private UUID session;
     public ExperienceProtocol() { }
     public ExperienceProtocol(UUID session) { this.session = java.util.Objects.requireNonNull(session); }

@@ -43,6 +43,100 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 final class RecoveryLifecycleServiceTest {
+    @Test
+    void initialPreparedCandidateIsUsedInsteadOfReconstructingAfterPlanning() {
+        MountRepository repository = new MountRepository();
+        MountRecord record = register(repository, UUID.randomUUID());
+        FakeRecoveryWorld world = new FakeRecoveryWorld();
+        world.carryPrepared = true;
+        MountLifecycleService service = service(repository, new ActiveServerClock(), new TestProvider(false), world, 0);
+        service.commitCapturedRecovery(record, record.getPhysicalEntityId(), record.getLastKnown(),
+                new ProviderPayload(1, new NBTTagCompound()), 0);
+        assertEquals(ContextualOutcome.Status.RECALLED, service.recallVerified(UUID.randomUUID(), null,
+                record.getOwnerId(), 0, InhibitedStatus.UNAFFECTED, config(0)).getStatus());
+        assertEquals(1, world.preparedAdmissions);
+        assertEquals(0, world.spawnCalls, "Old reconstruction path must not replace the checked candidate");
+        assertEquals(0, world.preparations);
+    }
+
+    @Test
+    void pauseDiscardsInitialAttemptAndRetryRechecksFreshCandidate() {
+        MountRepository repository = new MountRepository();
+        MountRecord record = register(repository, UUID.randomUUID());
+        FakeRecoveryWorld world = new FakeRecoveryWorld();
+        world.carryPrepared = true;
+        world.pausePhase = RestorationPhase.PREPARED;
+        MountLifecycleService service = service(repository, new ActiveServerClock(), new TestProvider(false), world, 0);
+        service.commitCapturedRecovery(record, record.getPhysicalEntityId(), record.getLastKnown(),
+                new ProviderPayload(1, new NBTTagCompound()), 0);
+        service.recallVerified(UUID.randomUUID(), null, record.getOwnerId(), 0, InhibitedStatus.UNAFFECTED, config(0));
+        RestorationOperation pending = repository.findRestorationByMount(record.getMountId()).get();
+        RestorationOperation intent = new RestorationOperation(pending.getOperationId(), pending.getMountId(),
+                pending.getOwnerId(), pending.getCandidateEntityId(), pending.getDestinationEvidence(),
+                pending.getCooldownDeadline(), pending.getCooldownDuration(), RestorationPhase.CANDIDATE_SPAWN_INTENT, null);
+        assertEquals(RecallWorldGateway.CandidateAction.UNAVAILABLE, world.initialAttempt.admit(intent));
+        world.pausePhase = null;
+        world.preparationDenied = true; // Fresh reconstruction no longer fits.
+        service.reconcilePendingRestorations();
+        assertEquals(1, world.preparations);
+        assertEquals(0, world.preparedAdmissions);
+        assertEquals(0, world.spawnCalls);
+        assertEquals(RestorationPhase.PREPARED, repository.findRestorationByMount(record.getMountId()).get().getPhase());
+        assertEquals(0L, repository.getRecallCooldownDeadline(record.getOwnerId()));
+        world.preparationDenied = false;
+        service.reconcilePendingRestorations();
+        assertEquals(MountCondition.LIVING, repository.find(record.getMountId()).get().getCondition());
+        assertEquals(1, world.spawnCalls);
+    }
+
+    @Test
+    void finalAdmissionDenialReturnsToStablePhaseWithoutSpawnOrCooldown() {
+        MountRepository repository = new MountRepository();
+        MountRecord record = register(repository, UUID.randomUUID());
+        FakeRecoveryWorld world = new FakeRecoveryWorld();
+        world.carryPrepared = true;
+        world.finalAdmissionDenied = true;
+        MountLifecycleService service = service(repository, new ActiveServerClock(), new TestProvider(false), world, 0);
+        service.commitCapturedRecovery(record, record.getPhysicalEntityId(), record.getLastKnown(),
+                new ProviderPayload(1, new NBTTagCompound()), 0);
+        service.recallVerified(UUID.randomUUID(), null, record.getOwnerId(), 0, InhibitedStatus.UNAFFECTED, config(0));
+        assertEquals(RestorationPhase.PREPARED, repository.findRestorationByMount(record.getMountId()).get().getPhase());
+        assertEquals(0, world.spawnCalls);
+        assertFalse(world.present);
+        assertEquals(0L, repository.getRecallCooldownDeadline(record.getOwnerId()));
+    }
+
+    @Test
+    void automaticRecoveryCannotFallBackToMountOnlyPlanning() {
+        MountRepository repository = new MountRepository();
+        MountRecord record = register(repository, UUID.randomUUID());
+        FakeRecoveryWorld world = new FakeRecoveryWorld();
+        MountLifecycleService service = service(repository, new ActiveServerClock(),
+                new BoardingProvider(), world, 0);
+        service.commitCapturedRecovery(record, record.getPhysicalEntityId(), record.getLastKnown(),
+                new ProviderPayload(1, new NBTTagCompound()), 0);
+        java.util.List<ExperienceCompletion> arrivals = new java.util.ArrayList<>();
+        service.setCompletionSink(event -> {
+            assertEquals(MountCondition.LIVING, repository.find(record.getMountId()).get().getCondition());
+            assertTrue(world.finalized);
+            arrivals.add(event);
+        });
+        assertEquals(ContextualOutcome.Status.NO_SAFE_DESTINATION, service.recallVerified(
+                UUID.randomUUID(), null, record.getOwnerId(), 0, InhibitedStatus.UNAFFECTED, config(0), true).getStatus());
+        assertEquals(0, world.planCalls);
+        assertEquals(0, world.spawnCalls);
+        assertFalse(repository.findRestorationByMount(record.getMountId()).isPresent());
+        assertEquals(0L, repository.getRecallCooldownDeadline(record.getOwnerId()));
+        assertTrue(arrivals.isEmpty());
+        world.riderPlanAllowed = true;
+        assertEquals(ContextualOutcome.Status.RECALLED, service.recallVerified(
+                UUID.randomUUID(), null, record.getOwnerId(), 0, InhibitedStatus.UNAFFECTED, config(0), true).getStatus());
+        assertEquals(2, world.riderPlanCalls);
+        assertEquals(0, world.planCalls);
+        assertEquals(1, world.spawnCalls);
+        assertEquals(1, arrivals.size());
+        assertEquals(20L, repository.getRecallCooldownDeadline(record.getOwnerId()));
+    }
 
     @ParameterizedTest
     @EnumSource(value = RecallWorldGateway.CheckpointStatus.class, names = {"FAILED", "UNAVAILABLE"})
@@ -521,7 +615,7 @@ final class RecoveryLifecycleServiceTest {
 
     private enum CaptureFailure { RETURNED_FAILURE, NULL_RESULT, EMPTY_SUCCESS, EXCEPTION }
 
-    private static final class TestProvider implements MountProvider, RecoverySupport {
+    private static class TestProvider implements MountProvider, RecoverySupport {
         private final boolean failCapture;
         private CaptureFailure captureFailure = CaptureFailure.RETURNED_FAILURE;
         private int captureCalls;
@@ -554,11 +648,39 @@ final class RecoveryLifecycleServiceTest {
         }
     }
 
+    private static final class BoardingProvider extends TestProvider
+            implements com.mahghuuuls.mountcollection.api.BoardingSupport {
+        private BoardingProvider() { super(false); }
+        @Override public ProviderResult<com.mahghuuuls.mountcollection.api.SeatEnvelope> describeBoarding(
+                Entity mount, UUID rider) {
+            throw new AssertionError("Lifecycle must delegate restored-seat inspection to the gateway");
+        }
+    }
+
     private static final class FakeRecoveryWorld implements RecallWorldGateway {
+        private boolean carryPrepared, preparationDenied, finalAdmissionDenied;
+        private int preparations, preparedAdmissions;
+        private RecoveryAttempt initialAttempt;
+        @Override public Optional<RecoveryAttempt> prepareRecoveryAttempt(
+                RestorationOperation operation, MountRecord record, MountProvider provider) {
+            preparations++;
+            return preparationDenied ? Optional.empty()
+                    : Optional.of(new RecoveryAttempt(acknowledged -> spawnRecoveryCandidate(acknowledged, record, provider)));
+        }
         private CheckpointStatus sourceFence = CheckpointStatus.VERIFIED;
         private LastKnownEvidence actualLocation;
         private int fenceCalls;
         private int planCalls;
+        private int riderPlanCalls;
+        private boolean riderPlanAllowed;
+        @Override public Optional<RecoveryPlan> planRecoveryWithRider(
+                net.minecraft.entity.player.EntityPlayerMP player, MountRecord record,
+                MountProvider provider, int normalRadius, int fallbackRadius) {
+            riderPlanCalls++;
+            return riderPlanAllowed ? Optional.of(new RecoveryPlan(candidateId,
+                    new Destination(new LastKnownEvidence(0, 8, 64, 8), record.getCharacteristics())))
+                    : Optional.empty();
+        }
         @Override public RecoveryEvidence recoverySourceEvidence(MountRecord record) {
             return new RecoveryEvidence(TransferEvidence.Presence.MISSING, null);
         }
@@ -599,6 +721,17 @@ final class RecoveryLifecycleServiceTest {
                 net.minecraft.entity.player.EntityPlayerMP player, MountRecord record,
                 MountProvider provider, int normalRadius, int fallbackRadius) {
             planCalls++;
+            if (carryPrepared) {
+                initialAttempt = new RecoveryAttempt(acknowledged -> {
+                    assertEquals(RestorationPhase.CANDIDATE_SPAWN_INTENT, acknowledged.getPhase());
+                    preparedAdmissions++;
+                    if (finalAdmissionDenied) { return CandidateAction.UNAVAILABLE; }
+                    present = true;
+                    return CandidateAction.SUCCESS;
+                });
+                return Optional.of(new RecoveryPlan(candidateId,
+                        new Destination(new LastKnownEvidence(0, 8, 64, 8)), initialAttempt));
+            }
             return Optional.of(new RecoveryPlan(candidateId,
                     new Destination(new LastKnownEvidence(0, 8.0D, 64.0D, 8.0D))));
         }

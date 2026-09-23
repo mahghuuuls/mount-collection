@@ -24,6 +24,7 @@ public final class ContextualOutcome {
         INHIBITED("mountcollection.message.inhibited"),
         COOLDOWN("mountcollection.message.cooldown"),
         NO_SAFE_DESTINATION("mountcollection.message.no_safe_destination"),
+        BOARDING_UNSUPPORTED("mountcollection.message.boarding_unsupported"),
         OPERATION_IN_PROGRESS("mountcollection.message.operation_in_progress"),
         INTEGRITY_CONFLICT("mountcollection.message.integrity_conflict"),
         TEMPORARILY_UNAVAILABLE("mountcollection.message.temporarily_unavailable"),

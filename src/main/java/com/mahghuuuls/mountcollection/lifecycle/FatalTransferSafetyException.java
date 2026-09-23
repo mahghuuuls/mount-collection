@@ -7,7 +7,8 @@ import java.util.UUID;
 
 /**
  * Signals that a durable physical-action intent could not be closed, rolled back, or
- * quarantined, or that an acknowledged captured source could not complete containment.
+ * quarantined, that an acknowledged captured source could not complete containment,
+ * or that a rejected native boarding attempt could not be safely rolled back.
  * This exception must escape the server-tick END listener so Minecraft stops before
  * controlled evidence can move during another tick or later event callback.
  */
@@ -58,6 +59,14 @@ public final class FatalTransferSafetyException extends RuntimeException {
                 "abandonment safe state could not be acknowledged");
     }
 
+    /** A rejected native attachment must not leave an unsafe rider ticking. */
+    public static FatalTransferSafetyException boardingFailure(UUID riderId, Throwable cause) {
+        FatalTransferSafetyException failure = new FatalTransferSafetyException(riderId,
+                "boarding rollback could not be contained");
+        failure.initCause(cause);
+        return failure;
+    }
+
     private FatalTransferSafetyException(UUID operationId, String reason) {
         super(reason);
         this.operationId = Objects.requireNonNull(operationId, "operationId");
@@ -87,7 +96,10 @@ public final class FatalTransferSafetyException extends RuntimeException {
 
     public String boundedDiagnosticDetail() {
         Object activePhase = phase == null ? restorationPhase : phase;
-        if (activePhase == null) { activePhase = getMessage().startsWith("abandonment") ? "ABANDONMENT" : "CAPTURED_SOURCE"; }
+        if (activePhase == null) {
+            activePhase = getMessage().startsWith("boarding") ? "BOARDING"
+                    : getMessage().startsWith("abandonment") ? "ABANDONMENT" : "CAPTURED_SOURCE";
+        }
         return "operation=" + operationId + " phase=" + activePhase + " reason=" + getMessage();
     }
 }

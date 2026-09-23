@@ -8,6 +8,71 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
 final class ExperienceCoordinatorTest {
+    @Test void recoveryContextErrorsDoNotBecomeExpiredOrConsumeCompletion() {
+        AtomicInteger delivered = new AtomicInteger();
+        ExperienceCoordinator coordinator = new ExperienceCoordinator(event -> delivered.incrementAndGet(), ignored -> {});
+        UUID request = UUID.randomUUID(), owner = UUID.randomUUID();
+        java.util.concurrent.atomic.AtomicBoolean broken = new java.util.concurrent.atomic.AtomicBoolean(true);
+        coordinator.admit(request, owner, () -> true, ignored -> {}, () -> {
+            if (broken.get()) { throw new IllegalStateException("lookup failed"); }
+            return RecoveryAdmission.optOut();
+        });
+        assertEquals(RecoveryAdmission.Mode.UNAVAILABLE, coordinator.recoveryAdmission(request, owner).getMode());
+        assertEquals(RecoveryAdmission.Mode.UNAVAILABLE, coordinator.recoveryAdmission(request, UUID.randomUUID()).getMode());
+        broken.set(false);
+        assertEquals(RecoveryAdmission.Mode.OPT_OUT, coordinator.recoveryAdmission(request, owner).getMode());
+        coordinator.complete(completion(request, owner));
+        assertEquals(1, delivered.get());
+        assertEquals(RecoveryAdmission.Mode.EXPIRED, coordinator.recoveryAdmission(request, owner).getMode());
+    }
+
+    @Test void expiryCannotBeRevivedAndFatalAdmissionFailuresEscape() {
+        ExperienceCoordinator coordinator = new ExperienceCoordinator(event -> fail("expired request replay"), ignored -> {});
+        UUID request = UUID.randomUUID(), owner = UUID.randomUUID();
+        java.util.concurrent.atomic.AtomicBoolean current = new java.util.concurrent.atomic.AtomicBoolean(true);
+        FatalTransferSafetyException fatal = FatalTransferSafetyException.abandonmentFailure(UUID.randomUUID());
+        coordinator.admit(request, owner, current::get, ignored -> {}, () -> { throw fatal; });
+        assertSame(fatal, assertThrows(FatalTransferSafetyException.class,
+                () -> coordinator.recoveryAdmission(request, owner)));
+        current.set(false);
+        assertEquals(RecoveryAdmission.Mode.EXPIRED, coordinator.recoveryAdmission(request, owner).getMode());
+        current.set(true);
+        assertEquals(RecoveryAdmission.Mode.EXPIRED, coordinator.recoveryAdmission(request, owner).getMode());
+        coordinator.complete(completion(request, owner));
+        assertEquals(RecoveryAdmission.Mode.UNAVAILABLE, RecoveryAdmission.automatic(null).getMode());
+    }
+    @Test void boardingStillRunsOnceAfterCosmeticFailureAndCannotReplay() {
+        AtomicInteger boarded = new AtomicInteger();
+        ExperienceCoordinator coordinator = new ExperienceCoordinator(event -> { throw new IllegalStateException(); }, ignored -> {});
+        UUID request = UUID.randomUUID(), owner = UUID.randomUUID();
+        coordinator.admit(request, owner, () -> true, event -> boarded.incrementAndGet());
+        ExperienceCompletion event = completion(request, owner);
+        coordinator.complete(event); coordinator.complete(event);
+        assertEquals(1, boarded.get());
+    }
+
+    @Test void registrationAndSessionInvalidationNeverBoard() {
+        java.util.concurrent.atomic.AtomicBoolean current = new java.util.concurrent.atomic.AtomicBoolean(true);
+        ExperienceCoordinator coordinator = new ExperienceCoordinator(event -> current.set(false), ignored -> {});
+        UUID request = UUID.randomUUID(), owner = UUID.randomUUID();
+        coordinator.admit(request, owner, current::get, event -> fail("stale boarding"));
+        coordinator.complete(completion(request, owner));
+        current.set(true);
+        coordinator.admit(request, owner, () -> true, event -> fail("registration boarding"));
+        coordinator.complete(new ExperienceCompletion(request, owner, MountId.create(), UUID.randomUUID(),
+                new LastKnownEvidence(0, 0, 64, 0), ExperienceCompletion.Kind.REGISTERED));
+    }
+
+    @Test void boardingExceptionDoesNotEscapeButFatalSafetyStillDoes() {
+        ExperienceCoordinator coordinator = new ExperienceCoordinator(event -> {}, ignored -> {});
+        UUID request = UUID.randomUUID(), owner = UUID.randomUUID();
+        coordinator.admit(request, owner, () -> true, event -> { throw new IllegalStateException(); });
+        assertDoesNotThrow(() -> coordinator.complete(completion(request, owner)));
+        FatalTransferSafetyException fatal = FatalTransferSafetyException.abandonmentFailure(UUID.randomUUID());
+        coordinator.admit(request, owner, () -> true, event -> { throw fatal; });
+        assertSame(fatal, assertThrows(FatalTransferSafetyException.class,
+                () -> coordinator.complete(completion(request, owner))));
+    }
     @Test void fatalDeliveryEscapesUnchangedAndConsumesEligibility() {
         FatalTransferSafetyException fatal = FatalTransferSafetyException.abandonmentFailure(UUID.randomUUID());
         ExperienceCoordinator coordinator = new ExperienceCoordinator(event -> { throw fatal; }, ignored -> {});

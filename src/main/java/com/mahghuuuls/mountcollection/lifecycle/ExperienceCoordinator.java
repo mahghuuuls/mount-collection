@@ -20,9 +20,34 @@ public final class ExperienceCoordinator {
     }
 
     public boolean admit(UUID request, UUID owner, BooleanSupplier stillCurrent) {
+        return admit(request, owner, stillCurrent, ignored -> { });
+    }
+
+    public boolean admit(UUID request, UUID owner, BooleanSupplier stillCurrent,
+            Consumer<ExperienceCompletion> boarding) {
+        return admit(request, owner, stillCurrent, boarding, RecoveryAdmission::optOut);
+    }
+
+    public boolean admit(UUID request, UUID owner, BooleanSupplier stillCurrent,
+            Consumer<ExperienceCompletion> boarding, java.util.function.Supplier<RecoveryAdmission> admission) {
         if (pending.size() >= MAX_PENDING || pending.containsKey(request)) { return false; }
-        pending.put(request, new Pending(owner, stillCurrent));
+        pending.put(request, new Pending(owner, stillCurrent, boarding, admission));
         return true;
+    }
+
+    public RecoveryAdmission recoveryAdmission(UUID request, UUID owner) {
+        Pending entry = pending.get(request);
+        if (entry == null) { return RecoveryAdmission.expired(); }
+        if (!entry.owner.equals(owner)) { return RecoveryAdmission.unavailable(); }
+        try {
+            if (!entry.current.getAsBoolean()) {
+                pending.remove(request);
+                return RecoveryAdmission.expired();
+            }
+            RecoveryAdmission result = entry.admission.get();
+            return result == null ? RecoveryAdmission.unavailable() : result;
+        } catch (FatalTransferSafetyException fatal) { throw fatal; }
+        catch (RuntimeException | LinkageError failure) { return RecoveryAdmission.unavailable(); }
     }
 
     public void complete(ExperienceCompletion completion) {
@@ -34,8 +59,17 @@ public final class ExperienceCoordinator {
                 diagnostic.accept(detail("SUPPRESSED_STALE", completion));
                 return;
             }
-            delivery.accept(completion);
-            diagnostic.accept(detail("DELIVERY_ATTEMPTED", completion));
+            boolean cosmeticFailed = false;
+            try { delivery.accept(completion); }
+            catch (FatalTransferSafetyException fatal) { throw fatal; }
+            catch (RuntimeException | LinkageError cosmeticFailure) {
+                cosmeticFailed = true;
+                // A cosmetic failure must not prevent the independent boarding action.
+            }
+            if (completion.getKind() == ExperienceCompletion.Kind.ARRIVED && admitted.current.getAsBoolean()) {
+                admitted.boarding.accept(completion);
+            }
+            diagnostic.accept(detail(cosmeticFailed ? "DELIVERY_FAILED" : "DELIVERY_ATTEMPTED", completion));
         } catch (FatalTransferSafetyException fatal) {
             throw fatal;
         } catch (RuntimeException failure) {
@@ -60,9 +94,14 @@ public final class ExperienceCoordinator {
     private static final class Pending {
         private final UUID owner;
         private final BooleanSupplier current;
-        private Pending(UUID owner, BooleanSupplier current) {
+        private final Consumer<ExperienceCompletion> boarding;
+        private final java.util.function.Supplier<RecoveryAdmission> admission;
+        private Pending(UUID owner, BooleanSupplier current, Consumer<ExperienceCompletion> boarding,
+                java.util.function.Supplier<RecoveryAdmission> admission) {
             this.owner = Objects.requireNonNull(owner);
             this.current = Objects.requireNonNull(current);
+            this.boarding = Objects.requireNonNull(boarding);
+            this.admission = Objects.requireNonNull(admission);
         }
     }
 }

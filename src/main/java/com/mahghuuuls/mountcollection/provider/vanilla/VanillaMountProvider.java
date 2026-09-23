@@ -22,9 +22,24 @@ import net.minecraft.entity.passive.EntityZombieHorse;
 import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.util.ResourceLocation;
 
-public final class VanillaMountProvider implements MountProvider, RecoverySupport {
+public final class VanillaMountProvider implements MountProvider, RecoverySupport,
+        com.mahghuuuls.mountcollection.api.BoardingSupport {
 
     public static final ResourceLocation ID = new ResourceLocation(Tags.MOD_ID, "vanilla");
+
+    @Override
+    public ProviderResult<com.mahghuuuls.mountcollection.api.SeatEnvelope> describeBoarding(
+            Entity mount, UUID riderId) {
+        if (riderId == null || !supports(mount)) {
+            return ProviderResult.failure(ProviderFailure.UNSUPPORTED);
+        }
+        boolean pig = mount instanceof EntityPig;
+        AbstractHorse horse = pig ? null : (AbstractHorse) mount;
+        return VanillaBoarding.describe(pig, mount instanceof EntityLlama, mount.isEntityAlive(),
+                ((net.minecraft.entity.EntityAgeable) mount).isChild(), mount.isBeingRidden(),
+                horse != null && horse.isTame(), pig && ((EntityPig) mount).getSaddled(),
+                mount.getMountedYOffset());
+    }
 
     @Override
     public ResourceLocation getProviderId() {

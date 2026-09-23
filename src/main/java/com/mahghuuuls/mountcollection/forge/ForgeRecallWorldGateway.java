@@ -46,6 +46,7 @@ import net.minecraft.util.ResourceLocation;
 import net.minecraft.util.math.AxisAlignedBB;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.WorldServer;
+import net.minecraft.world.World;
 import net.minecraft.world.chunk.Chunk;
 import net.minecraft.world.chunk.storage.AnvilChunkLoader;
 import net.minecraft.world.gen.ChunkProviderServer;
@@ -54,6 +55,45 @@ import net.minecraftforge.common.DimensionManager;
 
 /** Minecraft 1.12.2-specific bounded lookup and same-world placement adapter. */
 public final class ForgeRecallWorldGateway implements RecallWorldGateway {
+
+    /** Native world/construction operations only; admission ordering and context policy stay here. */
+    interface RecoveryAccess {
+        World world(int dimension);
+        Entity create(World world, MountRecord record, MountProvider provider, UUID id);
+        Entity find(World world, UUID id);
+        boolean spawn(World world, Entity candidate);
+        boolean mountSafe(Entity candidate, MountRecord record);
+        boolean riderSafe(EntityPlayerMP rider, Entity candidate, MountRecord record, MountProvider provider);
+        Optional<Destination> plan(EntityPlayerMP rider, Entity candidate, MountRecord record,
+                MountProvider provider, int normalRadius, int fallbackRadius);
+    }
+
+    private RecoveryAccess recoveryAccess = new RecoveryAccess() {
+        public World world(int dimension) { return resolveWorld(dimension); }
+        public Entity create(World world, MountRecord record, MountProvider provider, UUID id) {
+            return createRecoveryEntity((WorldServer) world, record, provider, id);
+        }
+        public Entity find(World world, UUID id) { return ((WorldServer) world).getEntityFromUuid(id); }
+        public boolean spawn(World world, Entity candidate) { return world.spawnEntity(candidate); }
+        public boolean mountSafe(Entity candidate, MountRecord record) {
+            return safe((WorldServer) candidate.world, candidate, record.getCharacteristics().getPlacementProfile(),
+                    candidate.posX, candidate.posY, candidate.posZ);
+        }
+        public boolean riderSafe(EntityPlayerMP rider, Entity candidate, MountRecord record, MountProvider provider) {
+            com.mahghuuuls.mountcollection.api.SeatEnvelope seat = boardingSeat(rider, candidate, provider);
+            return seat != null && combinedSafe(rider, candidate, record.getCharacteristics().getPlacementProfile(),
+                    seat, candidate.posX, candidate.posY, candidate.posZ, candidate.rotationYaw);
+        }
+        public Optional<Destination> plan(EntityPlayerMP rider, Entity candidate, MountRecord record,
+                MountProvider provider, int normalRadius, int fallbackRadius) {
+            return planRider(rider, candidate, provider, record.getCharacteristics(), normalRadius, fallbackRadius, true);
+        }
+    };
+
+    ForgeRecallWorldGateway(RecoveryAccess recoveryAccess) {
+        this(new AnvilChunkPersistence());
+        this.recoveryAccess = java.util.Objects.requireNonNull(recoveryAccess);
+    }
 
     interface ChunkPersistence {
         void drain() throws Exception;
@@ -202,6 +242,193 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
     }
 
     private final PlacementSearch placementSearch = new PlacementSearch();
+    private java.util.function.BiFunction<UUID, UUID, com.mahghuuuls.mountcollection.lifecycle.RecoveryAdmission>
+            recoveryAdmission = (request, owner) -> com.mahghuuuls.mountcollection.lifecycle.RecoveryAdmission.unavailable();
+
+    void setRecoveryAdmission(java.util.function.BiFunction<UUID, UUID,
+            com.mahghuuuls.mountcollection.lifecycle.RecoveryAdmission> admission) {
+        recoveryAdmission = java.util.Objects.requireNonNull(admission);
+    }
+
+    @Override
+    public Optional<Destination> planWithRider(EntityPlayerMP player, Source source,
+            MountProvider provider, MountCharacteristics characteristics, int normalRadius, int fallbackRadius) {
+        return planRider(player, entity(source), provider, characteristics, normalRadius, fallbackRadius, false);
+    }
+
+    private Optional<Destination> planRider(EntityPlayerMP player, Entity mount,
+            MountProvider provider, MountCharacteristics characteristics, int normalRadius, int fallbackRadius,
+            boolean preserveRestoredYaw) {
+        com.mahghuuuls.mountcollection.api.SeatEnvelope seat = boardingSeat(player, mount, provider);
+        if (seat == null) { return Optional.empty(); }
+        BlockPos origin = player.getPosition();
+        return placementSearch.find(normalRadius, fallbackRadius, (dx, dy, dz) -> combinedSafe(
+                player, mount, characteristics.getPlacementProfile(), seat,
+                origin.getX() + dx + .5D, origin.getY() + dy, origin.getZ() + dz + .5D,
+                preserveRestoredYaw ? mount.rotationYaw
+                        : placementYaw(player, origin.getX() + dx + .5D, origin.getZ() + dz + .5D)))
+                .map(offset -> new Destination(new LastKnownEvidence(player.dimension,
+                        origin.getX() + offset.getX() + .5D, origin.getY() + offset.getY(),
+                        origin.getZ() + offset.getZ() + .5D), characteristics));
+    }
+
+    @Override
+    public Optional<RecoveryPlan> planRecoveryWithRider(EntityPlayerMP player, MountRecord record,
+            MountProvider provider, int normalRadius, int fallbackRadius) {
+        UUID id = UUID.randomUUID();
+        Entity candidate = recoveryAccess.create(player.world, record, provider, id);
+        if (candidate == null) { return Optional.empty(); }
+        return recoveryAccess.plan(player, candidate, record, provider, normalRadius, fallbackRadius)
+                .map(destination -> new RecoveryPlan(id, destination,
+                        preparedRecoveryAttempt(candidate, record, provider, destination.getEvidence())));
+    }
+
+    private static float placementYaw(EntityPlayerMP player, double x, double z) {
+        return (float) (Math.toDegrees(Math.atan2(player.posZ - z, player.posX - x)) - 90.0D);
+    }
+
+    private static com.mahghuuuls.mountcollection.api.SeatEnvelope boardingSeat(
+            EntityPlayerMP player, Entity mount, MountProvider provider) {
+        if (player == null || mount == null || !player.isEntityAlive() || player.isSpectator()
+                || player.isPlayerSleeping() || player.isRiding() || player.isBeingRidden()
+                || !mount.isEntityAlive() || mount.isBeingRidden()
+                || !(provider instanceof com.mahghuuuls.mountcollection.api.BoardingSupport)) { return null; }
+        try {
+            if (!provider.supports(mount)) { return null; }
+            ProviderResult<com.mahghuuuls.mountcollection.api.SeatEnvelope> result =
+                    ((com.mahghuuuls.mountcollection.api.BoardingSupport) provider)
+                            .describeBoarding(mount, player.getUniqueID());
+            return result != null && result.isSuccess() ? result.getValue().orElse(null) : null;
+        } catch (com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException fatal) {
+            throw fatal;
+        } catch (RuntimeException | LinkageError unavailable) { return null; }
+    }
+
+    private static boolean riderDestinationValid(EntityPlayerMP player, Entity mount,
+            MountProvider provider, Destination destination) {
+        if (!destination.getRiderCharacteristics().isPresent()) { return true; }
+        com.mahghuuuls.mountcollection.api.SeatEnvelope seat = boardingSeat(player, mount, provider);
+        LastKnownEvidence target = destination.getEvidence();
+        return seat != null && player.dimension == target.getDimensionId()
+                && combinedSafe(player, mount, destination.getRiderCharacteristics().get().getPlacementProfile(),
+                        seat, target.getX(), target.getY(), target.getZ(),
+                        placementYaw(player, target.getX(), target.getZ()));
+    }
+
+    private static boolean combinedSafe(EntityPlayerMP player, Entity mount, PlacementProfile profile,
+            com.mahghuuuls.mountcollection.api.SeatEnvelope seat, double x, double y, double z, float yaw) {
+        WorldServer world = player.getServerWorld();
+        AxisAlignedBB rider;
+        try {
+            // Sneaking/elytra height cannot make a seat safe: vanilla expands a mounted player.
+            rider = RiderPlacement.envelope(seat, x, y, z, yaw, Math.max(.6D, player.width),
+                    Math.max(1.8D, player.height), player.getYOffset());
+        } catch (IllegalArgumentException invalid) { return false; }
+        AxisAlignedBB body = mount.getEntityBoundingBox().offset(x - mount.posX, y - mount.posY, z - mount.posZ);
+        return safe(world, mount, profile, x, y, z, player)
+                && insideBorder(world, body) && riderClear(world, rider, mount, player);
+    }
+
+    private static boolean riderClear(WorldServer world, AxisAlignedBB box, Entity mount, Entity player) {
+        return RiderPlacement.clear(box, new RiderPlacement.WorldAccess() {
+            @Override public int height() { return world.getHeight(); }
+            @Override public boolean insideBorder(AxisAlignedBB bounds) {
+                return ForgeRecallWorldGateway.insideBorder(world, bounds);
+            }
+            @Override public boolean loaded(AxisAlignedBB bounds) { return allLoaded(world, bounds); }
+            @Override public boolean blocksClear(AxisAlignedBB bounds) {
+                return world.getCollisionBoxes(null, bounds).isEmpty();
+            }
+            @Override public boolean entitiesClear(AxisAlignedBB bounds) {
+                return pairCollisionFree(world, bounds, mount, player);
+            }
+            @Override public IBlockState blockAt(int x, int y, int z) {
+                return world.getBlockState(new BlockPos(x, y, z));
+            }
+        });
+    }
+
+    private static boolean insideBorder(WorldServer world, AxisAlignedBB box) {
+        net.minecraft.world.border.WorldBorder border = world.getWorldBorder();
+        // WorldBorder.contains(AABB) accepts partial overlap, not full containment.
+        return box.minX >= border.minX() && box.maxX <= border.maxX()
+                && box.minZ >= border.minZ() && box.maxZ <= border.maxZ();
+    }
+
+    private static boolean pairCollisionFree(WorldServer world, AxisAlignedBB box, Entity mount, Entity rider) {
+        for (Entity other : world.getEntitiesWithinAABBExcludingEntity(null, box)) {
+            if (other != mount && other != rider && !other.isDead
+                    && (other.canBeCollidedWith() || other.preventEntitySpawning)) { return false; }
+        }
+        return true;
+    }
+
+    @Override
+    public boolean boardArrived(EntityPlayerMP player, MountRecord record, MountProvider provider) {
+        if (player == null || record.getLastKnown() == null || player.dimension != record.getLastKnown().getDimensionId()
+                || !player.getUniqueID().equals(record.getOwnerId()) || record.getPhysicalEntityId() == null) { return false; }
+        WorldServer world = player.getServerWorld();
+        Entity mount = world.getEntityFromUuid(record.getPhysicalEntityId());
+        if (!isExactLivingEntity(mount, record) || mount.isRiding()
+                || EntityMountEvidence.readTransfer(mount).getStatus() != EntityMountEvidence.Status.NONE) { return false; }
+        com.mahghuuuls.mountcollection.api.SeatEnvelope seat = boardingSeat(player, mount, provider);
+        if (seat == null || !combinedSafe(player, mount, record.getCharacteristics().getPlacementProfile(),
+                seat, mount.posX, mount.posY, mount.posZ, mount.rotationYaw)) { return false; }
+        final double returnX = player.posX, returnY = player.posY, returnZ = player.posZ;
+        return NativeBoarding.board(player, mount, new NativeBoarding.Environment() {
+            @Override public boolean ready() {
+                return unmountedClear(player, world, returnX, returnY, returnZ);
+            }
+            @Override public boolean seatedSafely() {
+                return !(player.world != world || mount.world != world || !isExactLivingEntity(mount, record)
+                    || world.getEntityFromUuid(record.getPhysicalEntityId()) != mount
+                    || !player.isEntityAlive() || player.isSpectator() || player.isPlayerSleeping()
+                    || player.isBeingRidden() || mount.isRiding() || mount.getPassengers().size() != 1
+                    || player.getRidingEntity() != mount || !mount.isPassenger(player)
+                    || !riderClear(world, player.getEntityBoundingBox(), mount, player));
+            }
+            @Override public boolean returnSafely() {
+                if (!player.isEntityAlive()) { return true; }
+                if (player.world != world) {
+                    // Do not undo an external dimension transition or teleport back into an old world.
+                    return player.world instanceof WorldServer
+                            && unmountedClear(player, (WorldServer) player.world, player.posX, player.posY, player.posZ);
+                }
+                double x = returnX, y = returnY, z = returnZ;
+                if (!unmountedClear(player, world, x, y, z)) {
+                    Optional<PlacementSearch.Offset> offset = new PlacementSearch().find(2, 4,
+                            (dx, dy, dz) -> unmountedClear(player, world,
+                                    returnX + dx, returnY + dy, returnZ + dz));
+                    if (!offset.isPresent()) { return false; }
+                    x += offset.get().getX(); y += offset.get().getY(); z += offset.get().getZ();
+                }
+                player.setPosition(x, y, z);
+                player.motionX = player.motionY = player.motionZ = 0;
+                player.fallDistance = 0;
+                return unmountedClear(player, world, player.posX, player.posY, player.posZ);
+            }
+            @Override public void synchronize() {
+                net.minecraft.network.play.server.SPacketSetPassengers packet =
+                        new net.minecraft.network.play.server.SPacketSetPassengers(mount);
+                world.getEntityTracker().sendToTracking(mount, packet);
+                if (player.connection != null) {
+                    if (player.world == world) { player.connection.sendPacket(packet); }
+                    if (!player.isRiding() && player.isEntityAlive()) {
+                        player.connection.setPlayerLocation(player.posX, player.posY, player.posZ,
+                                player.rotationYaw, player.rotationPitch);
+                    }
+                }
+            }
+        });
+    }
+
+    private static boolean unmountedClear(EntityPlayerMP player, WorldServer world, double x, double y, double z) {
+        double half = Math.max(.6D, player.width) / 2;
+        AxisAlignedBB body = new AxisAlignedBB(x - half, y, z - half,
+                x + half, y + Math.max(1.8D, player.height), z + half);
+        // Unlike seated checks, the arrived mount is an obstacle to the unmounted player.
+        return riderClear(world, body, null, player);
+    }
 
     @Override
     public Optional<AbandonmentTarget> locateAbandonment(
@@ -396,11 +623,13 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
             }
         }
         if (entity.isRiding()) {
+            if (!riderDestinationValid(player, entity, provider, destination)) { return false; }
             entity.dismountRidingEntity();
             if (entity.isRiding()) {
                 return false;
             }
         }
+        if (!riderDestinationValid(player, entity, provider, destination)) { return false; }
         if (entity instanceof EntityLiving && ((EntityLiving) entity).getLeashed()) {
             ((EntityLiving) entity).clearLeashed(true, true);
         }
@@ -453,7 +682,8 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         positionCandidate(candidate, player, destination.getEvidence());
         if (!providerSupports(new Source(
                 candidate.getUniqueID(), candidate.dimension, candidate.isBeingRidden(), candidate), provider)
-                || !prepareCandidate(candidate, provider)) {
+                || !prepareCandidate(candidate, provider)
+                || !riderDestinationValid(player, candidate, provider, destination)) {
             return Optional.empty();
         }
         NBTTagCompound preparedSnapshot = new NBTTagCompound();
@@ -556,39 +786,84 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
                         origin.getX() + offset.getX() + 0.5D,
                         origin.getY() + offset.getY(),
                         origin.getZ() + offset.getZ() + 0.5D)));
-        return destination.map(value -> new RecoveryPlan(candidateId, value));
+        return destination.map(value -> new RecoveryPlan(candidateId, value,
+                preparedRecoveryAttempt(candidate, record, provider, value.getEvidence())));
     }
 
     @Override
     public CandidateAction spawnRecoveryCandidate(
             RestorationOperation operation, MountRecord record, MountProvider provider) {
-        WorldServer world = resolveWorld(operation.getDestinationEvidence().getDimensionId());
-        if (world == null) {
-            return CandidateAction.UNAVAILABLE;
+        Optional<com.mahghuuuls.mountcollection.lifecycle.RecoveryAttempt> attempt =
+                prepareRecoveryAttempt(operation, record, provider);
+        if (!attempt.isPresent()) { return CandidateAction.UNAVAILABLE; }
+        try (com.mahghuuuls.mountcollection.lifecycle.RecoveryAttempt prepared = attempt.get()) {
+            return prepared.admit(operation);
         }
-        Entity existing = world.getEntityFromUuid(operation.getCandidateEntityId());
-        if (existing != null) {
-            return isExactRecoveryCandidate(existing, operation, record)
-                    ? CandidateAction.SUCCESS : CandidateAction.CONFLICT;
-        }
-        Entity candidate = createRecoveryEntity(
+    }
+
+    @Override
+    public Optional<com.mahghuuuls.mountcollection.lifecycle.RecoveryAttempt> prepareRecoveryAttempt(
+            RestorationOperation operation, MountRecord record, MountProvider provider) {
+        World world = recoveryAccess.world(operation.getDestinationEvidence().getDimensionId());
+        if (world == null) { return Optional.empty(); }
+        Entity candidate = recoveryAccess.create(
                 world, record, provider, operation.getCandidateEntityId());
-        if (candidate == null) {
-            return CandidateAction.FAILED;
-        }
-        LastKnownEvidence target = operation.getDestinationEvidence();
+        if (candidate == null) { return Optional.empty(); }
+        positionRecoveryCandidate(candidate, operation.getDestinationEvidence());
+        if (!recoveryCandidateSafe(candidate, operation, record, provider)) { return Optional.empty(); }
+        return Optional.of(preparedRecoveryAttempt(candidate, record, provider, operation.getDestinationEvidence()));
+    }
+
+    private com.mahghuuuls.mountcollection.lifecycle.RecoveryAttempt preparedRecoveryAttempt(
+            Entity candidate, MountRecord record, MountProvider provider, LastKnownEvidence target) {
+        return new com.mahghuuuls.mountcollection.lifecycle.RecoveryAttempt(operation -> {
+            if (!operation.getMountId().equals(record.getMountId())
+                    || !operation.getOwnerId().equals(record.getOwnerId())
+                    || !operation.getCandidateEntityId().equals(candidate.getUniqueID())
+                    || !target.equals(operation.getDestinationEvidence())) { return CandidateAction.CONFLICT; }
+            World world = recoveryAccess.world(target.getDimensionId());
+            if (world == null || candidate.world != world) { return CandidateAction.UNAVAILABLE; }
+            Entity existing = recoveryAccess.find(world, operation.getCandidateEntityId());
+            if (existing != null) {
+                return existing == candidate && isExactRecoveryCandidate(existing, operation, record)
+                        ? CandidateAction.SUCCESS : CandidateAction.CONFLICT;
+            }
+            positionRecoveryCandidate(candidate, target);
+            EntityMountEvidence.attachTransferCandidate(candidate, operation.getMountId(), operation.getOperationId());
+            // The final safety check and world admission use this same native instance.
+            if (!recoveryCandidateSafe(candidate, operation, record, provider)) { return CandidateAction.UNAVAILABLE; }
+            if (!recoveryAccess.spawn(world, candidate)) { return CandidateAction.FAILED; }
+            return recoveryAccess.find(world, candidate.getUniqueID()) == candidate
+                    && isExactRecoveryCandidate(candidate, operation, record)
+                    ? CandidateAction.SUCCESS : CandidateAction.CONFLICT;
+        });
+    }
+
+    private boolean recoveryCandidateSafe(Entity candidate, RestorationOperation operation,
+            MountRecord record, MountProvider provider) {
+        try {
+            if (!candidate.isEntityAlive() || candidate.isBeingRidden() || candidate.isRiding()
+                    || !provider.supports(candidate)) { return false; }
+            com.mahghuuuls.mountcollection.lifecycle.RecoveryAdmission context =
+                    recoveryAdmission.apply(operation.getOperationId(), operation.getOwnerId());
+            if (context == null || context.getMode()
+                    == com.mahghuuuls.mountcollection.lifecycle.RecoveryAdmission.Mode.UNAVAILABLE) { return false; }
+            if (context.getMode() == com.mahghuuuls.mountcollection.lifecycle.RecoveryAdmission.Mode.AUTOMATIC) {
+                EntityPlayerMP rider = context.getRider();
+                if (rider == null || rider.world != candidate.world
+                        || !rider.getUniqueID().equals(operation.getOwnerId())) { return false; }
+                return recoveryAccess.riderSafe(rider, candidate, record, provider);
+            }
+            return recoveryAccess.mountSafe(candidate, record);
+        } catch (com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException fatal) { throw fatal; }
+        catch (RuntimeException | LinkageError unavailable) { return false; }
+    }
+
+    private static void positionRecoveryCandidate(Entity candidate, LastKnownEvidence target) {
         candidate.setLocationAndAngles(target.getX(), target.getY(), target.getZ(),
                 candidate.rotationYaw, candidate.rotationPitch);
         candidate.motionX = candidate.motionY = candidate.motionZ = 0.0D;
         candidate.fallDistance = 0.0F;
-        EntityMountEvidence.attachTransferCandidate(
-                candidate, operation.getMountId(), operation.getOperationId());
-        if (!world.spawnEntity(candidate)) {
-            return CandidateAction.FAILED;
-        }
-        Entity indexed = world.getEntityFromUuid(operation.getCandidateEntityId());
-        return indexed == candidate && isExactRecoveryCandidate(indexed, operation, record)
-                ? CandidateAction.SUCCESS : CandidateAction.CONFLICT;
     }
 
     @Override
@@ -947,6 +1222,8 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
             candidate.setUniqueId(candidateId);
             normalizeRecoveredEntity(candidate, world.provider.getDimension());
             return candidate;
+        } catch (com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException fatal) {
+            throw fatal;
         } catch (RuntimeException exception) {
             return null;
         }
@@ -1359,6 +1636,11 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
 
     private static boolean safe(
             WorldServer world, Entity entity, PlacementProfile profile, double x, double y, double z) {
+        return safe(world, entity, profile, x, y, z, null);
+    }
+
+    private static boolean safe(WorldServer world, Entity entity, PlacementProfile profile,
+            double x, double y, double z, Entity intendedRider) {
         AxisAlignedBB candidate = entity.getEntityBoundingBox().offset(
                 x - entity.posX, y - entity.posY, z - entity.posZ);
         BlockPos feet = new BlockPos(x, y, z);
@@ -1380,12 +1662,13 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
 
             @Override
             public boolean isBlockCollisionFree() {
-                return world.getCollisionBoxes(entity, candidate).isEmpty();
+                return world.getCollisionBoxes(intendedRider == null ? entity : null, candidate).isEmpty();
             }
 
             @Override
             public boolean isEntityCollisionFree() {
-                return world.checkNoEntityCollision(candidate, entity);
+                return intendedRider == null ? world.checkNoEntityCollision(candidate, entity)
+                        : pairCollisionFree(world, candidate, entity, intendedRider);
             }
 
             @Override

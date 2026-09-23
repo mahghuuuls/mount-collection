@@ -48,6 +48,70 @@ final class MountLifecycleServiceTest {
     private static final ResourceLocation HORSE = new ResourceLocation("minecraft:horse");
 
     @Test
+    void automaticRecallUsesCombinedPlanAndEmitsOnlyAfterCommittedArrival() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord record = repository.register(new MountRepository.RegistrationCandidate(
+                owner, PROVIDER, HORSE, HORSE.toString(), UUID.randomUUID(),
+                new LastKnownEvidence(0, 1, 64, 1), null)).getRecord().get();
+        ActiveServerClock clock = new ActiveServerClock();
+        clock.restore(100L, 0L);
+        FakeRecallWorld gateway = new FakeRecallWorld(record, false, true);
+        ProviderRegistry providers = new ProviderRegistry();
+        providers.register(new BoardingProvider());
+        providers.freeze();
+        MountLifecycleService service = new MountLifecycleService(repository, providers,
+                MountLifecycleServiceTest::config, new NoOpDiagnostics(), clock, new InhibitedIntegration(), gateway);
+        List<ExperienceCompletion> effects = new ArrayList<>();
+        service.setCompletionSink(event -> {
+            assertEquals(1, gateway.commitCalls);
+            assertEquals(300L, repository.getRecallCooldownDeadline(owner));
+            effects.add(event);
+        });
+        assertEquals(ContextualOutcome.Status.NO_SAFE_DESTINATION, service.recallVerified(
+                UUID.randomUUID(), null, owner, 0, InhibitedStatus.UNAFFECTED, config(), true).getStatus());
+        assertEquals(0, gateway.planCalls);
+        assertEquals(0, gateway.commitCalls);
+        assertEquals(0L, repository.getRecallCooldownDeadline(owner));
+        assertTrue(effects.isEmpty());
+        gateway.riderPlanAllowed = true;
+        assertEquals(ContextualOutcome.Status.RECALLED, service.recallVerified(
+                UUID.randomUUID(), null, owner, 0, InhibitedStatus.UNAFFECTED, config(), true).getStatus());
+        assertEquals(2, gateway.riderPlanCalls);
+        assertEquals(0, gateway.planCalls);
+        assertEquals(1, effects.size());
+    }
+
+    @Test
+    void unsupportedAutomaticRidingFailsBeforePlacementButOptOutRetainsRecall() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID();
+        MountRecord record = repository.register(new MountRepository.RegistrationCandidate(
+                owner, PROVIDER, HORSE, HORSE.toString(), UUID.randomUUID(),
+                new LastKnownEvidence(0, 1, 64, 1), null)).getRecord().get();
+        ActiveServerClock clock = new ActiveServerClock();
+        clock.restore(100L, 0L);
+        FakeRecallWorld gateway = new FakeRecallWorld(record, false, true);
+        MountLifecycleService service = recallService(repository, clock, gateway);
+        List<ExperienceCompletion> effects = new ArrayList<>();
+        service.setCompletionSink(effects::add);
+
+        assertEquals(ContextualOutcome.Status.BOARDING_UNSUPPORTED, service.recallVerified(
+                UUID.randomUUID(), null, owner, 0, InhibitedStatus.UNAFFECTED, config(), true).getStatus());
+        assertEquals(0, gateway.planCalls);
+        assertEquals(0, gateway.commitCalls);
+        assertEquals(0L, repository.getRecallCooldownDeadline(owner));
+        assertTrue(effects.isEmpty());
+
+        assertEquals(ContextualOutcome.Status.RECALLED, service.recallVerified(
+                UUID.randomUUID(), null, owner, 0, InhibitedStatus.UNAFFECTED, config(), false).getStatus());
+        assertEquals(1, gateway.planCalls);
+        assertEquals(1, gateway.commitCalls);
+        assertEquals(300L, repository.getRecallCooldownDeadline(owner));
+        assertEquals(1, effects.size());
+    }
+
+    @Test
     void policyDenialOccursBeforeRepositoryMutation() {
         MountRepository repository = new MountRepository();
         MountLifecycleService service = service(repository, FilterMode.WHITELIST);
@@ -1366,12 +1430,20 @@ final class MountLifecycleServiceTest {
                 200L, 4, 16, flyingDisabled, true, 6000L, true, false);
     }
 
-    private static final class TestProvider implements MountProvider {
+    private static class TestProvider implements MountProvider {
         @Override public ResourceLocation getProviderId() { return PROVIDER; }
         @Override public boolean supports(Entity entity) { return true; }
         @Override public ProviderResult<RegistrationProfile> validateRegistration(
                 Entity entity, UUID playerId) {
             return ProviderResult.success(new RegistrationProfile(HORSE, HORSE.toString()));
+        }
+    }
+
+    private static final class BoardingProvider extends TestProvider
+            implements com.mahghuuuls.mountcollection.api.BoardingSupport {
+        @Override public ProviderResult<com.mahghuuuls.mountcollection.api.SeatEnvelope> describeBoarding(
+                Entity mount, UUID rider) {
+            throw new AssertionError("The gateway, not lifecycle, owns seat inspection");
         }
     }
 
@@ -1382,6 +1454,8 @@ final class MountLifecycleServiceTest {
         private final boolean planSucceeds;
         private LocateResult locateResult;
         private int planCalls;
+        private int riderPlanCalls;
+        private boolean riderPlanAllowed;
         private int commitCalls;
         private MountCharacteristics plannedCharacteristics;
 
@@ -1423,6 +1497,15 @@ final class MountLifecycleServiceTest {
                     ? Optional.of(new Destination(
                             new LastKnownEvidence(0, 9.0D, 64.0D, 9.0D)))
                     : Optional.empty();
+        }
+
+        @Override
+        public Optional<Destination> planWithRider(
+                net.minecraft.entity.player.EntityPlayerMP player, Source source, MountProvider provider,
+                MountCharacteristics characteristics, int normalRadius, int fallbackRadius) {
+            riderPlanCalls++;
+            return riderPlanAllowed ? Optional.of(new Destination(
+                    new LastKnownEvidence(0, 9, 64, 9), characteristics)) : Optional.empty();
         }
 
         @Override

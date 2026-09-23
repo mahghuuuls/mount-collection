@@ -353,10 +353,14 @@ public final class MountLifecycleService {
     }
 
     public ContextualOutcome handleContextualIntent(EntityPlayerMP player, UUID correlationId) {
+        return handleContextualIntent(player, correlationId, false);
+    }
+
+    public ContextualOutcome handleContextualIntent(EntityPlayerMP player, UUID correlationId, boolean automaticRiding) {
         Objects.requireNonNull(correlationId, "correlationId");
         Entity ridden = player.getRidingEntity();
         if (ridden == null) {
-            return recall(correlationId, player);
+            return recall(correlationId, player, automaticRiding);
         }
 
         ProviderResolution resolution = providers.resolve(ridden);
@@ -412,12 +416,12 @@ public final class MountLifecycleService {
         return fromRegistration(outcome);
     }
 
-    private ContextualOutcome recall(UUID correlationId, EntityPlayerMP player) {
+    private ContextualOutcome recall(UUID correlationId, EntityPlayerMP player, boolean automaticRiding) {
         ValidatedMountConfig config = configSupplier.get();
         InhibitedStatus inhibited = inhibitedIntegration.getStatus(
                 player, config.isInhibitedRecallBlockingEnabled());
         return recallVerified(
-                correlationId, player, player.getUniqueID(), player.dimension, inhibited, config);
+                correlationId, player, player.getUniqueID(), player.dimension, inhibited, config, automaticRiding);
     }
 
     ContextualOutcome recallVerified(
@@ -427,6 +431,11 @@ public final class MountLifecycleService {
             int destinationDimension,
             InhibitedStatus inhibited,
             ValidatedMountConfig config) {
+        return recallVerified(correlationId, player, ownerId, destinationDimension, inhibited, config, false);
+    }
+
+    ContextualOutcome recallVerified(UUID correlationId, EntityPlayerMP player, UUID ownerId,
+            int destinationDimension, InhibitedStatus inhibited, ValidatedMountConfig config, boolean automaticRiding) {
         MountRepository.CollectionInspection collection =
                 repository.inspectCollection(ownerId);
         if (!collection.getSelectedMountId().isPresent()) {
@@ -458,7 +467,7 @@ public final class MountLifecycleService {
             }
             return restoreRecovery(
                     correlationId, player, ownerId, destinationDimension,
-                    inhibited, config, record, provider);
+                    inhibited, config, record, provider, automaticRiding);
         }
         if (record.getCondition() != MountCondition.LIVING
                 || provider == null) {
@@ -518,7 +527,13 @@ public final class MountLifecycleService {
             return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
                     ContextualOutcome.failure(denial));
         }
-        java.util.Optional<RecallWorldGateway.Destination> destination = worldGateway.plan(
+        if (automaticRiding && !(provider instanceof com.mahghuuuls.mountcollection.api.BoardingSupport)) {
+            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
+                    ContextualOutcome.failure(ContextualOutcome.Status.BOARDING_UNSUPPORTED));
+        }
+        java.util.Optional<RecallWorldGateway.Destination> destination = automaticRiding
+                ? worldGateway.planWithRider(player, source, provider, record.getCharacteristics(),
+                        config.getNormalPlacementRadius(), config.getFallbackPlacementRadius()) : worldGateway.plan(
                 player, source, record.getCharacteristics(), config.getNormalPlacementRadius(),
                 config.getFallbackPlacementRadius());
         Map<String, String> placementFields = new LinkedHashMap<>();
@@ -656,7 +671,7 @@ public final class MountLifecycleService {
             InhibitedStatus inhibited,
             ValidatedMountConfig config,
             MountRecord record,
-            MountProvider provider) {
+            MountProvider provider, boolean automaticRiding) {
         if (!(provider instanceof RecoverySupport) || worldGateway == null) {
             return contextualFinish(correlationId, "recovery_recall",
                     record.getProviderId().toString(),
@@ -685,7 +700,13 @@ public final class MountLifecycleService {
             return contextualFinish(correlationId, "recovery_recall",
                     record.getProviderId().toString(), ContextualOutcome.failure(denial));
         }
-        java.util.Optional<RecallWorldGateway.RecoveryPlan> plan = worldGateway.planRecovery(
+        if (automaticRiding && !(provider instanceof com.mahghuuuls.mountcollection.api.BoardingSupport)) {
+            return contextualFinish(correlationId, "recovery_recall", record.getProviderId().toString(),
+                    ContextualOutcome.failure(ContextualOutcome.Status.BOARDING_UNSUPPORTED));
+        }
+        java.util.Optional<RecallWorldGateway.RecoveryPlan> plan = automaticRiding
+                ? worldGateway.planRecoveryWithRider(player, record, provider, config.getNormalPlacementRadius(),
+                        config.getFallbackPlacementRadius()) : worldGateway.planRecovery(
                 player, record, provider, config.getNormalPlacementRadius(),
                 config.getFallbackPlacementRadius());
         if (!plan.isPresent()) {
@@ -695,11 +716,12 @@ public final class MountLifecycleService {
         }
         ActiveTimeResult deadline = clock.deadlineAfter(config.getSummonCooldownTicks());
         if (!deadline.isValid()) {
+            plan.get().close();
             return contextualFinish(correlationId, "recovery_recall",
                     record.getProviderId().toString(),
                     ContextualOutcome.failure(ContextualOutcome.Status.INTERNAL_FAILURE));
         }
-        RecallWorldGateway.RecoveryPlan recoveryPlan = plan.get();
+        try (RecallWorldGateway.RecoveryPlan recoveryPlan = plan.get()) {
         RestorationOperation operation = new RestorationOperation(
                 correlationId, record.getMountId(), ownerId,
                 recoveryPlan.getCandidateEntityId(),
@@ -712,7 +734,7 @@ public final class MountLifecycleService {
                     record.getProviderId().toString(),
                     ContextualOutcome.failure(fromTransferStatus(began)));
         }
-        TransferAdvanceOutcome advanced = advanceRestoration(operation.getOperationId());
+        TransferAdvanceOutcome advanced = advanceRestoration(operation.getOperationId(), recoveryPlan.getAttempt());
         if (advanced == TransferAdvanceOutcome.COMPLETE) {
             return contextualFinish(correlationId, "recovery_recall",
                     record.getProviderId().toString(),
@@ -721,11 +743,16 @@ public final class MountLifecycleService {
         return contextualFinish(correlationId, "recovery_recall",
                 record.getProviderId().toString(),
                 ContextualOutcome.failure(fromTransferOutcome(advanced)));
+        }
     }
 
     private TransferAdvanceOutcome advanceRestoration(UUID operationId) {
+        return advanceRestoration(operationId, null);
+    }
+
+    private TransferAdvanceOutcome advanceRestoration(UUID operationId, RecoveryAttempt initial) {
         try {
-            return advanceRestorationUnchecked(operationId);
+            return advanceRestorationUnchecked(operationId, initial);
         } catch (FatalTransferSafetyException fatal) {
             throw fatal;
         } catch (RuntimeException unexpected) {
@@ -733,7 +760,9 @@ public final class MountLifecycleService {
         }
     }
 
-    private TransferAdvanceOutcome advanceRestorationUnchecked(UUID operationId) {
+    private TransferAdvanceOutcome advanceRestorationUnchecked(UUID operationId, RecoveryAttempt initial) {
+        RecoveryAttempt attempt = initial;
+        try {
         for (int step = 0; step < 8; step++) {
             RestorationOperation operation = repository.findRestoration(operationId).orElse(null);
             if (operation == null) {
@@ -795,6 +824,10 @@ public final class MountLifecycleService {
                     if (sourceFence != TransferAdvanceOutcome.PENDING) {
                         return sourceFence;
                     }
+                    if (attempt == null) {
+                        attempt = worldGateway.prepareRecoveryAttempt(operation, record, provider).orElse(null);
+                        if (attempt == null) { return TransferAdvanceOutcome.TEMPORARILY_UNAVAILABLE; }
+                    }
                     if (repository.markRestorationSpawnIntent(operationId)
                             != MountRepository.TransferStatus.SUCCESS) {
                         return TransferAdvanceOutcome.PERSISTENCE_FAILURE;
@@ -806,8 +839,12 @@ public final class MountLifecycleService {
                     RecallWorldGateway.TransferEvidence.Presence presence =
                             worldGateway.inspectRecoveryCandidate(operation, record);
                     if (presence == RecallWorldGateway.TransferEvidence.Presence.MISSING) {
+                        if (attempt == null) {
+                            attempt = worldGateway.prepareRecoveryAttempt(operation, record, provider).orElse(null);
+                            if (attempt == null) { return rollbackUnavailableRestorationIntent(operation); }
+                        }
                         RecallWorldGateway.CandidateAction spawned =
-                                worldGateway.spawnRecoveryCandidate(operation, record, provider);
+                                attempt.admit(operation);
                         if (spawned == RecallWorldGateway.CandidateAction.UNAVAILABLE) {
                             return rollbackUnavailableRestorationIntent(operation);
                         }
@@ -900,6 +937,9 @@ public final class MountLifecycleService {
             }
         }
         return TransferAdvanceOutcome.PENDING;
+        } finally {
+            if (attempt != null) { attempt.close(); }
+        }
     }
 
     private TransferAdvanceOutcome rollbackUnavailableRestorationIntent(

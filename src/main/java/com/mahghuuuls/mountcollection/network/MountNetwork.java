@@ -177,9 +177,12 @@ public final class MountNetwork {
     }
 
     public void sendContextualIntent() {
+        sendContextualIntent(true);
+    }
+
+    public void sendContextualIntent(boolean automaticRiding) {
         if (clientSession != null && clientSequence < Long.MAX_VALUE) {
-            // The preference field is transported now; boarding is introduced separately.
-            channel.sendToServer(new ContextualIntentMessage(clientSession, ++clientSequence, true));
+            channel.sendToServer(new ContextualIntentMessage(clientSession, ++clientSequence, automaticRiding));
         }
     }
 
@@ -222,7 +225,7 @@ public final class MountNetwork {
             if (currentPlayer(player) && player.dimension == dimension
                     && session.generation() == generation
                     && contextualSessions.get(player.getUniqueID()) == session) {
-                executeContextualIntent(player, session, dimension);
+                executeContextualIntent(player, session, dimension, message.isAutomaticRiding());
             }
         })) {
             player.sendMessage(new TextComponentTranslation(
@@ -230,24 +233,35 @@ public final class MountNetwork {
         }
     }
 
-    private void executeContextualIntent(EntityPlayerMP player, ContextualSession session, int dimension) {
+    private void executeContextualIntent(EntityPlayerMP player, ContextualSession session, int dimension,
+            boolean automaticRiding) {
         UUID request = UUID.randomUUID();
+        boolean[] boardingFailureReported = {false};
         long generation = session.generation();
         if (!services.getExperience().admit(request, player.getUniqueID(),
                 () -> currentPlayer(player) && player.dimension == dimension
                         && session.generation() == generation
-                        && contextualSessions.get(player.getUniqueID()) == session)) {
+                        && contextualSessions.get(player.getUniqueID()) == session, completion -> {
+                    if (automaticRiding && !services.boardArrived(player, completion)) {
+                        boardingFailureReported[0] = true;
+                        player.sendMessage(new TextComponentTranslation("mountcollection.message.boarding_failed"));
+                    }
+                }, () -> automaticRiding
+                        ? com.mahghuuuls.mountcollection.lifecycle.RecoveryAdmission.automatic(player)
+                        : com.mahghuuuls.mountcollection.lifecycle.RecoveryAdmission.optOut())) {
             player.sendMessage(new TextComponentTranslation(ContextualOutcome.Status.TEMPORARILY_UNAVAILABLE.getTranslationKey()));
             return;
         }
         ContextualOutcome outcome = executeLifecycleIntent(() -> services.getLifecycleService()
-                .map(service -> service.handleContextualIntent(player, request))
+                .map(service -> service.handleContextualIntent(player, request, automaticRiding))
                 .orElseGet(() -> ContextualOutcome.failure(
                         ContextualOutcome.Status.INTERNAL_FAILURE)));
         boolean pending = services.getActiveRepository().map(repository ->
                 repository.findTransfer(request).isPresent() || repository.findRestoration(request).isPresent()).orElse(false);
         if (!pending) { services.getExperience().cancel(request); }
-        player.sendMessage(new TextComponentTranslation(outcome.getStatus().getTranslationKey()));
+        if (!boardingFailureReported[0] || outcome.getStatus() != ContextualOutcome.Status.RECALLED) {
+            player.sendMessage(new TextComponentTranslation(outcome.getStatus().getTranslationKey()));
+        }
     }
 
     static ContextualOutcome executeLifecycleIntent(Supplier<ContextualOutcome> intent) {

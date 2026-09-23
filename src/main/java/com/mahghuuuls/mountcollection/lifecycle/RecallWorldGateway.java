@@ -33,6 +33,22 @@ public interface RecallWorldGateway {
 
     boolean providerSupports(Source source, MountProvider provider);
 
+    /** Fail closed when a gateway has no verified rider-aware implementation. */
+    default Optional<Destination> planWithRider(EntityPlayerMP player, Source source,
+            MountProvider provider, MountCharacteristics characteristics, int normalRadius, int fallbackRadius) {
+        return Optional.empty();
+    }
+
+    default Optional<RecoveryPlan> planRecoveryWithRider(EntityPlayerMP player, MountRecord record,
+            MountProvider provider, int normalRadius, int fallbackRadius) {
+        return Optional.empty();
+    }
+
+    /** Called only after successful arrival; failure never rolls back the mount or cooldown. */
+    default boolean boardArrived(EntityPlayerMP player, MountRecord record, MountProvider provider) {
+        return false;
+    }
+
     Optional<Destination> plan(
             EntityPlayerMP player,
             Source source,
@@ -109,6 +125,13 @@ public interface RecallWorldGateway {
     default CandidateAction spawnRecoveryCandidate(
             RestorationOperation operation, MountRecord record, MountProvider provider) {
         return CandidateAction.FAILED;
+    }
+
+    /** Prepare one bounded admission attempt; callers close it before returning or pausing. */
+    default Optional<RecoveryAttempt> prepareRecoveryAttempt(
+            RestorationOperation operation, MountRecord record, MountProvider provider) {
+        return Optional.of(new RecoveryAttempt(acknowledged ->
+                spawnRecoveryCandidate(acknowledged, record, provider)));
     }
 
     default TransferEvidence.Presence inspectRecoveryCandidate(
@@ -211,17 +234,25 @@ public interface RecallWorldGateway {
         public NBTTagCompound copySourceSnapshot() { return sourceSnapshot.copy(); }
     }
 
-    final class RecoveryPlan {
+    final class RecoveryPlan implements AutoCloseable {
         private final UUID candidateEntityId;
         private final Destination destination;
+        private final RecoveryAttempt attempt;
 
         public RecoveryPlan(UUID candidateEntityId, Destination destination) {
+            this(candidateEntityId, destination, null);
+        }
+
+        public RecoveryPlan(UUID candidateEntityId, Destination destination, RecoveryAttempt attempt) {
             this.candidateEntityId = Objects.requireNonNull(candidateEntityId, "candidateEntityId");
             this.destination = Objects.requireNonNull(destination, "destination");
+            this.attempt = attempt;
         }
 
         public UUID getCandidateEntityId() { return candidateEntityId; }
         public Destination getDestination() { return destination; }
+        public RecoveryAttempt getAttempt() { return attempt; }
+        @Override public void close() { if (attempt != null) { attempt.close(); } }
     }
 
     final class TransferEvidence {
@@ -348,9 +379,19 @@ public interface RecallWorldGateway {
 
     final class Destination {
         private final LastKnownEvidence evidence;
+        private final MountCharacteristics riderCharacteristics;
 
         public Destination(LastKnownEvidence evidence) {
+            this(evidence, null);
+        }
+
+        public Destination(LastKnownEvidence evidence, MountCharacteristics riderCharacteristics) {
             this.evidence = Objects.requireNonNull(evidence, "evidence");
+            this.riderCharacteristics = riderCharacteristics;
+        }
+
+        public Optional<MountCharacteristics> getRiderCharacteristics() {
+            return Optional.ofNullable(riderCharacteristics);
         }
 
         public LastKnownEvidence getEvidence() {
