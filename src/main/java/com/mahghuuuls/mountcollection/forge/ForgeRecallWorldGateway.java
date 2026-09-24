@@ -350,6 +350,7 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
 
     private static boolean combinedSafe(EntityPlayerMP player, Entity mount, PlacementProfile profile,
             com.mahghuuuls.mountcollection.api.SeatEnvelope seat, double x, double y, double z, float yaw) {
+        if (!RiderPlacement.nearby(seat, x, y, z, yaw, player.posX, player.posY, player.posZ)) { return false; }
         WorldServer world = player.getServerWorld();
         AxisAlignedBB rider;
         try {
@@ -420,6 +421,7 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
                     || !player.isEntityAlive() || player.isSpectator() || player.isPlayerSleeping()
                     || player.isBeingRidden() || mount.isRiding() || mount.getPassengers().size() != 1
                     || player.getRidingEntity() != mount || !mount.isPassenger(player)
+                    || !RiderPlacement.nearby(returnX, returnY, returnZ, player.posX, mount.posY, player.posZ)
                     || !riderClear(world, player.getEntityBoundingBox(), mount, player));
             }
             @Override public boolean returnSafely() {

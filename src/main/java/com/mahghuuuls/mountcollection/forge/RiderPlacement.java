@@ -7,6 +7,29 @@ import net.minecraft.util.math.AxisAlignedBB;
 final class RiderPlacement {
     private RiderPlacement() { }
 
+    /** Limits player displacement independently of the mount's wider recall search. */
+    static boolean nearby(double playerX, double playerY, double playerZ,
+            double seatedX, double mountY, double seatedZ) {
+        double dx = seatedX - playerX, dz = seatedZ - playerZ, dy = mountY - playerY;
+        return Double.isFinite(dx) && Double.isFinite(dz) && Double.isFinite(dy)
+                && dx * dx + dz * dz <= 4.0D && Math.abs(dy) <= 1.0D;
+    }
+
+    static boolean nearby(SeatEnvelope seat, double x, double y, double z, float yaw,
+            double playerX, double playerY, double playerZ) {
+        if (seat == null || !Float.isFinite(yaw)) { return false; }
+        double angle = Math.toRadians(yaw % 360.0F);
+        double sin = Math.sin(angle), cos = Math.cos(angle);
+        // A declaration can cover several native poses; every possible anchor must fit.
+        for (double localX : new double[] {seat.getMinX(), seat.getMaxX()}) {
+            for (double localZ : new double[] {seat.getMinZ(), seat.getMaxZ()}) {
+                if (!nearby(playerX, playerY, playerZ, x + localX * cos - localZ * sin,
+                        y, z + localX * sin + localZ * cos)) { return false; }
+            }
+        }
+        return true;
+    }
+
     /** Reads only loaded world data; no mount profile or player effect may waive rider hazards. */
     interface WorldAccess {
         int height();

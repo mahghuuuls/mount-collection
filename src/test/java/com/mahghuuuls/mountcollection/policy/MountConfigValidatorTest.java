@@ -38,7 +38,7 @@ final class MountConfigValidatorTest {
         assertTrue(config.getRegistrationEntities().allows(new ResourceLocation("minecraft:horse")));
         assertEquals(200L, config.getSummonCooldownTicks());
         assertEquals(4, config.getNormalPlacementRadius());
-        assertEquals(16, config.getFallbackPlacementRadius());
+        assertEquals(8, config.getFallbackPlacementRadius());
         assertFalse(config.isFlyingMountRecallDisabled());
         assertTrue(config.isRecoveryEnabled());
         assertEquals(6000L, config.getRecoveryDurationTicks());
@@ -72,7 +72,7 @@ final class MountConfigValidatorTest {
         assertEquals(FilterMode.BLACKLIST, config.getDestinationDimensions().getMode());
         assertEquals(200L, config.getSummonCooldownTicks());
         assertEquals(4, config.getNormalPlacementRadius());
-        assertEquals(16, config.getFallbackPlacementRadius());
+        assertEquals(8, config.getFallbackPlacementRadius());
         assertEquals(6000L, config.getRecoveryDurationTicks());
         assertTrue(warnings.values.size() >= 9, "each invalid category should produce a warning");
     }
@@ -161,7 +161,7 @@ final class MountConfigValidatorTest {
                 new String[0],
                 "10",
                 "4",
-                "16",
+                Integer.toString(MountConfigValidator.DEFAULT_FALLBACK_RADIUS),
                 true,
                 "300",
                 true,

@@ -24,6 +24,65 @@ import static org.junit.jupiter.api.Assertions.*;
 final class BoardingReadinessGatewayTest {
     @BeforeAll static void bootstrap() { Bootstrap.register(); }
 
+    @Test void actualNativeDisplacementIsMeasuredFromOriginalPose() throws Exception {
+        for (double shift : new double[]{0, 3}) {
+            Fixture f = new Fixture(); f.player.attach = true; f.player.seatedShift = shift;
+            assertEquals(shift == 0, f.gateway.boardArrived(f.player, f.record, f.provider));
+            assertEquals(1, f.player.attempts);
+            assertEquals(shift == 0, f.player.isRiding());
+            if (shift != 0) {
+                assertFalse(f.mount.isPassenger(f.player));
+                assertTrue(Math.abs(f.player.posX - .5) <= 2);
+            }
+        }
+    }
+
+    @Test void productionRecoveryAccessUsesProximityForPlanningAndAdmission() throws Exception {
+        Fixture f = new Fixture(); f.mount.setPosition(8.5,64,8.5);
+        Field field = ForgeRecallWorldGateway.class.getDeclaredField("recoveryAccess");
+        field.setAccessible(true);
+        ForgeRecallWorldGateway.RecoveryAccess access = (ForgeRecallWorldGateway.RecoveryAccess) field.get(f.gateway);
+        assertFalse(access.riderSafe(f.player, f.mount, f.record, f.provider));
+        assertTrue(access.unmountedSafe(f.player, f.mount, f.record));
+        RecallWorldGateway.Destination plan = access.plan(f.player, f.mount, f.record, f.provider, 2, 4).get();
+        assertEquals(ArrivalDisposition.COMBINED, plan.getDisposition());
+        f.mount.setPosition(plan.getEvidence().getX(), plan.getEvidence().getY(), plan.getEvidence().getZ());
+        assertTrue(access.riderSafe(f.player, f.mount, f.record, f.provider));
+        f.player.setPosition(10,64,10);
+        assertFalse(access.riderSafe(f.player, f.mount, f.record, f.provider));
+    }
+
+    @Test void distanceAndTerrainBoundariesReachNativeBoardingOnlyWhenNearby() throws Exception {
+        double[][] positions = {{2,0,0,1},{2.001,0,0,0},{1.5,0,1.5,0},{1,0,1,1},
+                {0,1.001,0,0}};
+        for (double[] p : positions) {
+            Fixture f = new Fixture(); f.mount.setPosition(.5+p[0],64+p[1],.5+p[2]);
+            f.gateway.boardArrived(f.player, f.record, f.provider);
+            assertEquals((int)p[3], f.player.attempts, Arrays.toString(p));
+        }
+    }
+
+    @Test void playerMovementDowngradesFixedTargetAndPreventsLateBoarding() throws Exception {
+        Fixture f = new Fixture(); f.mount.setPosition(8.5,64,8.5);
+        RecallWorldGateway.Destination destination = f.plan().get();
+        assertEquals(ArrivalDisposition.COMBINED, destination.getDisposition());
+        f.player.setPosition(10.25,64,10.25);
+        assertTrue(f.gateway.commit(f.player, f.source(), destination, f.provider));
+        assertEquals(ArrivalDisposition.UNMOUNTED_FALLBACK, destination.getDisposition());
+        assertEquals(destination.getEvidence().getX(), f.mount.posX);
+        assertFalse(f.gateway.boardArrived(f.player, f.record, f.provider));
+        assertEquals(0, f.player.attempts);
+        assertEquals(10.25, f.player.posX);
+    }
+
+    @Test void distantRideableSpotCannotBeatNearbyUnmountedSpot() throws Exception {
+        Fixture f = new Fixture(); f.mount.setPosition(8.5,64,8.5); f.world.distantOpening = true;
+        RecallWorldGateway.Destination destination = f.plan().get();
+        assertEquals(ArrivalDisposition.UNMOUNTED_FALLBACK, destination.getDisposition());
+        assertTrue(f.gateway.commit(f.player, f.source(), destination, f.provider));
+        assertEquals(.5, f.player.posX); assertEquals(.5, f.player.posZ);
+    }
+
     @Test void preparationCannotTurnUnsupportedMountIntoFallback() throws Exception {
         for (ArrivalDisposition disposition : new ArrivalDisposition[]{ArrivalDisposition.COMBINED,
                 ArrivalDisposition.UNMOUNTED_FALLBACK}) {
@@ -197,16 +256,37 @@ final class BoardingReadinessGatewayTest {
 
     private static final class Player extends EntityPlayerMP {
         int attempts;
+        boolean attach;
+        double seatedShift;
         private Player() { super(null,null,null,null); }
+        @Override public void setPosition(double x, double y, double z) {
+            // Inject a controlled native seat result while retaining a registered vanilla mount.
+            Entity vehicle = getRidingEntity();
+            if (attach && vehicle != null) {
+                super.setPosition(vehicle.posX + seatedShift, vehicle.posY + 1.65, vehicle.posZ);
+            } else {
+                super.setPosition(x, y, z);
+            }
+        }
         @Override public boolean isEntityAlive() { return true; }
         @Override public boolean isSpectator() { return false; }
         @Override public boolean isPlayerSleeping() { return false; }
         @Override public boolean isBeingRidden() { return false; }
-        @Override public boolean startRiding(Entity entity, boolean force) { assertFalse(force); attempts++; return false; }
+        @Override public boolean startRiding(Entity entity, boolean force) {
+            assertFalse(force); attempts++;
+            if (!attach) { return false; }
+            try {
+                Field vehicle = Entity.class.getDeclaredField("ridingEntity"); vehicle.setAccessible(true); vehicle.set(this, entity);
+                Field passengers = Entity.class.getDeclaredField("riddenByEntities"); passengers.setAccessible(true);
+                ((List<Entity>) passengers.get(entity)).add(this);
+                return true;
+            } catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
+        }
+        @Override public void dismountRidingEntity() { /* Exercise the verified pair-only rollback. */ }
     }
 
     private static final class ProbeWorld extends WorldServer {
-        WorldBorder border; Entity mount; boolean onlySeatedSpace, lowCeiling;
+        WorldBorder border; Entity mount; boolean onlySeatedSpace, lowCeiling, distantOpening;
         Tracker tracker;
         private ProbeWorld() { super(null,null,null,0,null); }
         @Override public WorldBorder getWorldBorder() { return border; }
@@ -220,7 +300,7 @@ final class BoardingReadinessGatewayTest {
         @Override public boolean containsAnyLiquid(AxisAlignedBB box) { return false; }
         @Override public List<AxisAlignedBB> getCollisionBoxes(Entity entity, AxisAlignedBB box) {
             // Preserve candidate/seated clearance while denying every unmounted search position.
-            boolean blocked = box.minY<64 || lowCeiling && box.maxY>66 || onlySeatedSpace && box.maxY-box.minY>1.7
+            boolean blocked = box.minY<64 || (lowCeiling || distantOpening && box.minX<3) && box.maxY>66 || onlySeatedSpace && box.maxY-box.minY>1.7
                     && Math.abs(box.minY-65.65)>0.001;
             return blocked ? Collections.singletonList(box) : Collections.emptyList();
         }

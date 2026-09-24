@@ -60,6 +60,11 @@ public final class ClientProxy extends CommonProxy {
     }
 
     @SubscribeEvent
+    public void onChat(net.minecraftforge.client.event.ClientChatReceivedEvent event) {
+        ridingPreferences.onChat(event);
+    }
+
+    @SubscribeEvent
     public void onDisconnect(net.minecraftforge.fml.common.network.FMLNetworkEvent.ClientDisconnectionFromServerEvent event) {
         net.minecraft.client.Minecraft.getMinecraft().addScheduledTask(network::clearClientProtocol);
     }

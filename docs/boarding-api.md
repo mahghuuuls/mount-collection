@@ -54,5 +54,14 @@ arrival at their fixed acknowledged destination, never silently move that durabl
 
 Client preference: `config/mountcollection-client.cfg`, category `recall`, boolean
 `automatic_riding`, defaults true. Restart the client after editing. There is no GUI toggle.
+`show_boarding_failure_message` independently defaults true; false hides only successful-summon
+notices about unavailable automatic riding. Actual summon failures and particles remain unchanged.
+Automatic riding requires the seated position within 2 blocks horizontally (straight-line) and
+the mount base within 1 block vertically of the player's current feet. Normal seat height does
+not count against the terrain limit. Otherwise safe unmounted arrival is preferred without moving
+the player. These limits are rechecked before boarding, including after pending arrival.
+Server placement search defaults are 4 initially and 8 for fallback, using square bounds;
+existing valid configurations are preserved. Wider configured recall ranges never expand the
+automatic-riding proximity limit.
 Both peers must support protocol revision 2, which enforces rider-aware recall. Revision 1
 reserved the same boolean field without implementing that behavior and is rejected.
