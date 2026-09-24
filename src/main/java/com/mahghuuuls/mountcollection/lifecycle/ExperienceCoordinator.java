@@ -45,7 +45,8 @@ public final class ExperienceCoordinator {
                 return RecoveryAdmission.expired();
             }
             RecoveryAdmission result = entry.admission.get();
-            return result == null ? RecoveryAdmission.unavailable() : result;
+            return result == null ? RecoveryAdmission.unavailable() : result.withDisposition(
+                    () -> entry.disposition, () -> entry.disposition = ArrivalDisposition.UNMOUNTED_FALLBACK);
         } catch (FatalTransferSafetyException fatal) { throw fatal; }
         catch (RuntimeException | LinkageError failure) { return RecoveryAdmission.unavailable(); }
     }
@@ -54,6 +55,7 @@ public final class ExperienceCoordinator {
         // Consume before validation/delivery, including reentrant or throwing adapters.
         Pending admitted = pending.remove(completion.getRequestId());
         if (admitted == null) { return; }
+        completion = completion.withDisposition(admitted.disposition);
         try {
             if (!admitted.owner.equals(completion.getOwnerId()) || !admitted.current.getAsBoolean()) {
                 diagnostic.accept(detail("SUPPRESSED_STALE", completion));
@@ -80,8 +82,15 @@ public final class ExperienceCoordinator {
     }
 
     public void cancel(UUID request) { pending.remove(request); }
+    public void arrivalPlanned(UUID request, ArrivalDisposition disposition) {
+        Pending entry = pending.get(request);
+        if (entry != null && entry.disposition != ArrivalDisposition.UNMOUNTED_FALLBACK) {
+            entry.disposition = Objects.requireNonNull(disposition);
+        }
+    }
     private static String detail(String outcome, ExperienceCompletion completion) {
         return outcome + " kind=" + completion.getKind() + " request=" + completion.getRequestId()
+                + " disposition=" + completion.getDisposition()
                 + " owner=" + completion.getOwnerId() + " mount=" + completion.getMountId();
     }
     public void retainPending(java.util.function.Predicate<UUID> operationExists) {
@@ -93,6 +102,7 @@ public final class ExperienceCoordinator {
 
     private static final class Pending {
         private final UUID owner;
+        private ArrivalDisposition disposition = ArrivalDisposition.COMBINED;
         private final BooleanSupplier current;
         private final Consumer<ExperienceCompletion> boarding;
         private final java.util.function.Supplier<RecoveryAdmission> admission;

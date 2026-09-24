@@ -55,6 +55,7 @@ public final class MountCollectionServices {
             com.mahghuuuls.mountcollection.api.MountProvider provider = record == null ? null
                     : providerRegistry.find(record.getProviderId()).orElse(null);
             boarded = record != null && provider != null && worldGateway != null
+                    && completion.getDisposition() == com.mahghuuuls.mountcollection.lifecycle.ArrivalDisposition.COMBINED
                     && record.getCondition() == com.mahghuuuls.mountcollection.persistence.MountCondition.LIVING
                     && completion.getEntityId().equals(record.getPhysicalEntityId())
                     && completion.getOwnerId().equals(player.getUniqueID())
@@ -65,7 +66,8 @@ public final class MountCollectionServices {
         try {
             diagnostics.detail(com.mahghuuuls.mountcollection.diagnostics.DiagnosticCategory.LIFECYCLE,
                 "boarding_outcome", java.util.Collections.singletonMap("outcome",
-                        (boarded ? "BOARDED" : "NOT_BOARDED") + " request=" + completion.getRequestId()));
+                        (boarded ? "BOARDED" : "NOT_BOARDED") + " disposition=" + completion.getDisposition()
+                                + " request=" + completion.getRequestId()));
         } catch (com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException fatal) {
             throw fatal;
         } catch (RuntimeException | LinkageError unavailable) {
@@ -151,6 +153,7 @@ public final class MountCollectionServices {
                 worldGateway,
                 developmentControls::consumeRecoveryProviderUnavailable);
         lifecycleService.setCompletionSink(experience::complete);
+        lifecycleService.setArrivalSink(experience::arrivalPlanned);
     }
 
     synchronized void clearActiveConfig() {

@@ -47,6 +47,30 @@ final class MountLifecycleServiceTest {
     private static final ResourceLocation PROVIDER = new ResourceLocation("mountcollection:vanilla");
     private static final ResourceLocation HORSE = new ResourceLocation("minecraft:horse");
 
+    @Test void fallbackDispositionReachesCompletionWithCommittedIdentityAndNormalCooldown() {
+        MountRepository repository = new MountRepository();
+        UUID owner = UUID.randomUUID(), request = UUID.randomUUID();
+        MountRecord record = repository.register(new MountRepository.RegistrationCandidate(
+                owner, PROVIDER, HORSE, HORSE.toString(), UUID.randomUUID(),
+                new LastKnownEvidence(0,1,64,1), null)).getRecord().get();
+        ActiveServerClock clock = new ActiveServerClock(); clock.restore(100L,0L);
+        FakeRecallWorld gateway = new FakeRecallWorld(record, false, true);
+        gateway.riderPlanAllowed = true; gateway.riderFallback = true;
+        MountLifecycleService service = recallService(repository, clock, gateway);
+        List<ExperienceCompletion> arrivals = new ArrayList<>();
+        ExperienceCoordinator coordinator = new ExperienceCoordinator(arrivals::add, ignored -> {});
+        coordinator.admit(request, owner, () -> true, event -> {
+            assertEquals(ArrivalDisposition.UNMOUNTED_FALLBACK, event.getDisposition());
+            assertEquals(300L, repository.getRecallCooldownDeadline(owner));
+            assertEquals(record.getPhysicalEntityId(), event.getEntityId());
+        });
+        service.setArrivalSink(coordinator::arrivalPlanned); service.setCompletionSink(coordinator::complete);
+        assertEquals(ContextualOutcome.Status.RECALLED, service.recallVerified(request, null, owner, 0,
+                InhibitedStatus.UNAFFECTED, config(), true).getStatus());
+        assertEquals(1, arrivals.size()); assertEquals(1, gateway.commitCalls);
+        assertEquals(ArrivalDisposition.UNMOUNTED_FALLBACK, arrivals.get(0).getDisposition());
+    }
+
     @Test
     void automaticRecallUsesCombinedPlanAndEmitsOnlyAfterCommittedArrival() {
         MountRepository repository = new MountRepository();
@@ -83,7 +107,7 @@ final class MountLifecycleServiceTest {
     }
 
     @Test
-    void unsupportedAutomaticRidingFailsBeforePlacementButOptOutRetainsRecall() {
+    void missingBoardingCapabilityDelegatesSafetyToGatewayAndOptOutRetainsRecall() {
         MountRepository repository = new MountRepository();
         UUID owner = UUID.randomUUID();
         MountRecord record = repository.register(new MountRepository.RegistrationCandidate(
@@ -96,8 +120,9 @@ final class MountLifecycleServiceTest {
         List<ExperienceCompletion> effects = new ArrayList<>();
         service.setCompletionSink(effects::add);
 
-        assertEquals(ContextualOutcome.Status.BOARDING_UNSUPPORTED, service.recallVerified(
+        assertEquals(ContextualOutcome.Status.NO_SAFE_DESTINATION, service.recallVerified(
                 UUID.randomUUID(), null, owner, 0, InhibitedStatus.UNAFFECTED, config(), true).getStatus());
+        assertEquals(1, gateway.riderPlanCalls);
         assertEquals(0, gateway.planCalls);
         assertEquals(0, gateway.commitCalls);
         assertEquals(0L, repository.getRecallCooldownDeadline(owner));
@@ -322,6 +347,7 @@ final class MountLifecycleServiceTest {
         assertEquals(0, passenger.planCalls);
         FakeRecallWorld failing = new FakeRecallWorld(record, false, false);
         MountLifecycleService failingService = recallService(repository, clock, failing);
+        failingService.setCompletionSink(event -> { throw new AssertionError("rejected commit must not complete"); });
         assertEquals(ContextualOutcome.Status.INTERNAL_FAILURE,
                 failingService.recallVerified(
                         UUID.randomUUID(), null, owner, 0,
@@ -653,10 +679,12 @@ final class MountLifecycleServiceTest {
     }
 
     @org.junit.jupiter.params.ParameterizedTest
-    @org.junit.jupiter.params.provider.CsvSource({"true,CANDIDATE_SPAWNED", "false,CANDIDATE_SPAWNED",
-            "true,SOURCE_REMOVED", "false,SOURCE_REMOVED"})
+    @org.junit.jupiter.params.provider.CsvSource({"true,CANDIDATE_SPAWNED,false", "false,CANDIDATE_SPAWNED,false",
+            "true,SOURCE_REMOVED,false", "false,SOURCE_REMOVED,false",
+            "true,CANDIDATE_SPAWNED,true", "false,CANDIDATE_SPAWNED,true",
+            "true,SOURCE_REMOVED,true", "false,SOURCE_REMOVED,true"})
     void livePendingTransferDeliversOnlyOnceAndSuppressesInvalidatedSession(
-            boolean stillCurrent, TransferPhase pausePhase) {
+            boolean stillCurrent, TransferPhase pausePhase, boolean fallback) {
         MountRepository repository = new MountRepository();
         UUID owner = UUID.randomUUID(), request = UUID.randomUUID();
         MountRecord record = registered(repository, owner);
@@ -668,7 +696,8 @@ final class MountLifecycleServiceTest {
         ExperienceCoordinator coordinator = new ExperienceCoordinator(effects::add, ignored -> {});
         coordinator.admit(request, owner, () -> current[0]);
         service.setCompletionSink(coordinator::complete);
-        service.recallVerified(request, null, owner, 1, InhibitedStatus.UNAFFECTED, config());
+        service.setArrivalSink(coordinator::arrivalPlanned);
+        service.recallVerified(request, null, owner, 1, InhibitedStatus.UNAFFECTED, config(), fallback);
         assertTrue(repository.findTransfer(request).isPresent());
         coordinator.retainPending(id -> repository.findTransfer(id).isPresent());
         service.reconcilePendingTransfers();
@@ -683,6 +712,8 @@ final class MountLifecycleServiceTest {
         if (stillCurrent) {
             assertEquals(request, effects.get(0).getRequestId());
             assertEquals(ExperienceCompletion.Kind.ARRIVED, effects.get(0).getKind());
+            assertEquals(fallback ? ArrivalDisposition.UNMOUNTED_FALLBACK : ArrivalDisposition.MOUNT_ONLY,
+                    effects.get(0).getDisposition());
             coordinator.complete(effects.get(0));
             assertEquals(1, effects.size());
         }
@@ -1456,6 +1487,7 @@ final class MountLifecycleServiceTest {
         private int planCalls;
         private int riderPlanCalls;
         private boolean riderPlanAllowed;
+        private boolean riderFallback;
         private int commitCalls;
         private MountCharacteristics plannedCharacteristics;
 
@@ -1505,7 +1537,8 @@ final class MountLifecycleServiceTest {
                 MountCharacteristics characteristics, int normalRadius, int fallbackRadius) {
             riderPlanCalls++;
             return riderPlanAllowed ? Optional.of(new Destination(
-                    new LastKnownEvidence(0, 9, 64, 9), characteristics)) : Optional.empty();
+                    new LastKnownEvidence(0, 9, 64, 9), characteristics, riderFallback
+                            ? ArrivalDisposition.UNMOUNTED_FALLBACK : ArrivalDisposition.COMBINED)) : Optional.empty();
         }
 
         @Override
@@ -1518,6 +1551,11 @@ final class MountLifecycleServiceTest {
     }
 
     private static final class FakeTransferWorld implements RecallWorldGateway {
+        @Override public Optional<Destination> planWithRider(net.minecraft.entity.player.EntityPlayerMP player,
+                Source source, MountProvider provider, MountCharacteristics characteristics, int normal, int fallback) {
+            return Optional.of(new Destination(new LastKnownEvidence(1,9,64,9), characteristics,
+                    ArrivalDisposition.UNMOUNTED_FALLBACK));
+        }
         private final MountRecord record;
         private UUID sourceId;
         private UUID candidateId = UUID.randomUUID();

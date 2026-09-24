@@ -9,6 +9,7 @@ import com.mahghuuuls.mountcollection.api.RecoverySupport;
 import com.mahghuuuls.mountcollection.diagnostics.DiagnosticCategory;
 import com.mahghuuuls.mountcollection.diagnostics.DiagnosticSink;
 import com.mahghuuuls.mountcollection.lifecycle.RecallWorldGateway;
+import com.mahghuuuls.mountcollection.lifecycle.ArrivalDisposition;
 import com.mahghuuuls.mountcollection.persistence.EntityMountEvidence;
 import com.mahghuuuls.mountcollection.persistence.LastKnownEvidence;
 import com.mahghuuuls.mountcollection.persistence.MountRecord;
@@ -56,14 +57,18 @@ import net.minecraftforge.common.DimensionManager;
 /** Minecraft 1.12.2-specific bounded lookup and same-world placement adapter. */
 public final class ForgeRecallWorldGateway implements RecallWorldGateway {
 
-    /** Native world/construction operations only; admission ordering and context policy stay here. */
+    /** Native Recovery/transfer operations; admission ordering and context policy stay here. */
     interface RecoveryAccess {
         World world(int dimension);
         Entity create(World world, MountRecord record, MountProvider provider, UUID id);
+        default Entity reconstruct(World world, NBTTagCompound snapshot) {
+            return EntityList.createEntityFromNBT(snapshot, world);
+        }
         Entity find(World world, UUID id);
         boolean spawn(World world, Entity candidate);
         boolean mountSafe(Entity candidate, MountRecord record);
         boolean riderSafe(EntityPlayerMP rider, Entity candidate, MountRecord record, MountProvider provider);
+        boolean unmountedSafe(EntityPlayerMP rider, Entity candidate, MountRecord record);
         Optional<Destination> plan(EntityPlayerMP rider, Entity candidate, MountRecord record,
                 MountProvider provider, int normalRadius, int fallbackRadius);
     }
@@ -83,6 +88,10 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
             com.mahghuuuls.mountcollection.api.SeatEnvelope seat = boardingSeat(rider, candidate, provider);
             return seat != null && combinedSafe(rider, candidate, record.getCharacteristics().getPlacementProfile(),
                     seat, candidate.posX, candidate.posY, candidate.posZ, candidate.rotationYaw);
+        }
+        public boolean unmountedSafe(EntityPlayerMP rider, Entity candidate, MountRecord record) {
+            return fallbackSafe(rider, candidate, record.getCharacteristics().getPlacementProfile(),
+                    candidate.posX, candidate.posY, candidate.posZ);
         }
         public Optional<Destination> plan(EntityPlayerMP rider, Entity candidate, MountRecord record,
                 MountProvider provider, int normalRadius, int fallbackRadius) {
@@ -260,9 +269,9 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
             MountProvider provider, MountCharacteristics characteristics, int normalRadius, int fallbackRadius,
             boolean preserveRestoredYaw) {
         com.mahghuuuls.mountcollection.api.SeatEnvelope seat = boardingSeat(player, mount, provider);
-        if (seat == null) { return Optional.empty(); }
+        if (player == null || mount == null || !provider.supports(mount)) { return Optional.empty(); }
         BlockPos origin = player.getPosition();
-        return placementSearch.find(normalRadius, fallbackRadius, (dx, dy, dz) -> combinedSafe(
+        Optional<Destination> combined = seat == null ? Optional.empty() : placementSearch.find(normalRadius, fallbackRadius, (dx, dy, dz) -> combinedSafe(
                 player, mount, characteristics.getPlacementProfile(), seat,
                 origin.getX() + dx + .5D, origin.getY() + dy, origin.getZ() + dz + .5D,
                 preserveRestoredYaw ? mount.rotationYaw
@@ -270,6 +279,13 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
                 .map(offset -> new Destination(new LastKnownEvidence(player.dimension,
                         origin.getX() + offset.getX() + .5D, origin.getY() + offset.getY(),
                         origin.getZ() + offset.getZ() + .5D), characteristics));
+        if (combined.isPresent()) { return combined; }
+        return placementSearch.find(normalRadius, fallbackRadius, (dx, dy, dz) -> fallbackSafe(
+                player, mount, characteristics.getPlacementProfile(), origin.getX() + dx + .5D,
+                origin.getY() + dy, origin.getZ() + dz + .5D))
+                .map(offset -> new Destination(new LastKnownEvidence(player.dimension,
+                        origin.getX() + offset.getX() + .5D, origin.getY() + offset.getY(),
+                        origin.getZ() + offset.getZ() + .5D), characteristics, ArrivalDisposition.UNMOUNTED_FALLBACK));
     }
 
     @Override
@@ -306,13 +322,30 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
 
     private static boolean riderDestinationValid(EntityPlayerMP player, Entity mount,
             MountProvider provider, Destination destination) {
+        // Preparation may change eligibility. Missing seating may fall back; an invalid mount may not.
+        if (!mount.isEntityAlive() || mount.isBeingRidden() || !provider.supports(mount)) { return false; }
         if (!destination.getRiderCharacteristics().isPresent()) { return true; }
         com.mahghuuuls.mountcollection.api.SeatEnvelope seat = boardingSeat(player, mount, provider);
         LastKnownEvidence target = destination.getEvidence();
-        return seat != null && player.dimension == target.getDimensionId()
+        if (destination.getDisposition() == ArrivalDisposition.COMBINED && seat != null && player.dimension == target.getDimensionId()
                 && combinedSafe(player, mount, destination.getRiderCharacteristics().get().getPlacementProfile(),
                         seat, target.getX(), target.getY(), target.getZ(),
-                        placementYaw(player, target.getX(), target.getZ()));
+                        placementYaw(player, target.getX(), target.getZ()))) { return true; }
+        if (player.dimension != target.getDimensionId() || !fallbackSafe(player, mount,
+                destination.getRiderCharacteristics().get().getPlacementProfile(),
+                target.getX(), target.getY(), target.getZ())) { return false; }
+        destination.useUnmountedFallback();
+        return true;
+    }
+
+    private static boolean fallbackSafe(EntityPlayerMP player, Entity mount, PlacementProfile profile,
+            double x, double y, double z) {
+        if (player == null || !player.isEntityAlive() || player.isRiding() || player.isBeingRidden()) { return false; }
+        WorldServer world = player.getServerWorld();
+        AxisAlignedBB body = mount.getEntityBoundingBox().offset(x - mount.posX, y - mount.posY, z - mount.posZ);
+        AxisAlignedBB standing = player.getEntityBoundingBox();
+        return !body.intersects(standing) && insideBorder(world, body) && safe(world, mount, profile, x, y, z, player)
+                && riderClear(world, standing, mount, player);
     }
 
     private static boolean combinedSafe(EntityPlayerMP player, Entity mount, PlacementProfile profile,
@@ -616,13 +649,15 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
     public boolean commit(
             EntityPlayerMP player, Source source, Destination destination, MountProvider provider) {
         Entity entity = entity(source);
-        if (entity.isDead || entity.isBeingRidden() || entity.dimension != player.dimension) {
+        if (entity.isDead || entity.isBeingRidden() || entity.dimension != player.dimension || !provider.supports(entity)) {
             return false;
         }
         if (provider instanceof PreparationSupport) {
             ProviderResult<Void> prepared;
             try {
                 prepared = ((PreparationSupport) provider).prepareForPlacement(entity);
+            } catch (com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException fatal) {
+                throw fatal;
             } catch (RuntimeException exception) {
                 return false;
             }
@@ -671,7 +706,7 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         }
         NBTTagCompound sourceSnapshot = captured.get();
         ResourceLocation entityType = EntityList.getKey(entity);
-        WorldServer destinationWorld = resolveWorld(destination.getEvidence().getDimensionId());
+        World destinationWorld = recoveryAccess.world(destination.getEvidence().getDimensionId());
         if (destinationWorld == null) {
             return Optional.empty();
         }
@@ -680,7 +715,7 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         normalizeCandidateSnapshot(candidateSnapshot, candidateId, destination.getEvidence());
         Entity candidate;
         try {
-            candidate = EntityList.createEntityFromNBT(candidateSnapshot, destinationWorld);
+            candidate = recoveryAccess.reconstruct(destinationWorld, candidateSnapshot);
         } catch (RuntimeException exception) {
             return Optional.empty();
         }
@@ -724,12 +759,12 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
     }
 
     @Override
-    public CandidateAction spawnCandidate(TransferOperation operation) {
-        WorldServer world = resolveWorld(operation.getDestinationEvidence().getDimensionId());
+    public CandidateAction spawnCandidate(TransferOperation operation, MountRecord record, MountProvider provider) {
+        World world = recoveryAccess.world(operation.getDestinationEvidence().getDimensionId());
         if (world == null) {
             return CandidateAction.UNAVAILABLE;
         }
-        Entity existing = world.getEntityFromUuid(operation.getCandidateEntityId());
+        Entity existing = recoveryAccess.find(world, operation.getCandidateEntityId());
         if (existing != null) {
             return isExactCandidate(existing, operation)
                     ? CandidateAction.SUCCESS
@@ -740,7 +775,7 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         normalizeCandidateSnapshot(raw, operation.getCandidateEntityId(), target);
         Entity candidate;
         try {
-            candidate = EntityList.createEntityFromNBT(raw, world);
+            candidate = recoveryAccess.reconstruct(world, raw);
         } catch (RuntimeException exception) {
             return CandidateAction.FAILED;
         }
@@ -756,10 +791,13 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         candidate.fallDistance = 0.0F;
         EntityMountEvidence.attachTransferCandidate(
                 candidate, operation.getMountId(), operation.getOperationId());
-        if (!world.spawnEntity(candidate)) {
+        if (!recoveryCandidateSafe(candidate, operation.getOperationId(), operation.getOwnerId(), record, provider)) {
+            return CandidateAction.UNAVAILABLE;
+        }
+        if (!recoveryAccess.spawn(world, candidate)) {
             return CandidateAction.FAILED;
         }
-        Entity indexed = world.getEntityFromUuid(operation.getCandidateEntityId());
+        Entity indexed = recoveryAccess.find(world, operation.getCandidateEntityId());
         return indexed == candidate && isExactCandidate(indexed, operation)
                 ? CandidateAction.SUCCESS
                 : CandidateAction.CONFLICT;
@@ -849,18 +887,28 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
 
     private boolean recoveryCandidateSafe(Entity candidate, RestorationOperation operation,
             MountRecord record, MountProvider provider) {
+        return recoveryCandidateSafe(candidate, operation.getOperationId(), operation.getOwnerId(), record, provider);
+    }
+
+    private boolean recoveryCandidateSafe(Entity candidate, UUID request, UUID owner,
+            MountRecord record, MountProvider provider) {
         try {
             if (!candidate.isEntityAlive() || candidate.isBeingRidden() || candidate.isRiding()
                     || !provider.supports(candidate)) { return false; }
             com.mahghuuuls.mountcollection.lifecycle.RecoveryAdmission context =
-                    recoveryAdmission.apply(operation.getOperationId(), operation.getOwnerId());
+                    recoveryAdmission.apply(request, owner);
             if (context == null || context.getMode()
                     == com.mahghuuuls.mountcollection.lifecycle.RecoveryAdmission.Mode.UNAVAILABLE) { return false; }
             if (context.getMode() == com.mahghuuuls.mountcollection.lifecycle.RecoveryAdmission.Mode.AUTOMATIC) {
                 EntityPlayerMP rider = context.getRider();
                 if (rider == null || rider.world != candidate.world
-                        || !rider.getUniqueID().equals(operation.getOwnerId())) { return false; }
-                return recoveryAccess.riderSafe(rider, candidate, record, provider);
+                        || !rider.getUniqueID().equals(owner)) { return false; }
+                if (context.allowsBoarding() && recoveryAccess.riderSafe(rider, candidate, record, provider)) {
+                    return true;
+                }
+                if (!recoveryAccess.unmountedSafe(rider, candidate, record)) { return false; }
+                context.useUnmountedFallback();
+                return true;
             }
             return recoveryAccess.mountSafe(candidate, record);
         } catch (com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException fatal) { throw fatal; }
@@ -1766,6 +1814,8 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         try {
             ProviderResult<Void> result = ((PreparationSupport) provider).prepareForPlacement(entity);
             return result != null && result.isSuccess();
+        } catch (com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException fatal) {
+            throw fatal;
         } catch (RuntimeException exception) {
             return false;
         }

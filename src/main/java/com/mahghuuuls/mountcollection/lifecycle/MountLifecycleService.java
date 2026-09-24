@@ -52,6 +52,11 @@ public final class MountLifecycleService {
     private boolean reconcilingTransfers;
     private boolean abandoning;
     private java.util.function.Consumer<ExperienceCompletion> completionSink = ignored -> { };
+    private java.util.function.BiConsumer<UUID, ArrivalDisposition> arrivalSink = (request, disposition) -> { };
+
+    public void setArrivalSink(java.util.function.BiConsumer<UUID, ArrivalDisposition> sink) {
+        arrivalSink = java.util.Objects.requireNonNull(sink);
+    }
 
     public void setCompletionSink(java.util.function.Consumer<ExperienceCompletion> sink) {
         completionSink = Objects.requireNonNull(sink);
@@ -527,10 +532,6 @@ public final class MountLifecycleService {
             return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
                     ContextualOutcome.failure(denial));
         }
-        if (automaticRiding && !(provider instanceof com.mahghuuuls.mountcollection.api.BoardingSupport)) {
-            return contextualFinish(correlationId, "recall", record.getProviderId().toString(),
-                    ContextualOutcome.failure(ContextualOutcome.Status.BOARDING_UNSUPPORTED));
-        }
         java.util.Optional<RecallWorldGateway.Destination> destination = automaticRiding
                 ? worldGateway.planWithRider(player, source, provider, record.getCharacteristics(),
                         config.getNormalPlacementRadius(), config.getFallbackPlacementRadius()) : worldGateway.plan(
@@ -576,6 +577,7 @@ public final class MountLifecycleService {
                 destination.get().getEvidence(),
                 deadline.getValue(),
                 config.getSummonCooldownTicks());
+        arrivalSink.accept(correlationId, destination.get().getDisposition());
         completed(correlationId, ownerId, mountId, source.getPhysicalEntityId(),
                 destination.get().getEvidence(), ExperienceCompletion.Kind.ARRIVED);
         Map<String, String> commitFields = new LinkedHashMap<>();
@@ -700,10 +702,6 @@ public final class MountLifecycleService {
             return contextualFinish(correlationId, "recovery_recall",
                     record.getProviderId().toString(), ContextualOutcome.failure(denial));
         }
-        if (automaticRiding && !(provider instanceof com.mahghuuuls.mountcollection.api.BoardingSupport)) {
-            return contextualFinish(correlationId, "recovery_recall", record.getProviderId().toString(),
-                    ContextualOutcome.failure(ContextualOutcome.Status.BOARDING_UNSUPPORTED));
-        }
         java.util.Optional<RecallWorldGateway.RecoveryPlan> plan = automaticRiding
                 ? worldGateway.planRecoveryWithRider(player, record, provider, config.getNormalPlacementRadius(),
                         config.getFallbackPlacementRadius()) : worldGateway.planRecovery(
@@ -722,6 +720,7 @@ public final class MountLifecycleService {
                     ContextualOutcome.failure(ContextualOutcome.Status.INTERNAL_FAILURE));
         }
         try (RecallWorldGateway.RecoveryPlan recoveryPlan = plan.get()) {
+        arrivalSink.accept(correlationId, recoveryPlan.getDestination().getDisposition());
         RestorationOperation operation = new RestorationOperation(
                 correlationId, record.getMountId(), ownerId,
                 recoveryPlan.getCandidateEntityId(),
@@ -1122,6 +1121,7 @@ public final class MountLifecycleService {
                     ContextualOutcome.failure(ContextualOutcome.Status.INTERNAL_FAILURE));
         }
         RecallWorldGateway.TransferPlan transferPlan = planned.get();
+        arrivalSink.accept(correlationId, destination.getDisposition());
         TransferOperation operation = new TransferOperation(
                 correlationId,
                 record.getMountId(),
@@ -1156,7 +1156,7 @@ public final class MountLifecycleService {
             recordTransferPhase(operation, TransferPhase.CANDIDATE_SPAWN_INTENT);
             operation = repository.findTransfer(operationId).orElse(operation);
             worldGateway.transferPhaseAcknowledged(TransferPhase.CANDIDATE_SPAWN_INTENT);
-            RecallWorldGateway.CandidateAction spawned = worldGateway.spawnCandidate(operation);
+            RecallWorldGateway.CandidateAction spawned = worldGateway.spawnCandidate(operation, record, provider);
             if (spawned != RecallWorldGateway.CandidateAction.SUCCESS) {
                 TransferAdvanceOutcome rollback = rollbackSpawnFailure(operation, spawned);
                 return contextualFinish(correlationId, "recall", record.getProviderId().toString(),

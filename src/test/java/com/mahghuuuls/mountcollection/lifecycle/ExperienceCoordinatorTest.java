@@ -8,6 +8,30 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
 final class ExperienceCoordinatorTest {
+    @Test void plannedFallbackCannotUpgradeBeforeCompletionAndIsDeliveredOnce() {
+        AtomicInteger calls = new AtomicInteger();
+        ExperienceCoordinator coordinator = new ExperienceCoordinator(event -> {
+            assertEquals(ArrivalDisposition.UNMOUNTED_FALLBACK, event.getDisposition()); calls.incrementAndGet();
+        }, ignored -> {});
+        UUID request = UUID.randomUUID(), owner = UUID.randomUUID();
+        coordinator.admit(request, owner, () -> true, event ->
+                assertEquals(ArrivalDisposition.UNMOUNTED_FALLBACK, event.getDisposition()));
+        coordinator.arrivalPlanned(request, ArrivalDisposition.UNMOUNTED_FALLBACK);
+        coordinator.arrivalPlanned(request, ArrivalDisposition.COMBINED);
+        assertFalse(coordinator.recoveryAdmission(request, owner).allowsBoarding());
+        coordinator.complete(completion(request, owner)); coordinator.complete(completion(request, owner));
+        assertEquals(1, calls.get());
+    }
+
+    @Test void finalAdmissionFallbackUpdatesExistingRequestWithoutNewRegistry() {
+        UUID request = UUID.randomUUID(), owner = UUID.randomUUID();
+        ExperienceCoordinator coordinator = new ExperienceCoordinator(event -> {}, ignored -> {});
+        coordinator.admit(request, owner, () -> true, event ->
+                assertEquals(ArrivalDisposition.UNMOUNTED_FALLBACK, event.getDisposition()));
+        coordinator.recoveryAdmission(request, owner).useUnmountedFallback();
+        assertFalse(coordinator.recoveryAdmission(request, owner).allowsBoarding());
+        coordinator.complete(completion(request, owner));
+    }
     @Test void recoveryContextErrorsDoNotBecomeExpiredOrConsumeCompletion() {
         AtomicInteger delivered = new AtomicInteger();
         ExperienceCoordinator coordinator = new ExperienceCoordinator(event -> delivered.incrementAndGet(), ignored -> {});

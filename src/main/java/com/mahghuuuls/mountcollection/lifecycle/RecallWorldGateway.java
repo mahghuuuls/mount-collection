@@ -71,6 +71,10 @@ public interface RecallWorldGateway {
         return CandidateAction.FAILED;
     }
 
+    default CandidateAction spawnCandidate(TransferOperation operation, MountRecord record, MountProvider provider) {
+        return spawnCandidate(operation);
+    }
+
     default TransferEvidence inspectTransfer(TransferOperation operation) {
         return TransferEvidence.conflict();
     }
@@ -380,15 +384,29 @@ public interface RecallWorldGateway {
     final class Destination {
         private final LastKnownEvidence evidence;
         private final MountCharacteristics riderCharacteristics;
+        private ArrivalDisposition disposition;
 
         public Destination(LastKnownEvidence evidence) {
             this(evidence, null);
         }
 
         public Destination(LastKnownEvidence evidence, MountCharacteristics riderCharacteristics) {
+            this(evidence, riderCharacteristics, riderCharacteristics == null
+                    ? ArrivalDisposition.MOUNT_ONLY : ArrivalDisposition.COMBINED);
+        }
+
+        public Destination(LastKnownEvidence evidence, MountCharacteristics riderCharacteristics,
+                ArrivalDisposition disposition) {
             this.evidence = Objects.requireNonNull(evidence, "evidence");
             this.riderCharacteristics = riderCharacteristics;
+            this.disposition = Objects.requireNonNull(disposition);
+            if (disposition != ArrivalDisposition.MOUNT_ONLY && riderCharacteristics == null) {
+                throw new IllegalArgumentException("Automatic arrival requires placement characteristics");
+            }
         }
+
+        public ArrivalDisposition getDisposition() { return disposition; }
+        public void useUnmountedFallback() { disposition = ArrivalDisposition.UNMOUNTED_FALLBACK; }
 
         public Optional<MountCharacteristics> getRiderCharacteristics() {
             return Optional.ofNullable(riderCharacteristics);

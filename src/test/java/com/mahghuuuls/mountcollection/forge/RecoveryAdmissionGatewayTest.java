@@ -19,6 +19,64 @@ import static org.junit.jupiter.api.Assertions.*;
 final class RecoveryAdmissionGatewayTest {
     @BeforeAll static void bootstrap() { Bootstrap.register(); }
 
+    @Test void transferCaptureRejectsSupportLostDuringPreparationBeforeProducingIntent() throws Exception {
+        Fixture f = new Fixture(); f.provider.invalidateOnPrepare = true;
+        EntityBoat source = new EntityBoat(f.access.world); source.dimension = 1;
+        source.setUniqueId(f.record.getPhysicalEntityId()); source.setPosition(2,64,2);
+        assertFalse(f.gateway.captureTransfer(f.player,
+                new RecallWorldGateway.Source(source.getUniqueID(), 1, false, source),
+                new RecallWorldGateway.Destination(new LastKnownEvidence(0,8,64,8),
+                        f.record.getCharacteristics()), f.provider).isPresent());
+        assertEquals(1, f.access.created.size()); assertEquals(1, f.provider.preparations);
+        assertEquals(0, f.access.spawns); assertEquals(2, source.posX);
+    }
+
+    @Test void transferReconstructionIsCheckedBeforeSpawnAndDowngradesLiveCompletion() throws Exception {
+        Fixture f = new Fixture(); f.access.autoSafe = false;
+        ExperienceCoordinator coordinator = new ExperienceCoordinator(event -> {}, ignored -> {});
+        List<ExperienceCompletion> completed = new ArrayList<>();
+        coordinator.admit(f.intent.getOperationId(), f.owner, () -> true, completed::add,
+                () -> RecoveryAdmission.automatic(f.player));
+        f.gateway.setRecoveryAdmission(coordinator::recoveryAdmission);
+        TransferOperation operation = f.transfer();
+        assertEquals(RecallWorldGateway.CandidateAction.SUCCESS,
+                f.gateway.spawnCandidate(operation, f.record, f.provider));
+        assertEquals(1, f.access.created.size());
+        Entity candidate = f.access.created.get(0);
+        assertSame(candidate, f.access.spawned);
+        assertEquals(Arrays.asList(candidate, candidate), f.access.checked);
+        assertEquals(8, candidate.posX); assertEquals(64, candidate.posY); assertEquals(8, candidate.posZ);
+        assertEquals(8, operation.getDestinationEvidence().getX());
+        assertEquals(operation.getCandidateEntityId(), candidate.getUniqueID());
+        f.access.autoSafe = true; // Later seat availability cannot change the recorded decision.
+        coordinator.complete(new ExperienceCompletion(operation.getOperationId(), f.owner, f.record.getMountId(),
+                candidate.getUniqueID(), operation.getDestinationEvidence(), ExperienceCompletion.Kind.ARRIVED));
+        assertEquals(1, completed.size());
+        assertEquals(ArrivalDisposition.UNMOUNTED_FALLBACK, completed.get(0).getDisposition());
+    }
+
+    @Test void transferFinalGuardRejectsUnsafeUnavailableAndUnsupportedButNotExpired() throws Exception {
+        for (int mode = 0; mode < 4; mode++) {
+            Fixture f = new Fixture(); f.access.autoSafe = false; f.access.fallbackSafe = false;
+            if (mode == 1) { f.context = RecoveryAdmission.unavailable(); }
+            if (mode == 2) { f.provider.supported = false; }
+            if (mode == 3) { f.context = RecoveryAdmission.expired(); }
+            assertEquals(mode == 3 ? RecallWorldGateway.CandidateAction.SUCCESS : RecallWorldGateway.CandidateAction.UNAVAILABLE,
+                    f.gateway.spawnCandidate(f.transfer(), f.record, f.provider));
+            assertEquals(mode == 3 ? 1 : 0, f.access.spawns);
+            assertEquals(mode == 3 ? 1 : 0, f.access.mountChecks);
+            assertEquals(1, f.access.created.size());
+        }
+    }
+
+    @Test void transferCombinedControlChecksTheSameInstanceThatSpawns() throws Exception {
+        Fixture f = new Fixture();
+        assertEquals(RecallWorldGateway.CandidateAction.SUCCESS,
+                f.gateway.spawnCandidate(f.transfer(), f.record, f.provider));
+        assertEquals(Collections.singletonList(f.access.spawned), f.access.checked);
+        assertEquals(1, f.access.autoChecks); assertEquals(0, f.access.fallbackChecks);
+    }
+
     @Test void initialRiderPlanRetainsItsExactCandidateAndDenialProducesNoAttempt() throws Exception {
         Fixture f = new Fixture();
         RecallWorldGateway.RecoveryPlan plan = f.gateway.planRecoveryWithRider(f.player, f.record, f.provider, 2, 4).get();
@@ -29,7 +87,7 @@ final class RecoveryAdmissionGatewayTest {
         assertEquals(RecallWorldGateway.CandidateAction.SUCCESS, plan.getAttempt().admit(intent));
         assertSame(planned, f.access.spawned); assertEquals(1, f.access.created.size());
         assertEquals(Arrays.asList(planned, planned), f.access.checked);
-        Fixture g = new Fixture(); g.access.autoSafe = false;
+        Fixture g = new Fixture(); g.access.autoSafe = false; g.access.fallbackSafe = false;
         assertFalse(g.gateway.planRecoveryWithRider(g.player, g.record, g.provider, 2, 4).isPresent());
         assertEquals(0, g.access.spawns);
     }
@@ -45,6 +103,34 @@ final class RecoveryAdmissionGatewayTest {
         assertEquals(1, f.access.spawns);
     }
 
+    @Test void finalSeatLossFallsBackAtFixedTargetButUnsafeFallbackCannotSpawn() throws Exception {
+        Fixture f = new Fixture(); RecoveryAttempt attempt = f.prepare().get();
+        f.access.autoSafe = false;
+        assertEquals(RecallWorldGateway.CandidateAction.SUCCESS, attempt.admit(f.intent));
+        assertEquals(f.intent.getDestinationEvidence().getX(), f.access.spawned.posX);
+        assertEquals(f.intent.getDestinationEvidence().getZ(), f.access.spawned.posZ);
+        assertEquals(1, f.access.created.size()); assertEquals(1, f.access.fallbackChecks);
+        Fixture g = new Fixture(); RecoveryAttempt denied = g.prepare().get();
+        g.access.autoSafe = false; g.access.fallbackSafe = false;
+        assertEquals(RecallWorldGateway.CandidateAction.UNAVAILABLE, denied.admit(g.intent));
+        assertEquals(0, g.access.spawns);
+    }
+
+    @Test void plannedFallbackRemainsUnmountedThroughActualRecoveryAdmission() throws Exception {
+        Fixture f = new Fixture(); f.access.autoSafe = false;
+        ExperienceCoordinator coordinator = new ExperienceCoordinator(event -> {}, ignored -> {});
+        coordinator.admit(f.intent.getOperationId(), f.owner, () -> true, event ->
+                assertEquals(ArrivalDisposition.UNMOUNTED_FALLBACK, event.getDisposition()),
+                () -> RecoveryAdmission.automatic(f.player));
+        f.gateway.setRecoveryAdmission(coordinator::recoveryAdmission);
+        RecoveryAttempt attempt = f.prepare().get();
+        f.access.autoSafe = true;
+        assertEquals(RecallWorldGateway.CandidateAction.SUCCESS, attempt.admit(f.intent));
+        assertEquals(1, f.access.autoChecks); assertEquals(2, f.access.fallbackChecks);
+        coordinator.complete(new ExperienceCompletion(f.intent.getOperationId(), f.owner, f.record.getMountId(),
+                f.intent.getCandidateEntityId(), f.intent.getDestinationEvidence(), ExperienceCompletion.Kind.ARRIVED));
+    }
+
     @Test void finalGeometryOrEligibilityChangesRejectAfterIntent() throws Exception {
         for (boolean geometry : new boolean[]{false, true}) {
             Fixture f = new Fixture(); RecoveryAttempt attempt = f.prepare().get();
@@ -55,7 +141,7 @@ final class RecoveryAdmissionGatewayTest {
     }
 
     @Test void initialAutoDenialAndFreshChangedReconstructionAreChecked() throws Exception {
-        Fixture f = new Fixture(); f.access.autoSafe = false;
+        Fixture f = new Fixture(); f.access.autoSafe = false; f.access.fallbackSafe = false;
         assertFalse(f.prepare().isPresent()); assertEquals(0, f.access.spawns);
         Fixture g = new Fixture(); RecoveryAttempt discarded = g.prepare().get(); discarded.close();
         // Second construction has a different geometry, not a fake preparation-denied switch.
@@ -66,9 +152,10 @@ final class RecoveryAdmissionGatewayTest {
         assertEquals(0, g.access.spawns);
     }
 
-    @Test void currentAutoNeverFallsBackButOptOutAndExpiredUseMountChecks() throws Exception {
+    @Test void currentAutoFallsBackButOptOutAndExpiredUseMountChecks() throws Exception {
         Fixture f = new Fixture(); f.access.autoSafe = false;
-        assertFalse(f.prepare().isPresent()); assertEquals(0, f.access.mountChecks);
+        assertEquals(RecallWorldGateway.CandidateAction.SUCCESS, f.prepare().get().admit(f.intent));
+        assertEquals(2, f.access.fallbackChecks);
         for (RecoveryAdmission context : new RecoveryAdmission[]{RecoveryAdmission.optOut(), RecoveryAdmission.expired()}) {
             Fixture g = new Fixture(); g.context = context; g.access.autoSafe = false;
             assertEquals(RecallWorldGateway.CandidateAction.SUCCESS, g.prepare().get().admit(g.intent));
@@ -135,34 +222,62 @@ final class RecoveryAdmissionGatewayTest {
             });
         }
         Optional<RecoveryAttempt> prepare() { return gateway.prepareRecoveryAttempt(prepared, record, provider); }
+        TransferOperation transfer() {
+            net.minecraft.nbt.NBTTagCompound snapshot = new net.minecraft.nbt.NBTTagCompound();
+            snapshot.setString("id", "minecraft:boat");
+            return new TransferOperation(intent.getOperationId(), record.getMountId(), owner,
+                    record.getPhysicalEntityId(), intent.getCandidateEntityId(), new LastKnownEvidence(1,2,64,2),
+                    intent.getDestinationEvidence(), snapshot, 20,20,TransferPhase.CANDIDATE_SPAWN_INTENT,null);
+        }
     }
     private static final class Access implements ForgeRecallWorldGateway.RecoveryAccess {
         final World world = new BoardingTestWorld();
         final List<Entity> created = new ArrayList<>(), checked = new ArrayList<>();
-        Entity spawned; int spawns, autoChecks, mountChecks; boolean autoSafe = true;
+        Entity spawned; int spawns, autoChecks, mountChecks, fallbackChecks;
+        boolean autoSafe = true, fallbackSafe = true;
         public World world(int dimension) { return world; }
+        public Entity reconstruct(World world, net.minecraft.nbt.NBTTagCompound snapshot) {
+            Entity candidate = ForgeRecallWorldGateway.RecoveryAccess.super.reconstruct(world, snapshot);
+            created.add(candidate); return candidate;
+        }
         public Entity create(World world, MountRecord record, MountProvider provider, UUID id) {
             EntityBoat candidate = new EntityBoat(world); candidate.setUniqueId(id);
             candidate.width = created.isEmpty() ? 1 : 9;
             created.add(candidate); return candidate;
         }
         public Entity find(World world, UUID id) { return spawned; }
-        public boolean spawn(World world, Entity candidate) { spawns++; spawned = candidate; return true; }
+        public boolean spawn(World world, Entity candidate) {
+            assertFalse(checked.isEmpty(), "admission must run before spawn");
+            assertSame(candidate, checked.get(checked.size()-1));
+            spawns++; spawned = candidate; return true;
+        }
         public boolean mountSafe(Entity candidate, MountRecord record) {
             mountChecks++; checked.add(candidate); return candidate.width < 2;
         }
         public boolean riderSafe(EntityPlayerMP rider, Entity candidate, MountRecord record, MountProvider provider) {
             autoChecks++; checked.add(candidate); return autoSafe && candidate.width < 2;
         }
+        public boolean unmountedSafe(EntityPlayerMP rider, Entity candidate, MountRecord record) {
+            fallbackChecks++; checked.add(candidate); return fallbackSafe && candidate.width < 2;
+        }
         public Optional<RecallWorldGateway.Destination> plan(EntityPlayerMP rider, Entity candidate, MountRecord record,
                 MountProvider provider, int normalRadius, int fallbackRadius) {
-            return riderSafe(rider, candidate, record, provider)
-                    ? Optional.of(new RecallWorldGateway.Destination(new LastKnownEvidence(0, 8, 64, 8),
-                            record.getCharacteristics())) : Optional.empty();
+            if (riderSafe(rider, candidate, record, provider)) {
+                return Optional.of(new RecallWorldGateway.Destination(new LastKnownEvidence(0, 8, 64, 8), record.getCharacteristics()));
+            }
+            return unmountedSafe(rider, candidate, record) ? Optional.of(new RecallWorldGateway.Destination(
+                    new LastKnownEvidence(0, 8, 64, 8), record.getCharacteristics(), ArrivalDisposition.UNMOUNTED_FALLBACK))
+                    : Optional.empty();
         }
     }
-    private static final class Provider implements MountProvider {
+    private static final class Provider implements MountProvider, PreparationSupport {
         boolean supported = true;
+        boolean invalidateOnPrepare; int preparations;
+        public ProviderResult<Void> prepareForPlacement(Entity entity) {
+            preparations++;
+            if (invalidateOnPrepare) { supported = false; }
+            return ProviderResult.success();
+        }
         public ResourceLocation getProviderId() { return new ResourceLocation("test:admission"); }
         public boolean supports(Entity entity) { return supported; }
         public ProviderResult<RegistrationProfile> validateRegistration(Entity entity, UUID owner) {

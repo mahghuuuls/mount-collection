@@ -14,15 +14,22 @@ public final class ExperienceCompletion {
     private final UUID entityId;
     private final LastKnownEvidence location;
     private final Kind kind;
+    private final ArrivalDisposition disposition;
 
     public ExperienceCompletion(UUID requestId, UUID ownerId, MountId mountId,
             UUID entityId, LastKnownEvidence location, Kind kind) {
+        this(requestId, ownerId, mountId, entityId, location, kind, ArrivalDisposition.COMBINED);
+    }
+
+    private ExperienceCompletion(UUID requestId, UUID ownerId, MountId mountId,
+            UUID entityId, LastKnownEvidence location, Kind kind, ArrivalDisposition disposition) {
         this.requestId = Objects.requireNonNull(requestId);
         this.ownerId = Objects.requireNonNull(ownerId);
         this.mountId = Objects.requireNonNull(mountId);
         this.entityId = Objects.requireNonNull(entityId);
         this.location = Objects.requireNonNull(location);
         this.kind = Objects.requireNonNull(kind);
+        this.disposition = Objects.requireNonNull(disposition);
     }
     public UUID getRequestId() { return requestId; }
     public UUID getOwnerId() { return ownerId; }
@@ -30,4 +37,8 @@ public final class ExperienceCompletion {
     public UUID getEntityId() { return entityId; }
     public LastKnownEvidence getLocation() { return location; }
     public Kind getKind() { return kind; }
+    public ArrivalDisposition getDisposition() { return disposition; }
+    public ExperienceCompletion withDisposition(ArrivalDisposition disposition) {
+        return new ExperienceCompletion(requestId, ownerId, mountId, entityId, location, kind, disposition);
+    }
 }

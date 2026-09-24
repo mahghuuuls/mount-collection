@@ -1,8 +1,8 @@
 # Experimental boarding capability
 
 `BoardingSupport` is optional and common-side. Existing `MountProvider` implementations
-without it remain eligible for ordinary nearby recall when the client opts out of automatic
-riding. They reject automatic riding; absence is never interpreted as a generic horse seat.
+without it remain eligible for safe nearby recall, including unmounted fallback when automatic
+riding is enabled. Absence is never interpreted as a generic horse seat.
 
 `describeBoarding(Entity, UUID)` inspects native seating eligibility and returns a
 `ProviderResult<SeatEnvelope>`. It may receive the living source or an unspawned entity
@@ -16,7 +16,7 @@ origin at yaw zero. Coordinates must be finite, ordered, and within -16 through 
 Zero extent is valid for a fixed anchor. Cover all relevant native attachment poses and body
 yaw variation; do not include player width, height or the player's Y offset. Core rotates the
 envelope to the candidate yaw and adds those dimensions. Unknown or unprovable geometry must
-return a failure, never an invented offset. A successful result without geometry also rejects.
+return a failure, never an invented offset. A successful result without geometry also prevents boarding.
 
 Core independently checks ownership, occupancy, loaded-world bounds, full border clearance,
 mount placement, rider collision and water/lava/fire exposure. A provider cannot waive those
@@ -24,6 +24,12 @@ rules. Eligibility is inspected again after arrival. Core attempts non-forced na
 once and verifies the resulting relationship. Native mounting hooks can still veto; a late
 failure leaves the successfully summoned mount and its cooldown intact. No boarding request
 is replayed after disconnect or restart.
+
+Automatic riding prefers a safe combined destination. When seating is unavailable or unsafe,
+core may instead choose safe mount-only arrival that leaves the player safely unmounted and
+separate from the arriving mount. This does not waive mount-provider or recall restrictions.
+Planned fallback never attempts boarding later, even if eligibility improves. It retains normal
+success cooldown and arrival particles and reports that the player could not mount.
 
 If an attachment fails verification, core first attempts normal dismount and verifies both
 sides of the passenger relationship. It may then remove only the link created by that failed
@@ -43,7 +49,8 @@ is not permission to spawn: core retains its existing journal acknowledgement an
 fences. A paused attempt is discarded; a later reconstruction is checked again. Providers
 must not assume that a successful earlier seat declaration authorizes a different instance.
 An expired original request may allow acknowledged recovery to converge without boarding;
-an unavailable context lookup does not waive a current request's rider safety.
+an unavailable context lookup fails closed. Current requests may degrade to safe unmounted
+arrival at their fixed acknowledged destination, never silently move that durable target.
 
 Client preference: `config/mountcollection-client.cfg`, category `recall`, boolean
 `automatic_riding`, defaults true. Restart the client after editing. There is no GUI toggle.
