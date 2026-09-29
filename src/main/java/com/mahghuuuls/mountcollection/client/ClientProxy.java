@@ -17,7 +17,8 @@ public final class ClientProxy extends CommonProxy {
     private KeyBinding openCollection;
     private MountNetwork network;
     private ClientRidingPreferences ridingPreferences;
-    private final ClientRelocations relocations = new ClientRelocations();
+    private final ClientRelocationTrace relocationTrace = new ClientRelocationTrace();
+    private final ClientRelocations relocations = new ClientRelocations(relocationTrace);
     private final com.mahghuuuls.mountcollection.client.preview.ClientPreviewRegistry previews =
             new com.mahghuuuls.mountcollection.client.preview.ClientPreviewRegistry();
 
@@ -65,6 +66,14 @@ public final class ClientProxy extends CommonProxy {
             });
         });
         MinecraftForge.EVENT_BUS.register(this);
+        net.minecraftforge.client.ClientCommandHandler.instance.registerCommand(relocationTrace);
+    }
+
+    @SubscribeEvent
+    public void onClientTick(net.minecraftforge.fml.common.gameevent.TickEvent.ClientTickEvent event) {
+        if (event.phase == net.minecraftforge.fml.common.gameevent.TickEvent.Phase.END) {
+            relocationTrace.tick(net.minecraft.client.Minecraft.getMinecraft());
+        }
     }
 
     @SubscribeEvent

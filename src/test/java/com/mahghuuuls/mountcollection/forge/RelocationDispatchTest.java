@@ -42,10 +42,15 @@ final class RelocationDispatchTest {
         assertEquals(f.channel.challenge.getSession(), f.channel.relocation.session());
         assertTrue(f.game.gateway.boardArrived(f.game.player, f.game.record, f.game.provider));
         assertEquals(Arrays.asList("challenge", "relocation", "SPacketSetPassengers", "SPacketMoveVehicle"), f.events);
+        assertEquals(1, f.trace.size());
+        assertTrue(f.trace.get(0).contains("phase=SEND_ATTEMPT"));
+        assertTrue(f.trace.get(0).contains("session=" + f.channel.relocation.session()));
+        assertTrue(f.trace.get(0).contains("entity=" + f.game.mount.getUniqueID()));
     }
     private static final class Fixture {
         final BoardingReadinessGatewayTest.Fixture game = new BoardingReadinessGatewayTest.Fixture();
         final List<String> events = new ArrayList<>();
+        final List<String> trace = new ArrayList<>();
         final MountNetwork network = allocate(MountNetwork.class);
         final Channel channel = allocate(Channel.class);
         final CommonBootstrap bootstrap = allocate(CommonBootstrap.class);
@@ -53,6 +58,11 @@ final class RelocationDispatchTest {
             channel.events = events;
             set(MountNetwork.class, "channel", network, channel);
             set(MountNetwork.class, "contextualSessions", network, new HashMap<>());
+            set(MountNetwork.class, "relocationTrace", network,
+                    new com.mahghuuuls.mountcollection.diagnostics.RelocationTraceLog(() -> true, trace::add));
+            set(net.minecraft.world.World.class, "worldInfo", game.world,
+                    new net.minecraft.world.storage.WorldInfo(new net.minecraft.nbt.NBTTagCompound()));
+            set(net.minecraft.entity.Entity.class, "riddenByEntities", game.player, new ArrayList<>());
             MountCollectionServices services = new MountCollectionServices(
                     new com.mahghuuuls.mountcollection.provider.ProviderRegistry(), null,
                     new com.mahghuuuls.mountcollection.diagnostics.MountCollectionDiagnostics(

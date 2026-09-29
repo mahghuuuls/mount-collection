@@ -34,6 +34,11 @@ public final class MountNetwork {
     private UUID clientSession;
     private java.util.function.BiConsumer<RelocationMessage,Object> clientRelocationReceiver=(message,connection)->{};
     private long clientSequence;
+    private final com.mahghuuuls.mountcollection.diagnostics.RelocationTraceLog relocationTrace =
+            new com.mahghuuuls.mountcollection.diagnostics.RelocationTraceLog(
+                    () -> net.minecraftforge.fml.relauncher.FMLLaunchHandler.isDeobfuscatedEnvironment()
+                            && services != null && services.getDiagnostics().isDetailedEnabled(),
+                    line -> org.apache.logging.log4j.LogManager.getLogger("mountcollection").info(line));
 
     public void preInitialize(MountCollectionServices services) {
         if (this.services != null) {
@@ -108,6 +113,12 @@ public final class MountNetwork {
                     playerLoggedIn(recipient); session=contextualSessions.get(recipient.getUniqueID());
                 }
                 RelocationMessage message=new RelocationMessage(session.id(),session.nextRelocation(),entity);
+                relocationTrace.record(() -> "side=SERVER phase=SEND_ATTEMPT "
+                        + com.mahghuuuls.mountcollection.diagnostics.RelocationTraceLog.packet(message)
+                        + " worldTick=" + entity.world.getTotalWorldTime()
+                        + " recipient=" + recipient.getUniqueID() + " player={"
+                        + com.mahghuuuls.mountcollection.diagnostics.RelocationTraceLog.pose(recipient)
+                        + "} mount={" + com.mahghuuuls.mountcollection.diagnostics.RelocationTraceLog.pose(entity) + "}");
                 com.mahghuuuls.mountcollection.forge.ConnectionDelivery.send(recipient,()->channel.getPacketFrom(message));
             } catch(RuntimeException | LinkageError failure) {
                 org.apache.logging.log4j.LogManager.getLogger("mountcollection").error("Mount relocation delivery failed for {}",recipient.getUniqueID(),failure);

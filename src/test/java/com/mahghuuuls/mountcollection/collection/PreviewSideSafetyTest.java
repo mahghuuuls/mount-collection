@@ -10,7 +10,7 @@ final class PreviewSideSafetyTest {
                 "forge.CommonProxy", "collection.CollectionService", "provider.ProviderRegistry", "network.PreviewCodec",
                 "network.CollectionPage", "network.MountNetwork", "network.RelocationMessage",
                 "network.ServerRelocations", "forge.RelocationOutput", "forge.ConnectionDelivery",
-                "forge.NativePassengerSync"};
+                "forge.NativePassengerSync", "diagnostics.RelocationTraceLog"};
         java.util.List<java.net.URL> urls = new java.util.ArrayList<>();
         ClassLoader current = getClass().getClassLoader();
         while (current != null) {

@@ -9,6 +9,9 @@ import net.minecraft.util.text.TextComponentString;
 
 /** One current world view, processed in the same main-thread receive order as native packets. */
 final class ClientRelocations {
+    private final ClientRelocationTrace trace;
+    ClientRelocations() { this(new ClientRelocationTrace()); }
+    ClientRelocations(ClientRelocationTrace trace) { this.trace = trace; }
     private Object connection;
     private Object world;
     private Object player;
@@ -30,6 +33,7 @@ final class ClientRelocations {
         return true;
     }
     void clear() {
+        trace.clear();
         connection = null;
         world = null;
         player = null;
@@ -42,13 +46,22 @@ final class ClientRelocations {
         return true;
     }
     void receive(Minecraft client, RelocationMessage message, Object source) {
+        trace.before(client, message, source);
         if (!admit(source, client.getConnection(), client.world, client.player,
-                client.player == null ? 0 : client.player.dimension, message)) { return; }
+                client.player == null ? 0 : client.player.dimension, message)) {
+            trace.outcome(client, message, "REJECTED_VIEW"); return;
+        }
         Entity entity = client.world.getEntityByID(message.entityId());
         if (entity == null || !entity.getUniqueID().equals(message.entity())
-                || entity instanceof net.minecraft.entity.player.EntityPlayer) { return; }
-        try { applyPose(entity, message); }
+                || entity instanceof net.minecraft.entity.player.EntityPlayer) {
+            trace.outcome(client, message, "REJECTED_ENTITY"); return;
+        }
+        try {
+            applyPose(entity, message);
+            trace.outcome(client, message, "APPLIED");
+        }
         catch (RuntimeException | LinkageError failure) {
+            trace.outcome(client, message, "APPLICATION_FAILED");
             client.getConnection().getNetworkManager().closeChannel(
                     new TextComponentString("Mount Collection could not synchronize a summoned mount."));
             clear();

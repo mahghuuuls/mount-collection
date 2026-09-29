@@ -13,6 +13,145 @@ import static org.junit.jupiter.api.Assertions.*;
 
 final class ClientRelocationsTest {
     @BeforeAll static void bootstrap() { Bootstrap.register(); }
+    @Test void armedTraceObservesRealReceiverBeforeAfterAndFiniteNativeSamples() throws Exception {
+        TraceHarness h = new TraceHarness();
+        h.view.receive(h.client, h.message(1), h.handler);
+        assertTrue(h.lines.isEmpty()); // Default is off even in development.
+        h.boat.setPosition(339.5, 80, 328.5);
+        assertTrue(h.arm());
+        h.view.receive(h.client, h.message(2), h.handler);
+        assertEquals(2, h.lines.size());
+        assertTrue(h.lines.get(0).contains("phase=BEFORE"));
+        assertTrue(h.lines.get(0).contains("pos=339.5,80.0,328.5"));
+        assertTrue(h.lines.get(1).contains("phase=APPLIED"));
+        assertTrue(h.lines.get(1).contains("pos=318.5,80.0,318.5"));
+        assertEquals(1234, h.boat.serverPosX);
+        assertEquals(320.5, h.client.player.posX);
+        for (int i = 0; i < 200; i++) { h.trace.tick(h.client); }
+        assertEquals(16, h.lines.size()); // Before/after, twelve tick ends, forty and160.
+        assertTrue(h.lines.get(15).contains("END_SAMPLE_160"));
+        h.view.receive(h.client, h.message(3), h.handler);
+        assertEquals(16, h.lines.size()); // No automatic rearm.
+        assertEquals(1234, h.boat.serverPosX);
+        assertFalse(h.boat.isBeingRidden());
+    }
+
+    @Test void traceExpiresAndCannotCrossWorldPlayerConnectionOrChallenge() throws Exception {
+        TraceHarness h = new TraceHarness();
+        assertTrue(h.arm());
+        h.now[0] = 45_000_000_000L;
+        h.view.receive(h.client, h.message(1), h.handler);
+        assertTrue(h.lines.isEmpty());
+        assertTrue(h.arm());
+        h.view.begin(h.client, new com.mahghuuuls.mountcollection.network.ExperienceProtocol(h.session, 0), h.handler);
+        h.view.receive(h.client, h.message(2), h.handler);
+        assertTrue(h.lines.isEmpty());
+        assertTrue(h.arm());
+        h.view.receive(h.client, h.message(3), h.handler);
+        assertEquals(2, h.lines.size());
+        LookupWorld oldWorld = (LookupWorld) h.client.world;
+        h.client.world = allocate(LookupWorld.class);
+        h.trace.tick(h.client);
+        h.client.world = oldWorld;
+        h.trace.tick(h.client);
+        assertEquals(2, h.lines.size());
+        assertTrue(h.arm());
+        h.client.player = null;
+        h.trace.tick(h.client);
+        assertFalse(h.trace.arm(h.handler, h.client.world, null, h.boat.getUniqueID()));
+        assertFalse(new ClientRelocationTrace(() -> false, () -> 0L, h.lines::add)
+                .arm(h.handler, oldWorld, new Object(), h.boat.getUniqueID()));
+    }
+
+    @Test void diagnosticsCannotBreakApplicationAndSupersedingPacketsEndCapture() throws Exception {
+        TraceHarness h = new TraceHarness();
+        assertTrue(h.arm());
+        h.view.receive(h.client, h.message(1), h.handler);
+        h.view.receive(h.client, h.message(2), h.handler);
+        assertTrue(h.lines.get(2).contains("SUPERSEDED"));
+        h.trace.tick(h.client);
+        assertEquals(3, h.lines.size());
+        ClientRelocationTrace broken = new ClientRelocationTrace(() -> true, () -> 0L,
+                line -> { throw new IllegalStateException("log failure"); });
+        ClientRelocations view = new ClientRelocations(broken);
+        view.begin(h.client, new com.mahghuuuls.mountcollection.network.ExperienceProtocol(h.session, 0), h.handler);
+        assertTrue(broken.arm(h.handler, h.client.world, h.client.player, h.boat.getUniqueID()));
+        h.boat.setPosition(339.5, 80, 328.5);
+        view.receive(h.client, h.message(3), h.handler);
+        assertEquals(318.5, h.boat.posX);
+        assertEquals(320.5, h.client.player.posX);
+    }
+
+    @Test void rejectedAndLostEntitiesStopObservationWithoutReplay() throws Exception {
+        TraceHarness h = new TraceHarness();
+        h.view.receive(h.client, h.message(2), h.handler);
+        assertTrue(h.arm());
+        h.view.receive(h.client, h.message(1), h.handler);
+        assertTrue(h.lines.get(1).contains("REJECTED_VIEW"));
+        h.trace.tick(h.client);
+        assertEquals(2, h.lines.size());
+        assertTrue(h.arm());
+        ((LookupWorld) h.client.world).entity = null;
+        h.view.receive(h.client, h.message(3), h.handler);
+        assertTrue(h.lines.get(3).contains("REJECTED_ENTITY"));
+        ((LookupWorld) h.client.world).entity = h.boat;
+        assertTrue(h.arm());
+        h.view.receive(h.client, h.message(4), h.handler);
+        h.boat.setUniqueId(UUID.randomUUID());
+        h.trace.tick(h.client);
+        assertTrue(h.lines.get(6).contains("ENTITY_LOST"));
+        h.trace.tick(h.client);
+        assertEquals(7, h.lines.size());
+    }
+
+    @Test void disconnectAndConnectionReplacementClearCaptureAndReleaseCannotArm() throws Exception {
+        TraceHarness h = new TraceHarness();
+        assertTrue(h.arm());
+        h.view.receive(h.client, h.message(1), h.handler);
+        assertTrue(h.view.disconnect(h.handler));
+        h.trace.tick(h.client);
+        assertEquals(2, h.lines.size());
+        assertTrue(h.arm());
+        field(net.minecraft.client.entity.EntityPlayerSP.class, "connection", h.client.player,
+                allocate(net.minecraft.client.network.NetHandlerPlayClient.class));
+        h.trace.tick(h.client);
+        field(net.minecraft.client.entity.EntityPlayerSP.class, "connection", h.client.player, h.handler);
+        h.view.receive(h.client, h.message(2), h.handler);
+        assertEquals(2, h.lines.size());
+        ClientRelocationTrace release = new ClientRelocationTrace(() -> false, () -> 0L, h.lines::add);
+        assertThrows(net.minecraft.command.CommandException.class,
+                () -> release.execute(null, null, new String[]{h.boat.getUniqueID().toString()}));
+    }
+
+    private static final class TraceHarness {
+        final java.util.List<String> lines = new java.util.ArrayList<>();
+        final long[] now = {0};
+        final ClientRelocationTrace trace = new ClientRelocationTrace(() -> true, () -> now[0], lines::add);
+        final ClientRelocations view = new ClientRelocations(trace);
+        final net.minecraft.client.Minecraft client = allocate(net.minecraft.client.Minecraft.class);
+        final net.minecraft.client.network.NetHandlerPlayClient handler = allocate(net.minecraft.client.network.NetHandlerPlayClient.class);
+        final EntityBoat boat = new EntityBoat(new ClientWorld());
+        final UUID session = UUID.randomUUID();
+        TraceHarness() throws Exception {
+            client.player = allocate(net.minecraft.client.entity.EntityPlayerSP.class);
+            field(net.minecraft.client.entity.EntityPlayerSP.class, "connection", client.player, handler);
+            field(Entity.class, "riddenByEntities", client.player, new java.util.ArrayList<Entity>());
+            client.player.setUniqueId(UUID.randomUUID());
+            client.player.setPosition(320.5, 80, 320.5);
+            LookupWorld world = allocate(LookupWorld.class);
+            world.entity = boat;
+            client.world = world;
+            boat.serverPosX = 1234;
+            view.begin(client, new com.mahghuuuls.mountcollection.network.ExperienceProtocol(session, 0), handler);
+        }
+        boolean arm() { return trace.arm(handler, client.world, client.player, boat.getUniqueID()); }
+        RelocationMessage message(long sequence) {
+            EntityBoat server = new EntityBoat(null);
+            server.setEntityId(boat.getEntityId()); server.setUniqueId(boat.getUniqueID());
+            server.setPosition(318.5, 80, 318.5);
+            return new RelocationMessage(session, sequence, server);
+        }
+    }
     @Test void nativeApplicationFailureClosesConnectionAndClearsBoundView() throws Exception {
         ClientRelocations view = new ClientRelocations();
         net.minecraft.client.Minecraft client = allocate(net.minecraft.client.Minecraft.class);
@@ -121,6 +260,7 @@ final class ClientRelocationsTest {
         Entity entity;
         private LookupWorld() { super(null, null, 0, null, null); }
         @Override public Entity getEntityByID(int id) { return entity != null && entity.getEntityId() == id ? entity : null; }
+        @Override public long getTotalWorldTime() { return 123L; }
     }
     @Test void delayedDisconnectCannotClearReplacementConnection() {
         ClientRelocations view = new ClientRelocations();
