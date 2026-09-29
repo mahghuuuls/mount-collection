@@ -19,6 +19,56 @@ import static org.junit.jupiter.api.Assertions.*;
 final class RecoveryAdmissionGatewayTest {
     @BeforeAll static void bootstrap() { Bootstrap.register(); }
 
+    @Test void candidateRelocationRequiresSuccessfulExactIndexingAndIsNotReplayed() throws Exception {
+        for (boolean recovery : new boolean[]{false, true}) {
+            for (int mode = 0; mode < 4; mode++) {
+                Fixture f = new Fixture();
+                f.access.spawnSucceeds = mode != 1;
+                f.access.conflictOnSpawn = mode == 2;
+                final boolean ready = mode != 3;
+                List<Entity> published = new ArrayList<>();
+                f.gateway.setRelocationOutput(new RelocationOutput() {
+                    public boolean ready(Entity entity, double x, double y, double z) {
+                        assertEquals(0, f.access.spawns);
+                        return ready;
+                    }
+                    public boolean visibleTo(Entity entity, EntityPlayerMP player) { return false; }
+                    public void relocated(Entity entity) {
+                        assertEquals(1, f.access.spawns);
+                        assertSame(entity, f.access.spawned);
+                        published.add(entity);
+                    }
+                });
+                RecoveryAttempt attempt = recovery ? f.prepare().get() : null;
+                TransferOperation transfer = f.transfer();
+                RecallWorldGateway.CandidateAction result = recovery ? attempt.admit(f.intent)
+                        : f.gateway.spawnCandidate(transfer, f.record, f.provider);
+                assertEquals(mode == 0 ? RecallWorldGateway.CandidateAction.SUCCESS
+                        : mode == 1 ? RecallWorldGateway.CandidateAction.FAILED
+                        : mode == 2 ? RecallWorldGateway.CandidateAction.CONFLICT
+                        : RecallWorldGateway.CandidateAction.UNAVAILABLE, result);
+                assertEquals(mode == 0 ? 1 : 0, published.size());
+                if (mode == 0) {
+                    assertEquals(recovery ? RecallWorldGateway.CandidateAction.UNAVAILABLE
+                            : RecallWorldGateway.CandidateAction.SUCCESS, recovery ? attempt.admit(f.intent)
+                            : f.gateway.spawnCandidate(transfer, f.record, f.provider));
+                    assertEquals(1, published.size());
+                    assertEquals(1, f.access.spawns);
+                    if (recovery) {
+                        f.access.sameSizedCandidates = true;
+                        try (RecoveryAttempt fresh = f.prepare().get()) {
+                            assertEquals(RecallWorldGateway.CandidateAction.CONFLICT, fresh.admit(f.intent));
+                        }
+                        assertEquals(2, f.access.created.size());
+                        assertEquals(1, f.access.spawns);
+                        assertEquals(1, published.size());
+                    }
+                }
+                if (attempt != null) { attempt.close(); }
+            }
+        }
+    }
+
     @Test void transferCaptureRejectsSupportLostDuringPreparationBeforeProducingIntent() throws Exception {
         Fixture f = new Fixture(); f.provider.invalidateOnPrepare = true;
         EntityBoat source = new EntityBoat(f.access.world); source.dimension = 1;
@@ -211,6 +261,7 @@ final class RecoveryAdmissionGatewayTest {
         final EntityPlayerMP player;
         RecoveryAdmission context; boolean lookupThrows;
         Fixture() throws Exception {
+            gateway.setRelocationOutput(new TestRelocations());
             // Carrier only: no server/player constructor or native player behavior is claimed here.
             Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true);
             player = (EntityPlayerMP) ((sun.misc.Unsafe) field.get(null)).allocateInstance(EntityPlayerMP.class);
@@ -235,6 +286,8 @@ final class RecoveryAdmissionGatewayTest {
         final List<Entity> created = new ArrayList<>(), checked = new ArrayList<>();
         Entity spawned; int spawns, autoChecks, mountChecks, fallbackChecks;
         boolean autoSafe = true, fallbackSafe = true;
+        boolean spawnSucceeds = true, conflictOnSpawn;
+        boolean sameSizedCandidates;
         public World world(int dimension) { return world; }
         public Entity reconstruct(World world, net.minecraft.nbt.NBTTagCompound snapshot) {
             Entity candidate = ForgeRecallWorldGateway.RecoveryAccess.super.reconstruct(world, snapshot);
@@ -242,14 +295,17 @@ final class RecoveryAdmissionGatewayTest {
         }
         public Entity create(World world, MountRecord record, MountProvider provider, UUID id) {
             EntityBoat candidate = new EntityBoat(world); candidate.setUniqueId(id);
-            candidate.width = created.isEmpty() ? 1 : 9;
+            candidate.width = created.isEmpty() || sameSizedCandidates ? 1 : 9;
             created.add(candidate); return candidate;
         }
         public Entity find(World world, UUID id) { return spawned; }
         public boolean spawn(World world, Entity candidate) {
             assertFalse(checked.isEmpty(), "admission must run before spawn");
             assertSame(candidate, checked.get(checked.size()-1));
-            spawns++; spawned = candidate; return true;
+            spawns++;
+            if (!spawnSucceeds) { return false; }
+            spawned = conflictOnSpawn ? new EntityBoat(world) : candidate;
+            return true;
         }
         public boolean mountSafe(Entity candidate, MountRecord record) {
             mountChecks++; checked.add(candidate); return candidate.width < 2;

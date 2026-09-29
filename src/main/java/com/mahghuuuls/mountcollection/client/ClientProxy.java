@@ -17,6 +17,7 @@ public final class ClientProxy extends CommonProxy {
     private KeyBinding openCollection;
     private MountNetwork network;
     private ClientRidingPreferences ridingPreferences;
+    private final ClientRelocations relocations = new ClientRelocations();
     private final com.mahghuuuls.mountcollection.client.preview.ClientPreviewRegistry previews =
             new com.mahghuuuls.mountcollection.client.preview.ClientPreviewRegistry();
 
@@ -35,8 +36,15 @@ public final class ClientProxy extends CommonProxy {
         network.setClientProtocolReceiver((message, connection) -> {
             net.minecraft.client.Minecraft client = net.minecraft.client.Minecraft.getMinecraft();
             client.addScheduledTask(() -> {
-                if (client.getConnection() == connection) { network.acceptClientProtocol(message); }
+                if (client.getConnection() == connection) {
+                    network.clearClientProtocol();
+                    if(relocations.begin(client,message,connection)) { network.acceptClientProtocol(message); }
+                }
             });
+        });
+        network.setClientRelocationReceiver((message, connection) -> {
+            net.minecraft.client.Minecraft client=net.minecraft.client.Minecraft.getMinecraft();
+            client.addScheduledTask(() -> relocations.receive(client,message,connection));
         });
         contextualAction = new KeyBinding(
                 "key.mountcollection.contextual",
@@ -66,7 +74,11 @@ public final class ClientProxy extends CommonProxy {
 
     @SubscribeEvent
     public void onDisconnect(net.minecraftforge.fml.common.network.FMLNetworkEvent.ClientDisconnectionFromServerEvent event) {
-        net.minecraft.client.Minecraft.getMinecraft().addScheduledTask(network::clearClientProtocol);
+        net.minecraft.client.Minecraft.getMinecraft().addScheduledTask(() -> {
+            if (relocations.disconnect(event.getHandler())) {
+                network.clearClientProtocol();
+            }
+        });
     }
 
     @SubscribeEvent

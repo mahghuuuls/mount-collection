@@ -56,6 +56,13 @@ import net.minecraftforge.common.DimensionManager;
 
 /** Minecraft 1.12.2-specific bounded lookup and same-world placement adapter. */
 public final class ForgeRecallWorldGateway implements RecallWorldGateway {
+    private RelocationOutput relocationOutput;
+    public void setRelocationOutput(RelocationOutput output) {
+        relocationOutput=java.util.Objects.requireNonNull(output);
+    }
+    private boolean relocationReady(Entity entity,double x,double y,double z) {
+        return relocationOutput!=null && relocationOutput.ready(entity,x,y,z);
+    }
 
     /** Native Recovery/transfer operations; admission ordering and context policy stay here. */
     interface RecoveryAccess {
@@ -344,8 +351,13 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         WorldServer world = player.getServerWorld();
         AxisAlignedBB body = mount.getEntityBoundingBox().offset(x - mount.posX, y - mount.posY, z - mount.posZ);
         AxisAlignedBB standing = player.getEntityBoundingBox();
-        return !body.intersects(standing) && insideBorder(world, body) && safe(world, mount, profile, x, y, z, player)
+        return !interactionBox(mount,body).intersects(standing) && insideBorder(world, body) && safe(world, mount, profile, x, y, z, player)
                 && riderClear(world, standing, mount, player);
+    }
+
+    private static AxisAlignedBB interactionBox(Entity entity,AxisAlignedBB body) {
+        return entity instanceof net.minecraft.entity.item.EntityBoat
+                ? body.grow(.20000000298023224D,0,.20000000298023224D) : body;
     }
 
     private static boolean combinedSafe(EntityPlayerMP player, Entity mount, PlacementProfile profile,
@@ -410,6 +422,9 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
                 seat, mount.posX, mount.posY, mount.posZ, mount.rotationYaw)) { return false; }
         final double returnX = player.posX, returnY = player.posY, returnZ = player.posZ;
         return NativeBoarding.board(player, mount, new NativeBoarding.Environment() {
+            @Override public boolean attachmentAvailable() {
+                return relocationOutput!=null && relocationOutput.visibleTo(mount,player);
+            }
             @Override public boolean ready() {
                 // Arrival may occupy the original pose. Require the same bounded safe-return
                 // search used by rollback, not an empty original pose after the mount arrives.
@@ -441,16 +456,7 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
                 return unmountedClear(player, world, player.posX, player.posY, player.posZ);
             }
             @Override public void synchronize() {
-                net.minecraft.network.play.server.SPacketSetPassengers packet =
-                        new net.minecraft.network.play.server.SPacketSetPassengers(mount);
-                world.getEntityTracker().sendToTracking(mount, packet);
-                if (player.connection != null) {
-                    if (player.world == world) { player.connection.sendPacket(packet); }
-                    if (!player.isRiding() && player.isEntityAlive()) {
-                        player.connection.setPlayerLocation(player.posX, player.posY, player.posZ,
-                                player.rotationYaw, player.rotationPitch);
-                    }
-                }
+                NativePassengerSync.synchronize(world,mount,player);
             }
         });
     }
@@ -470,7 +476,12 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         AxisAlignedBB body = new AxisAlignedBB(x - half, y, z - half,
                 x + half, y + Math.max(1.8D, player.height), z + half);
         // Unlike seated checks, the arrived mount is an obstacle to the unmounted player.
-        return riderClear(world, body, null, player);
+        if(!riderClear(world, body, null, player)) { return false; }
+        for(Entity other : world.getEntitiesWithinAABBExcludingEntity(player,body.grow(.20000000298023224D,0,.20000000298023224D))) {
+            if(!other.isDead && other instanceof net.minecraft.entity.item.EntityBoat
+                    && interactionBox(other,other.getEntityBoundingBox()).intersects(body)) { return false; }
+        }
+        return true;
     }
 
     @Override
@@ -654,6 +665,8 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         if (entity.isDead || entity.isBeingRidden() || entity.dimension != player.dimension || !provider.supports(entity)) {
             return false;
         }
+        LastKnownEvidence target = destination.getEvidence();
+        if(!relocationReady(entity,target.getX(),target.getY(),target.getZ())) { return false; }
         if (provider instanceof PreparationSupport) {
             ProviderResult<Void> prepared;
             try {
@@ -678,7 +691,6 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         if (entity instanceof EntityLiving && ((EntityLiving) entity).getLeashed()) {
             ((EntityLiving) entity).clearLeashed(true, true);
         }
-        LastKnownEvidence target = destination.getEvidence();
         float yaw = (float) (Math.toDegrees(Math.atan2(
                 player.posZ - target.getZ(), player.posX - target.getX())) - 90.0D);
         entity.setLocationAndAngles(target.getX(), target.getY(), target.getZ(), yaw, entity.rotationPitch);
@@ -689,6 +701,7 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         if (entity instanceof EntityCreature) {
             ((EntityCreature) entity).getNavigator().clearPath();
         }
+        relocationOutput.relocated(entity);
         return true;
     }
 
@@ -796,10 +809,12 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
         if (!recoveryCandidateSafe(candidate, operation.getOperationId(), operation.getOwnerId(), record, provider)) {
             return CandidateAction.UNAVAILABLE;
         }
+        if(!relocationReady(candidate,candidate.posX,candidate.posY,candidate.posZ)) { return CandidateAction.UNAVAILABLE; }
         if (!recoveryAccess.spawn(world, candidate)) {
             return CandidateAction.FAILED;
         }
         Entity indexed = recoveryAccess.find(world, operation.getCandidateEntityId());
+        if(indexed==candidate && isExactCandidate(indexed,operation)) { relocationOutput.relocated(candidate); }
         return indexed == candidate && isExactCandidate(indexed, operation)
                 ? CandidateAction.SUCCESS
                 : CandidateAction.CONFLICT;
@@ -880,7 +895,10 @@ public final class ForgeRecallWorldGateway implements RecallWorldGateway {
             EntityMountEvidence.attachTransferCandidate(candidate, operation.getMountId(), operation.getOperationId());
             // The final safety check and world admission use this same native instance.
             if (!recoveryCandidateSafe(candidate, operation, record, provider)) { return CandidateAction.UNAVAILABLE; }
+            if(!relocationReady(candidate,candidate.posX,candidate.posY,candidate.posZ)) { return CandidateAction.UNAVAILABLE; }
             if (!recoveryAccess.spawn(world, candidate)) { return CandidateAction.FAILED; }
+            if(recoveryAccess.find(world,candidate.getUniqueID())==candidate
+                    && isExactRecoveryCandidate(candidate,operation,record)) { relocationOutput.relocated(candidate); }
             return recoveryAccess.find(world, candidate.getUniqueID()) == candidate
                     && isExactRecoveryCandidate(candidate, operation, record)
                     ? CandidateAction.SUCCESS : CandidateAction.CONFLICT;

@@ -24,6 +24,59 @@ import static org.junit.jupiter.api.Assertions.*;
 final class BoardingReadinessGatewayTest {
     @BeforeAll static void bootstrap() { Bootstrap.register(); }
 
+    @Test void relocationPreflightDeniesBeforePreparationAndPublishesOnlyCommittedPose() throws Exception {
+        Fixture f = new Fixture();
+        f.mount.setPosition(8.5, 64, 8.5);
+        RecallWorldGateway.Destination destination = f.plan().get();
+        List<String> events = new ArrayList<>();
+        boolean[] ready = {false};
+        f.gateway.setRelocationOutput(new RelocationOutput() {
+            public boolean ready(Entity entity, double x, double y, double z) {
+                events.add("preflight");
+                assertEquals(8.5, entity.posX);
+                return ready[0];
+            }
+            public boolean visibleTo(Entity entity, EntityPlayerMP player) { return false; }
+            public void relocated(Entity entity) {
+                events.add("relocated");
+                assertEquals(destination.getEvidence().getX(), entity.posX);
+                assertEquals(0, entity.motionX);
+                assertEquals(0, f.player.attempts);
+            }
+        });
+        assertFalse(f.gateway.commit(f.player, f.source(), destination, f.provider));
+        assertEquals(0, f.provider.preparations);
+        assertEquals(8.5, f.mount.posX);
+        ready[0] = true;
+        assertTrue(f.gateway.commit(f.player, f.source(), destination, f.provider));
+        assertEquals(Arrays.asList("preflight", "preflight", "relocated"), events);
+        assertEquals(1, f.provider.preparations);
+        assertFalse(f.gateway.boardArrived(f.player, f.record, f.provider));
+        assertEquals(0, f.player.attempts);
+        assertFalse(f.mount.getEntityBoundingBox().grow(.20000000298023224D, 0, .20000000298023224D)
+                .intersects(f.player.getEntityBoundingBox()));
+    }
+
+    @Test void fallbackRejectsBoatInteractionMarginAtPlanningCommitAndRecovery() throws Exception {
+        Fixture f = new Fixture(); f.mount.setPosition(8.5,64,8.5); f.provider.seatAvailable = false;
+        RecallWorldGateway.Destination plan = f.plan().get();
+        AxisAlignedBB placed = f.mount.getEntityBoundingBox().offset(
+                plan.getEvidence().getX()-f.mount.posX, plan.getEvidence().getY()-f.mount.posY,
+                plan.getEvidence().getZ()-f.mount.posZ);
+        assertFalse(placed.grow(.20000000298023224D,0,.20000000298023224D)
+                .intersects(f.player.getEntityBoundingBox()));
+        Field field = ForgeRecallWorldGateway.class.getDeclaredField("recoveryAccess"); field.setAccessible(true);
+        ForgeRecallWorldGateway.RecoveryAccess access = (ForgeRecallWorldGateway.RecoveryAccess)field.get(f.gateway);
+        for (double distance : new double[]{1,1.19}) {
+            f.mount.setPosition(.5+distance,64,.5);
+            assertEquals(distance > 1.18, access.unmountedSafe(f.player,f.mount,f.record));
+            RecallWorldGateway.Destination target = new RecallWorldGateway.Destination(
+                    new LastKnownEvidence(0,.5+distance,64,.5), f.record.getCharacteristics(),
+                    ArrivalDisposition.UNMOUNTED_FALLBACK);
+            assertEquals(distance > 1.18, f.gateway.commit(f.player,f.source(),target,f.provider));
+        }
+    }
+
     @Test void actualNativeDisplacementIsMeasuredFromOriginalPose() throws Exception {
         for (double shift : new double[]{0, 3}) {
             Fixture f = new Fixture(); f.player.attach = true; f.player.seatedShift = shift;
@@ -227,7 +280,7 @@ final class BoardingReadinessGatewayTest {
         return type.cast(((sun.misc.Unsafe) field.get(null)).allocateInstance(type));
     }
 
-    private static final class Fixture {
+    static final class Fixture {
         final ProbeWorld world = allocate(ProbeWorld.class);
         final Player player = allocate(Player.class);
         final EntityBoat mount = new EntityBoat(new BoardingTestWorld());
@@ -242,6 +295,7 @@ final class BoardingReadinessGatewayTest {
             return gateway.planWithRider(player, source(), provider, record.getCharacteristics(), 2, 4);
         }
         Fixture() throws Exception {
+            gateway.setRelocationOutput(new TestRelocations());
             world.border = new WorldBorder(); world.mount = mount;
             world.tracker = allocate(Tracker.class);
             player.world = world; player.width = .6F; player.height = 1.8F;
@@ -254,7 +308,7 @@ final class BoardingReadinessGatewayTest {
         }
     }
 
-    private static final class Player extends EntityPlayerMP {
+    static final class Player extends EntityPlayerMP {
         int attempts;
         boolean attach;
         double seatedShift;
@@ -285,7 +339,15 @@ final class BoardingReadinessGatewayTest {
         @Override public void dismountRidingEntity() { /* Exercise the verified pair-only rollback. */ }
     }
 
-    private static final class ProbeWorld extends WorldServer {
+    static final class ProbeWorld extends WorldServer {
+        net.minecraft.server.MinecraftServer server;
+        List<Runnable> tasks;
+        @Override public net.minecraft.server.MinecraftServer getMinecraftServer() { return server; }
+        @Override public com.google.common.util.concurrent.ListenableFuture<Object> addScheduledTask(Runnable task) {
+            if (tasks == null) { throw new AssertionError("unexpected scheduled work"); }
+            tasks.add(task);
+            return com.google.common.util.concurrent.Futures.immediateFuture(null);
+        }
         WorldBorder border; Entity mount; boolean onlySeatedSpace, lowCeiling, distantOpening;
         Tracker tracker;
         private ProbeWorld() { super(null,null,null,0,null); }
@@ -310,17 +372,23 @@ final class BoardingReadinessGatewayTest {
         }
     }
 
-    private static final class Tracker extends net.minecraft.entity.EntityTracker {
+    static final class Tracker extends net.minecraft.entity.EntityTracker {
+        Set<net.minecraft.entity.player.EntityPlayer> players;
         int sends;
         private Tracker() { super(null); }
         @Override public void sendToTracking(Entity entity, net.minecraft.network.Packet<?> packet) { sends++; }
+        @Override public Set<? extends net.minecraft.entity.player.EntityPlayer> getTrackingPlayers(Entity entity) {
+            sends++; return players == null ? Collections.emptySet() : players;
+        }
     }
 
-    private static final class Provider implements MountProvider, BoardingSupport, PreparationSupport {
+    static final class Provider implements MountProvider, BoardingSupport, PreparationSupport {
+        int preparations;
         boolean seatAvailable = true, supported = true;
         boolean invalidateOnPrepare;
         com.mahghuuuls.mountcollection.lifecycle.FatalTransferSafetyException fatal;
         public ProviderResult<Void> prepareForPlacement(Entity entity) {
+            preparations++;
             if (fatal != null) { throw fatal; }
             if (invalidateOnPrepare) { supported = false; }
             return ProviderResult.success();

@@ -8,6 +8,12 @@ final class ContextualSession {
     private long lastSequence;
     private boolean ready;
     private long generation;
+    private long relocationSequence;
+    boolean relocationExhausted() { return relocationSequence==Long.MAX_VALUE; }
+    long nextRelocation() {
+        if(relocationSequence==Long.MAX_VALUE) { throw new IllegalStateException("relocation sequence exhausted"); }
+        return ++relocationSequence;
+    }
     long generation() { return generation; }
     void invalidatePending() { generation++; }
     UUID id() { return id; }

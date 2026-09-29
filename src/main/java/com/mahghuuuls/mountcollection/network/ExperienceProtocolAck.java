@@ -4,4 +4,5 @@ package com.mahghuuuls.mountcollection.network;
 public final class ExperienceProtocolAck extends ExperienceProtocol {
     public ExperienceProtocolAck() { }
     public ExperienceProtocolAck(java.util.UUID session) { super(session); }
+    public ExperienceProtocolAck(java.util.UUID session, int dimension) { super(session, dimension); }
 }

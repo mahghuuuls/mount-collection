@@ -382,7 +382,12 @@ public final class CommonBootstrap {
 
     @SubscribeEvent
     public void onPlayerChangedDimension(PlayerEvent.PlayerChangedDimensionEvent event) {
-        network.invalidatePlayerExperience(event.player.getUniqueID());
+        if(event.player instanceof EntityPlayerMP) { network.playerLoggedIn((EntityPlayerMP)event.player); }
+    }
+
+    @SubscribeEvent
+    public void onPlayerRespawn(PlayerEvent.PlayerRespawnEvent event) {
+        if(event.player instanceof EntityPlayerMP) { network.playerLoggedIn((EntityPlayerMP)event.player); }
     }
 
     @SubscribeEvent

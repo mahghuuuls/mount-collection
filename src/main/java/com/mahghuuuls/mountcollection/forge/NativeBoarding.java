@@ -10,6 +10,7 @@ import net.minecraftforge.fml.relauncher.ReflectionHelper;
 final class NativeBoarding {
     interface Environment {
         boolean ready();
+        default boolean attachmentAvailable() { return true; }
         boolean seatedSafely();
         boolean returnSafely();
         void synchronize();
@@ -27,10 +28,14 @@ final class NativeBoarding {
         catch (RuntimeException | LinkageError unavailable) { return false; }
         boolean accepted = false;
         try {
+            if(!environment.attachmentAvailable()) { return false; }
             if (!rider.startRiding(mount, false)) { return false; }
             if (!links.attached()) { return false; }
             mount.updatePassenger(rider);
-            accepted = environment.seatedSafely() && links.attached();
+            if(environment.seatedSafely() && links.attached()) {
+                environment.synchronize();
+                accepted = true;
+            }
             return accepted;
         } catch (FatalTransferSafetyException fatal) { throw fatal; }
         catch (RuntimeException | LinkageError rejected) { return false; }

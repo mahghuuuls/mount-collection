@@ -32,6 +32,7 @@ public final class MountNetwork {
     private java.util.function.BiConsumer<ExperienceProtocol, Object> clientProtocolReceiver = (message, connection) -> { };
     private final Map<UUID, ContextualSession> contextualSessions = new java.util.HashMap<>();
     private UUID clientSession;
+    private java.util.function.BiConsumer<RelocationMessage,Object> clientRelocationReceiver=(message,connection)->{};
     private long clientSequence;
 
     public void preInitialize(MountCollectionServices services) {
@@ -39,6 +40,7 @@ public final class MountNetwork {
             throw new IllegalStateException("network already initialized");
         }
         this.services = Objects.requireNonNull(services, "services");
+        services.setRelocationOutput(new ServerRelocations(this::sendRelocation));
         channel.registerMessage(
                 new ContextualIntentHandler(), ContextualIntentMessage.class, 0, Side.SERVER);
         channel.registerMessage((IMessageHandler<CollectionIntent, IMessage>) (message, context) -> {
@@ -89,6 +91,31 @@ public final class MountNetwork {
             });
             return null;
         }, ExperienceProtocolAck.class, 6, Side.SERVER);
+        channel.registerMessage((IMessageHandler<RelocationMessage,IMessage>)(message,context)->{
+            clientRelocationReceiver.accept(message,context.netHandler); return null;
+        },RelocationMessage.class,7,Side.CLIENT);
+    }
+
+    public void setClientRelocationReceiver(java.util.function.BiConsumer<RelocationMessage,Object> receiver) {
+        clientRelocationReceiver=Objects.requireNonNull(receiver);
+    }
+
+    private void sendRelocation(EntityPlayerMP recipient,net.minecraft.entity.Entity entity) {
+            try {
+                ContextualSession session=contextualSessions.get(recipient.getUniqueID());
+                if(session==null) { throw new IllegalStateException("missing world view"); }
+                if(session.relocationExhausted()) {
+                    playerLoggedIn(recipient); session=contextualSessions.get(recipient.getUniqueID());
+                }
+                RelocationMessage message=new RelocationMessage(session.id(),session.nextRelocation(),entity);
+                com.mahghuuuls.mountcollection.forge.ConnectionDelivery.send(recipient,()->channel.getPacketFrom(message));
+            } catch(RuntimeException | LinkageError failure) {
+                org.apache.logging.log4j.LogManager.getLogger("mountcollection").error("Mount relocation delivery failed for {}",recipient.getUniqueID(),failure);
+                try { recipient.connection.disconnect(new TextComponentTranslation("mountcollection.sync_failed")); }
+                catch(RuntimeException | LinkageError closing) {
+                    recipient.connection.getNetworkManager().closeChannel(new TextComponentTranslation("mountcollection.sync_failed"));
+                }
+            }
     }
 
     public void setClientProtocolReceiver(java.util.function.BiConsumer<ExperienceProtocol, Object> receiver) {
@@ -97,14 +124,15 @@ public final class MountNetwork {
     public void acceptClientProtocol(ExperienceProtocol message) {
         clientSession = message.getSession();
         clientSequence = 0L;
-        channel.sendToServer(new ExperienceProtocolAck(clientSession));
+        channel.sendToServer(new ExperienceProtocolAck(clientSession,message.getDimension()));
     }
     public void clearClientProtocol() { clientSession = null; clientSequence = 0L; }
 
     public void playerLoggedIn(EntityPlayerMP player) {
+        invalidatePlayerExperience(player.getUniqueID());
         ContextualSession session = new ContextualSession();
         contextualSessions.put(player.getUniqueID(), session);
-        channel.sendTo(new ExperienceProtocol(session.id()), player);
+        channel.sendTo(new ExperienceProtocol(session.id(),player.dimension), player);
     }
     private boolean currentPlayer(EntityPlayerMP player) {
         return player.isEntityAlive() && player.connection.getNetworkManager().isChannelOpen()

@@ -71,6 +71,7 @@ mountcollection.message.recovery_provider_unavailable_death=Your mount died norm
 mountcollection.message.recovery_waiting=The selected mount is still recovering.
 mountcollection.gui.abandon=Abandon
 mountcollection.gui.confirm_abandon=Confirm
+mountcollection.sync_failed=Mount Collection could not synchronize a summoned mount. Please reconnect.
 mountcollection.gui.abandon_hint=Abandon %s? This removes it from your collection but leaves the mount and its native ownership unchanged.
 mountcollection.gui.result.abandoned=Mount abandoned.
 mountcollection.gui.result.abandonment_pending=Abandonment is pending. It will resume when the mount is available, or you can confirm again to retry.

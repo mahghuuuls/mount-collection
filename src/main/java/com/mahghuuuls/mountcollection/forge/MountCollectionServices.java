@@ -142,6 +142,7 @@ public final class MountCollectionServices {
                 developmentControls::phaseAcknowledged, developmentControls::shouldPauseRestoration,
                 developmentControls::restorationPhaseAcknowledged);
         worldGateway.setRecoveryAdmission(experience::recoveryAdmission);
+        if(relocationOutput!=null) { worldGateway.setRelocationOutput(relocationOutput); }
         lifecycleService = new MountLifecycleService(
                 repository,
                 providerRegistry,
@@ -154,6 +155,11 @@ public final class MountCollectionServices {
                 developmentControls::consumeRecoveryProviderUnavailable);
         lifecycleService.setCompletionSink(experience::complete);
         lifecycleService.setArrivalSink(experience::arrivalPlanned);
+    }
+
+    private RelocationOutput relocationOutput;
+    public void setRelocationOutput(RelocationOutput output) {
+        relocationOutput=java.util.Objects.requireNonNull(output);
     }
 
     synchronized void clearActiveConfig() {

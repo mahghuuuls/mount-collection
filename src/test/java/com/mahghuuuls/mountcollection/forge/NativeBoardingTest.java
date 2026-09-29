@@ -16,6 +16,7 @@ final class NativeBoardingTest {
         assertTrue(NativeBoarding.board(f.rider, f.mount, f.environment));
         assertSame(f.mount, f.rider.getRidingEntity()); assertTrue(f.mount.isPassenger(f.rider));
         assertEquals(0, f.environment.returns);
+        assertEquals(1, f.environment.syncs);
     }
 
     @Test void nativeMountVetoIsNotOverridden() {

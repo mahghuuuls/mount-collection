@@ -8,7 +8,9 @@ final class PreviewSideSafetyTest {
     @Test void commonPresentationContractsResolveWithClientClassesDenied() throws Exception {
         String[] types = {"api.MountPreview", "api.MountProvider", "api.MountProviderRegistrationEvent",
                 "forge.CommonProxy", "collection.CollectionService", "provider.ProviderRegistry", "network.PreviewCodec",
-                "network.CollectionPage", "network.MountNetwork"};
+                "network.CollectionPage", "network.MountNetwork", "network.RelocationMessage",
+                "network.ServerRelocations", "forge.RelocationOutput", "forge.ConnectionDelivery",
+                "forge.NativePassengerSync"};
         java.util.List<java.net.URL> urls = new java.util.ArrayList<>();
         ClassLoader current = getClass().getClassLoader();
         while (current != null) {
