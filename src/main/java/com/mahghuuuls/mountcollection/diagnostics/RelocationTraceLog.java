@@ -45,7 +45,6 @@ public final class RelocationTraceLog {
                 + " prev=" + entity.prevPosX + "," + entity.prevPosY + "," + entity.prevPosZ
                 + " render=" + entity.lastTickPosX + "," + entity.lastTickPosY + "," + entity.lastTickPosZ
                 + " motion=" + entity.motionX + "," + entity.motionY + "," + entity.motionZ
-                + " encoded=" + entity.serverPosX + "," + entity.serverPosY + "," + entity.serverPosZ
                 + " grounded=" + entity.onGround + " box=" + entity.getEntityBoundingBox()
                 + " vehicle=" + (entity.getRidingEntity() == null ? "none" : entity.getRidingEntity().getUniqueID())
                 + " passengers=" + passengers;

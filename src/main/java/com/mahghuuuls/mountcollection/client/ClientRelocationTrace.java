@@ -123,8 +123,15 @@ final class ClientRelocationTrace extends CommandBase {
     private void snapshot(Minecraft client, String phase) {
         log.record(() -> "side=CLIENT phase=" + phase + " " + RelocationTraceLog.packet(captured)
                 + " worldTick=" + client.world.getTotalWorldTime()
-                + " player={" + RelocationTraceLog.pose(client.player) + "} mount={"
-                + RelocationTraceLog.pose(client.world.getEntityByID(captured.entityId())) + "}");
+                + " player={" + clientPose(client.player) + "} mount={"
+                + clientPose(client.world.getEntityByID(captured.entityId())) + "}");
+    }
+
+    private static String clientPose(Entity entity) {
+        if (entity == null) { return "absent"; }
+        // Forge removes these interpolation coordinates on the physical server.
+        return RelocationTraceLog.pose(entity) + " encoded="
+                + entity.serverPosX + "," + entity.serverPosY + "," + entity.serverPosZ;
     }
 
     private void safely(Runnable observation) {
